@@ -8,13 +8,22 @@ from pydantic import BaseModel
 from typing import Dict, List, Optional, Any
 import logging
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import time
+
+import redis
+import psycopg2
+import httpx
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 전역 변수
+trading_bot = None
+slack_bot = None
+redis_streams = None
 
 # FastAPI 앱 생성
 app = FastAPI(
@@ -101,6 +110,53 @@ error_counters = {
     "db_errors": 0
 }
 
+# 헬스체크 헬퍼 함수들
+CONNECT_TIMEOUT = 1.5  # 초
+
+def check_redis(url: str):
+    t0 = time.perf_counter()
+    try:
+        r = redis.from_url(url, socket_timeout=CONNECT_TIMEOUT, socket_connect_timeout=CONNECT_TIMEOUT)
+        r.ping()
+        return True, None, int((time.perf_counter() - t0) * 1000)
+    except Exception as e:
+        return False, str(e), int((time.perf_counter() - t0) * 1000)
+
+def check_db(dsn: str):
+    t0 = time.perf_counter()
+    try:
+        conn = psycopg2.connect(dsn, connect_timeout=int(CONNECT_TIMEOUT))
+        cur = conn.cursor()
+        cur.execute("SELECT 1;")
+        cur.fetchone()
+        cur.close()
+        conn.close()
+        return True, None, int((time.perf_counter() - t0) * 1000)
+    except Exception as e:
+        return False, str(e), int((time.perf_counter() - t0) * 1000)
+
+def check_slack(token: str, channel_id: str):
+    t0 = time.perf_counter()
+    if not token or not channel_id:
+        return False, "missing_token_or_channel", int((time.perf_counter() - t0) * 1000)
+    try:
+        # 가벼운 인증 체크 (메시지 전송 아님 — 스팸 방지)
+        with httpx.Client(timeout=CONNECT_TIMEOUT) as client:
+            res = client.get(
+                "https://slack.com/api/auth.test",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            ok = res.status_code == 200 and res.json().get("ok") is True
+            return (True, None, int((time.perf_counter() - t0) * 1000)) if ok else (False, res.text, int((time.perf_counter() - t0) * 1000))
+    except Exception as e:
+        return False, str(e), int((time.perf_counter() - t0) * 1000)
+
+def check_llm():
+    enabled = os.getenv("LLM_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+    has_key = bool(os.getenv("OPENAI_API_KEY"))
+    # 헬스 관점에선 "켜져 있고 키가 있다"면 OK로 간주 (외부 호출은 비용/지연 유발)
+    return enabled and has_key, {"enabled": enabled, "has_key": has_key}
+
 @app.on_event("startup")
 async def startup_event():
     """앱 시작 시 초기화"""
@@ -108,9 +164,18 @@ async def startup_event():
     
     logger.info("Trading Bot API 시작")
     
+    # Slack 봇 초기화
+    try:
+        from app.io.slack_bot import SlackBot
+        channel_id = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "#trading-signals")
+        slack_bot = SlackBot(token=os.getenv("SLACK_BOT_TOKEN"), channel=channel_id)
+        logger.info(f"Slack 봇 초기화 완료: 채널 {channel_id}")
+    except Exception as e:
+        logger.error(f"Slack 봇 초기화 실패: {e}")
+        slack_bot = None
+    
     # 여기서 실제 컴포넌트들을 초기화
     # trading_bot = TradingBot()
-    # slack_bot = SlackBot(token=os.getenv("SLACK_TOKEN"))
     # redis_streams = RedisStreams()
 
 @app.on_event("shutdown")
@@ -159,86 +224,27 @@ async def health_check():
 @app.get("/healthz", response_model=HealthzResponse)
 async def healthz_check():
     """헬스체크 (상세) - Redis/DB/Slack 토큰 체크"""
-    try:
-        # Redis 체크
-        redis_status = {"connected": False, "error": None}
-        if redis_streams:
-            try:
-                health = redis_streams.health_check()
-                redis_status = {
-                    "connected": health.get("redis_connected", False),
-                    "streams": health.get("streams", {}),
-                    "error": None
-                }
-            except Exception as e:
-                redis_status["error"] = str(e)
-                error_counters["redis_errors"] += 1
-        
-        # DB 체크
-        db_status = {"connected": False, "error": None}
-        if db_connection:
-            try:
-                cursor = db_connection.cursor()
-                cursor.execute("SELECT 1")
-                db_status = {"connected": True, "error": None}
-            except Exception as e:
-                db_status["error"] = str(e)
-                error_counters["db_errors"] += 1
-        
-        # Slack 체크
-        slack_status = {"connected": False, "error": None}
-        if slack_bot:
-            try:
-                status = slack_bot.get_status()
-                slack_status = {
-                    "connected": status.get("connected", False),
-                    "channel": status.get("channel", ""),
-                    "error": None
-                }
-            except Exception as e:
-                slack_status["error"] = str(e)
-                error_counters["slack_errors"] += 1
-        
-        # LLM 체크
-        llm_status = {"enabled": False, "error": None}
-        if llm_engine:
-            try:
-                status = llm_engine.get_status()
-                llm_status = {
-                    "enabled": status.get("llm_enabled", False),
-                    "monthly_cost_krw": status.get("monthly_cost_krw", 0),
-                    "error": None
-                }
-            except Exception as e:
-                llm_status["error"] = str(e)
-                error_counters["llm_errors"] += 1
-        
-        # 전체 상태 결정
-        all_healthy = (
-            redis_status["connected"] and 
-            db_status["connected"] and 
-            slack_status["connected"]
-        )
-        
-        return HealthzResponse(
-            status="healthy" if all_healthy else "unhealthy",
-            redis=redis_status,
-            database=db_status,
-            slack=slack_status,
-            llm=llm_status,
-            timestamp=datetime.now().isoformat()
-        )
-        
-    except Exception as e:
-        logger.error(f"헬스체크 실패: {e}")
-        return HealthzResponse(
-            status="unhealthy",
-            redis={"connected": False, "error": str(e)},
-            database={"connected": False, "error": str(e)},
-            slack={"connected": False, "error": str(e)},
-            llm={"enabled": False, "error": str(e)},
-            timestamp=datetime.now().isoformat()
-        )
+    # 환경변수에서 직접 읽어와 자가검사 (전역 객체 의존 X)
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+    db_dsn = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL", "")
+    slack_token = os.getenv("SLACK_BOT_TOKEN", "")
+    slack_channel = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "")
+
+    r_ok, r_err, r_ms = check_redis(redis_url)
+    d_ok, d_err, d_ms = check_db(db_dsn) if db_dsn else (False, "missing_db_dsn", 0)
+    s_ok, s_err, s_ms = check_slack(slack_token, slack_channel)
+    l_ok, l_meta = check_llm()
+
+    overall = r_ok and d_ok and s_ok and l_ok
+
+    return HealthzResponse(
+        status="healthy" if overall else "unhealthy",
+        redis={"connected": r_ok, "ms": r_ms, "error": r_err},
+        database={"connected": d_ok, "ms": d_ms, "error": d_err},
+        slack={"connected": s_ok, "ms": s_ms, "error": s_err},
+        llm=l_meta,
+        timestamp=datetime.now(timezone.utc).isoformat()
+    )
 
 @app.get("/status", response_model=SystemStatusResponse)
 async def system_status():
@@ -379,7 +385,7 @@ async def generate_report(request: ReportRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/report/daily", response_model=Dict)
-async def get_daily_report():
+async def get_daily_report(force: bool = False, post: bool = False):
     """일일 리포트 조회 (배치용)"""
     try:
         today = datetime.now().date()
@@ -390,8 +396,8 @@ async def get_daily_report():
         # metrics_daily에 upsert
         await upsert_daily_metrics(today, report_data)
         
-        # Slack 전송
-        if slack_bot:
+        # Slack 전송 (post=True일 때만)
+        if post and slack_bot:
             await send_daily_report_to_slack(report_data)
         
         return {
@@ -548,11 +554,16 @@ async def send_daily_report_to_slack(report_data: Dict):
             ]
         })
         
-        message = {
-            "text": text,
-            "blocks": blocks,
-            "channel": "#trading-signals"
-        }
+        from app.io.slack_bot import SlackMessage
+        
+        # 채널 ID 사용 (환경변수에서 가져오기)
+        channel_id = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "#trading-signals")
+        
+        message = SlackMessage(
+            channel=channel_id,
+            text=text,
+            blocks=blocks
+        )
         
         success = slack_bot.send_message(message)
         if success:

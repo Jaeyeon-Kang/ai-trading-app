@@ -5,6 +5,10 @@ LLM 인사이트 엔진
 출력(JSON): {sentiment:-1~1, trigger:str, horizon_minutes:int, summary:str}
 24시간 캐시, 분당 1콜 제한, 월 비용 KRW 기준 집계
 → LLM_MONTHLY_CAP_KRW 넘으면 자동 OFF(그때는 기술신호만)
+
+LLM 호출 조건:
+- edgar_event == True OR regime == 'vol_spike'
+- RTH(정규장) 시간대만 허용 (09:30-16:00 ET)
 """
 import logging
 import hashlib
@@ -12,7 +16,7 @@ import json
 import os
 from typing import Dict, List, Optional
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 import numpy as np
 from openai import OpenAI
@@ -21,13 +25,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class LLMInsight:
-    """LLM 인사이트 결과"""
-    sentiment: float  # -1 ~ +1
-    trigger: str  # 트리거 키워드
+    """LLM 분석 결과"""
+    sentiment: float  # -1.0 ~ 1.0
+    trigger: str      # 주요 트리거
     horizon_minutes: int  # 영향 지속 시간 (분)
-    summary: str  # 요약
+    summary: str      # 한 줄 요약
     timestamp: datetime
-    cost_krw: float  # 비용 (KRW)
+    cost_krw: float = 0.0  # 비용 (KRW)
 
 class LLMInsightEngine:
     """LLM 인사이트 엔진"""
@@ -79,17 +83,72 @@ class LLMInsightEngine:
         """슬랙 봇 설정 (상태 변경 알림용)"""
         self.slack_bot = slack_bot
     
-    def analyze_text(self, text: str, source: str = "") -> Optional[LLMInsight]:
+    def should_call_llm(self, edgar_event: bool = False, regime: str = None) -> bool:
         """
-        텍스트 분석
+        LLM 호출 조건 확인
+        
+        Args:
+            edgar_event: EDGAR 이벤트 여부
+            regime: 현재 레짐 ('trend', 'vol_spike', 'mean_revert', 'sideways')
+            
+        Returns:
+            bool: LLM 호출 여부
+        """
+        # 조건 1: edgar_event == True OR regime == 'vol_spike'
+        if not edgar_event and regime != 'vol_spike':
+            logger.debug(f"LLM 호출 조건 불충족: edgar_event={edgar_event}, regime={regime}")
+            return False
+        
+        # 조건 2: RTH(정규장) 시간대만 허용 (09:30-16:00 ET)
+        if not self._is_rth_time():
+            logger.debug("LLM 호출 제한: 정규장 시간이 아님")
+            return False
+        
+        return True
+    
+    def _is_rth_time(self) -> bool:
+        """RTH(정규장) 시간대 확인 (09:30-16:00 ET)"""
+        # ET 시간대 (UTC-5, 일광절약시간 고려)
+        et_tz = timezone(timedelta(hours=-5))  # EST
+        et_time = datetime.now(et_tz)
+        
+        # 일광절약시간 확인 (3월 둘째 주 일요일 ~ 11월 첫째 주 일요일)
+        dst_start = et_time.replace(month=3, day=8 + (6 - et_time.replace(month=3, day=1).weekday()) % 7, hour=2)
+        dst_end = et_time.replace(month=11, day=1 + (6 - et_time.replace(month=11, day=1).weekday()) % 7, hour=2)
+        
+        if dst_start <= et_time < dst_end:
+            et_tz = timezone(timedelta(hours=-4))  # EDT
+        
+        et_time = datetime.now(et_tz)
+        current_time = et_time.time()
+        
+        # 정규장 시간: 09:30-16:00 ET
+        market_open = time(9, 30)
+        market_close = time(16, 0)
+        
+        is_rth = market_open <= current_time <= market_close
+        
+        logger.debug(f"RTH 체크: {et_time.strftime('%Y-%m-%d %H:%M:%S %Z')} = {is_rth}")
+        return is_rth
+    
+    def analyze_text(self, text: str, source: str = "", edgar_event: bool = False, regime: str = None) -> Optional[LLMInsight]:
+        """
+        텍스트 분석 (호출 조건 제한 적용)
         
         Args:
             text: 분석할 텍스트 (≤1000자)
             source: 소스 URL (캐시 키용)
+            edgar_event: EDGAR 이벤트 여부
+            regime: 현재 레짐
             
         Returns:
-            LLMInsight: 분석 결과 (None if 실패)
+            LLMInsight: 분석 결과 (None if 실패 또는 조건 불충족)
         """
+        # LLM 호출 조건 확인
+        if not self.should_call_llm(edgar_event, regime):
+            logger.debug(f"LLM 호출 스킵: edgar_event={edgar_event}, regime={regime}")
+            return None
+        
         # 텍스트 길이 제한
         if len(text) > 1000:
             text = text[:1000]
@@ -349,7 +408,7 @@ class LLMInsightEngine:
             
             text = " | ".join(text_parts)
             
-            return self.analyze_text(text, f"edgar_{ticker}_{form_type}")
+            return self.analyze_text(text, f"edgar_{ticker}_{form_type}", edgar_event=True)
             
         except Exception as e:
             logger.error(f"EDGAR 공시 분석 실패: {e}")

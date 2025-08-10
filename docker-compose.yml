@@ -43,6 +43,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: trading_bot_api
+    env_file:
+      - .env
     environment:
       - DATABASE_URL=postgresql://trading_bot_user:${POSTGRES_PASSWORD:-trading_bot_password}@postgres:5432/trading_bot
       - REDIS_URL=redis://redis:6379/0
@@ -78,6 +80,8 @@ services:
       dockerfile: Dockerfile
     container_name: trading_bot_worker
     command: celery -A app.jobs.scheduler worker --loglevel=info --concurrency=2
+    env_file:
+      - .env
     environment:
       - DATABASE_URL=postgresql://trading_bot_user:${POSTGRES_PASSWORD:-trading_bot_password}@postgres:5432/trading_bot
       - REDIS_URL=redis://redis:6379/0
@@ -104,6 +108,8 @@ services:
       dockerfile: Dockerfile
     container_name: trading_bot_scheduler
     command: celery -A app.jobs.scheduler beat --loglevel=info
+    env_file:
+      - .env
     environment:
       - DATABASE_URL=postgresql://trading_bot_user:${POSTGRES_PASSWORD:-trading_bot_password}@postgres:5432/trading_bot
       - REDIS_URL=redis://redis:6379/0
@@ -125,6 +131,7 @@ services:
 
   # Grafana (모니터링 대시보드)
   grafana:
+    profiles: ["monitoring"]
     image: grafana/grafana:latest
     container_name: trading_bot_grafana
     environment:
@@ -142,12 +149,13 @@ services:
 
   # Prometheus (메트릭 수집)
   prometheus:
+    profiles: ["monitoring"]
     image: prom/prometheus:latest
     container_name: trading_bot_prometheus
     ports:
       - "9090:9090"
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus:/etc/prometheus
       - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
@@ -160,6 +168,7 @@ services:
 
   # Nginx (리버스 프록시)
   nginx:
+    profiles: ["monitoring"]
     image: nginx:alpine
     container_name: trading_bot_nginx
     ports:
@@ -174,6 +183,7 @@ services:
 
   # Redis Commander (Redis 관리 UI)
   redis-commander:
+    profiles: ["monitoring"]
     image: rediscommander/redis-commander:latest
     container_name: trading_bot_redis_commander
     environment:
@@ -186,6 +196,7 @@ services:
 
   # pgAdmin (PostgreSQL 관리 UI)
   pgadmin:
+    profiles: ["monitoring"]
     image: dpage/pgadmin4:latest
     container_name: trading_bot_pgadmin
     environment:

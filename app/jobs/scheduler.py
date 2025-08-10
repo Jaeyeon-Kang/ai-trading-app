@@ -26,8 +26,8 @@ celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
-    timezone="UTC",
-    enable_utc=True,
+    timezone="Asia/Seoul",  # KST
+    enable_utc=True,        # UTC 유지 + 타임존-aware 스케줄 OK
     task_track_started=True,
     task_time_limit=30 * 60,  # 30분
     task_soft_time_limit=25 * 60,  # 25분
@@ -67,10 +67,11 @@ celery_app.conf.beat_schedule = {
         "task": "app.jobs.scheduler.daily_reset",
         "schedule": crontab(hour=0, minute=0),  # 매일 00:00
     },
-    # 매일 06:10 KST에 일일 리포트
+    # 매일 06:10 KST에 일일 리포트 (KST = UTC+9, 06:10 KST = 21:10 UTC 전날)
     "daily-report": {
         "task": "app.jobs.scheduler.daily_report",
-        "schedule": crontab(hour=6, minute=10),  # 매일 06:10 KST
+        "schedule": crontab(hour=21, minute=10),  # 매일 21:10 UTC = 06:10 KST
+        "args": [False, True],  # force=False, post=True (슬랙으로 보내기)
     },
 }
 
@@ -124,12 +125,12 @@ def pipeline_e2e(self):
                 if not ticker:
                     continue
                 
-                # 2. LLM 분석
+                # 2. LLM 분석 (EDGAR 이벤트이므로 조건 충족)
                 llm_insight = None
                 if llm_engine:
                     text = event.data.get("snippet_text", "")
                     url = event.data.get("url", "")
-                    llm_insight = llm_engine.analyze_text(text, url)
+                    llm_insight = llm_engine.analyze_text(text, url, edgar_event=True)
                 
                 # 3. 시세 데이터 가져오기 (간단한 모의 데이터)
                 candles = get_mock_candles(ticker)
@@ -283,8 +284,14 @@ def generate_signals(self):
                 recent_edgar = get_recent_edgar_filing(ticker)
                 if recent_edgar:
                     edgar_filing = recent_edgar
-                    # LLM 분석
+                    # LLM 분석 (EDGAR 이벤트이므로 조건 충족)
                     llm_insight = llm_engine.analyze_edgar_filing(edgar_filing)
+                
+                # 6. 레짐이 vol_spike인 경우 추가 LLM 분석
+                if regime_result.regime.value == 'vol_spike' and llm_engine and not llm_insight:
+                    # vol_spike 레짐에서 LLM 분석 (조건 충족)
+                    text = f"Volatility spike detected for {ticker} in {regime_result.regime.value} regime"
+                    llm_insight = llm_engine.analyze_text(text, f"vol_spike_{ticker}", regime='vol_spike')
                 
                 # 6. 시그널 믹싱
                 current_price = candles[-1].close if candles else 0
@@ -540,8 +547,8 @@ def daily_reset(self):
             "timestamp": datetime.now().isoformat()
         }
 
-@celery_app.task(bind=True, name="app.jobs.scheduler.daily_report")
-def daily_report(self):
+@celery_app.task(name="app.jobs.scheduler.daily_report")
+def daily_report(force=False, post=True):
     """일일 리포트 작업"""
     try:
         logger.info("일일 리포트 생성 시작")
@@ -578,7 +585,7 @@ def daily_report(self):
         }
         
         # Slack 리포트 전송
-        if slack_bot:
+        if slack_bot and post:
             slack_bot.send_daily_report(report_data)
         
         logger.info("일일 리포트 생성 완료")

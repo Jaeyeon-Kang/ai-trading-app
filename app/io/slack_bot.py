@@ -2,7 +2,7 @@
 Slack Bot
 알림 + 버튼 승인 기능
 """
-import requests
+import httpx
 import json
 import logging
 from typing import Dict, List, Optional, Callable
@@ -94,15 +94,15 @@ class SlackBot:
                 if message.thread_ts:
                     payload["thread_ts"] = message.thread_ts
                 
-                response = requests.post(
-                    f"{self.base_url}/chat.postMessage",
-                    headers={
-                        "Authorization": f"Bearer {self.token}",
-                        "Content-Type": "application/json"
-                    },
-                    json=payload,
-                    timeout=10
-                )
+                with httpx.Client(timeout=10) as client:
+                    response = client.post(
+                        f"{self.base_url}/chat.postMessage",
+                        headers={
+                            "Authorization": f"Bearer {self.token}",
+                            "Content-Type": "application/json"
+                        },
+                        json=payload
+                    )
                 
                 response.raise_for_status()
                 result = response.json()
