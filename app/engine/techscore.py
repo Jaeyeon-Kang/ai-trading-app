@@ -1,240 +1,365 @@
 """
-기술적 지표 점수화 엔진
-EMA/MACD/RSI/VWAP 편차 → 0~1 점수 변환
+TechScore 엔진 - Week 1 라이트봇 A단계
+EMA/MACD/RSI/VWAP 편차 → 0~1 정규화
 """
 import numpy as np
 import pandas as pd
 import logging
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from dataclasses import dataclass
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 @dataclass
-class TechScore:
-    """기술적 점수"""
-    overall_score: float  # 0~1 종합 점수
-    ema_score: float     # EMA 점수
-    macd_score: float    # MACD 점수
-    rsi_score: float     # RSI 점수
-    vwap_score: float    # VWAP 점수
+class TechScoreResult:
+    """TechScore 계산 결과"""
+    score: float  # 0~1 정규화된 점수
+    components: Dict[str, float]  # 각 지표별 점수
     timestamp: datetime
 
 class TechScoreEngine:
-    """기술적 점수 엔진"""
+    """TechScore 엔진 - Week 1 버전"""
     
     def __init__(self):
-        """초기화"""
-        # 점수 계산 파라미터
-        self.params = {
-            "ema": {
-                "weight": 0.3,
-                "short_period": 20,
-                "long_period": 50
-            },
-            "macd": {
-                "weight": 0.25,
-                "fast_period": 12,
-                "slow_period": 26,
-                "signal_period": 9
-            },
-            "rsi": {
-                "weight": 0.25,
-                "period": 14,
-                "oversold": 30,
-                "overbought": 70
-            },
-            "vwap": {
-                "weight": 0.2,
-                "deviation_threshold": 0.02  # 2% 편차
-            }
+        """TechScore 엔진 초기화"""
+        # 지표별 가중치
+        self.weights = {
+            "ema": 0.25,      # EMA 상승/하락
+            "macd": 0.25,     # MACD 신호
+            "rsi": 0.25,      # RSI 위치
+            "vwap": 0.25      # VWAP 편차
         }
         
-        logger.info("기술적 점수 엔진 초기화 완료")
+        # 정규화 범위
+        self.normalization_ranges = {
+            "ema": (-0.05, 0.05),    # -5% ~ +5%
+            "macd": (-2.0, 2.0),     # MACD 값 범위
+            "rsi": (20, 80),         # RSI 범위
+            "vwap": (-0.03, 0.03)    # VWAP 편차 -3% ~ +3%
+        }
+        
+        logger.info("TechScore 엔진 초기화 완료")
     
-    def calculate_tech_score(self, indicators: Dict, candles: List) -> TechScore:
+    def calculate_ema(self, prices: List[float], period: int) -> List[float]:
+        """EMA 계산"""
+        if len(prices) < period:
+            return []
+        
+        alpha = 2.0 / (period + 1)
+        ema = [prices[0]]
+        
+        for price in prices[1:]:
+            ema.append(alpha * price + (1 - alpha) * ema[-1])
+        
+        return ema
+    
+    def calculate_macd(self, prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Dict[str, float]:
+        """MACD 계산"""
+        if len(prices) < slow:
+            return {"macd": 0.0, "signal": 0.0, "histogram": 0.0}
+        
+        ema_fast = self.calculate_ema(prices, fast)
+        ema_slow = self.calculate_ema(prices, slow)
+        
+        if not ema_fast or not ema_slow:
+            return {"macd": 0.0, "signal": 0.0, "histogram": 0.0}
+        
+        # MACD 라인
+        macd_line = []
+        for i in range(len(ema_slow)):
+            if i < len(ema_fast):
+                macd_line.append(ema_fast[i] - ema_slow[i])
+            else:
+                macd_line.append(0.0)
+        
+        # Signal 라인 (MACD의 EMA)
+        signal_line = self.calculate_ema(macd_line, signal)
+        
+        # Histogram
+        histogram = []
+        for i in range(len(signal_line)):
+            if i < len(macd_line):
+                histogram.append(macd_line[i] - signal_line[i])
+            else:
+                histogram.append(0.0)
+        
+        return {
+            "macd": macd_line[-1] if macd_line else 0.0,
+            "signal": signal_line[-1] if signal_line else 0.0,
+            "histogram": histogram[-1] if histogram else 0.0
+        }
+    
+    def calculate_rsi(self, prices: List[float], period: int = 14) -> float:
+        """RSI 계산"""
+        if len(prices) < period + 1:
+            return 50.0
+        
+        gains = []
+        losses = []
+        
+        for i in range(1, len(prices)):
+            change = prices[i] - prices[i-1]
+            if change > 0:
+                gains.append(change)
+                losses.append(0)
+            else:
+                gains.append(0)
+                losses.append(abs(change))
+        
+        if len(gains) < period:
+            return 50.0
+        
+        avg_gain = np.mean(gains[-period:])
+        avg_loss = np.mean(losses[-period:])
+        
+        if avg_loss == 0:
+            return 100.0
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        return rsi
+    
+    def calculate_vwap(self, candles: List) -> float:
+        """VWAP 계산"""
+        if not candles:
+            return 0.0
+        
+        total_pv = 0.0  # Price * Volume
+        total_volume = 0.0
+        
+        for candle in candles:
+            # 캔들 중간가격
+            typical_price = (candle.h + candle.l + candle.c) / 3
+            total_pv += typical_price * candle.v
+            total_volume += candle.v
+        
+        if total_volume == 0:
+            return candles[-1].c
+        
+        return total_pv / total_volume
+    
+    def normalize_value(self, value: float, min_val: float, max_val: float) -> float:
+        """값을 0~1 범위로 정규화"""
+        if max_val == min_val:
+            return 0.5
+        
+        normalized = (value - min_val) / (max_val - min_val)
+        return max(0.0, min(1.0, normalized))
+    
+    def calculate_ema_score(self, prices: List[float]) -> float:
+        """EMA 점수 계산"""
+        if len(prices) < 20:
+            return 0.5
+        
+        ema_20 = self.calculate_ema(prices, 20)
+        ema_50 = self.calculate_ema(prices, 50)
+        
+        if not ema_20 or not ema_50:
+            return 0.5
+        
+        # EMA 20과 50의 비율
+        ema_ratio = (ema_20[-1] - ema_50[-1]) / ema_50[-1] if ema_50[-1] > 0 else 0
+        
+        # 정규화
+        min_val, max_val = self.normalization_ranges["ema"]
+        score = self.normalize_value(ema_ratio, min_val, max_val)
+        
+        return score
+    
+    def calculate_macd_score(self, prices: List[float]) -> float:
+        """MACD 점수 계산"""
+        if len(prices) < 26:
+            return 0.5
+        
+        macd_data = self.calculate_macd(prices)
+        
+        # MACD 히스토그램 사용 (신호선 대비 MACD 위치)
+        histogram = macd_data["histogram"]
+        
+        # 정규화
+        min_val, max_val = self.normalization_ranges["macd"]
+        score = self.normalize_value(histogram, min_val, max_val)
+        
+        return score
+    
+    def calculate_rsi_score(self, prices: List[float]) -> float:
+        """RSI 점수 계산"""
+        if len(prices) < 15:
+            return 0.5
+        
+        rsi = self.calculate_rsi(prices, 14)
+        
+        # RSI를 0~1로 변환 (50이 중간, 80 이상이 좋음, 20 이하가 나쁨)
+        if rsi >= 50:
+            # 50~100 범위를 0.5~1.0으로 매핑
+            score = 0.5 + (rsi - 50) / 50 * 0.5
+        else:
+            # 0~50 범위를 0.0~0.5로 매핑
+            score = rsi / 50 * 0.5
+        
+        return max(0.0, min(1.0, score))
+    
+    def calculate_vwap_score(self, candles: List) -> float:
+        """VWAP 점수 계산"""
+        if not candles:
+            return 0.5
+        
+        vwap = self.calculate_vwap(candles)
+        current_price = candles[-1].c
+        
+        # VWAP 대비 편차
+        vwap_deviation = (current_price - vwap) / vwap if vwap > 0 else 0
+        
+        # 정규화 (VWAP 위에 있으면 좋음)
+        min_val, max_val = self.normalization_ranges["vwap"]
+        score = self.normalize_value(vwap_deviation, min_val, max_val)
+        
+        return score
+    
+    def calculate_tech_score(self, candles: List) -> TechScoreResult:
         """
-        기술적 점수 계산
+        TechScore 계산
         
         Args:
-            indicators: 기술적 지표 딕셔너리
-            candles: OHLCV 캔들 리스트
+            candles: OHLCV 캔들 리스트 (Bar30s 객체들)
             
         Returns:
-            TechScore: 기술적 점수
+            TechScoreResult: 계산된 TechScore
         """
-        # 각 지표별 점수 계산
-        ema_score = self._calculate_ema_score(indicators)
-        macd_score = self._calculate_macd_score(indicators)
-        rsi_score = self._calculate_rsi_score(indicators)
-        vwap_score = self._calculate_vwap_score(indicators)
+        if len(candles) < 20:
+            return TechScoreResult(
+                score=0.5,
+                components={"ema": 0.5, "macd": 0.5, "rsi": 0.5, "vwap": 0.5},
+                timestamp=datetime.now()
+            )
         
-        # 종합 점수 계산 (상승장일수록 높은 점수)
-        overall_score = (
-            ema_score * self.params["ema"]["weight"] +
-            macd_score * self.params["macd"]["weight"] +
-            rsi_score * self.params["rsi"]["weight"] +
-            vwap_score * self.params["vwap"]["weight"]
+        # 가격 데이터 추출
+        prices = [c.c for c in candles]
+        
+        # 각 지표별 점수 계산
+        ema_score = self.calculate_ema_score(prices)
+        macd_score = self.calculate_macd_score(prices)
+        rsi_score = self.calculate_rsi_score(prices)
+        vwap_score = self.calculate_vwap_score(candles)
+        
+        # 가중 평균으로 최종 점수 계산
+        final_score = (
+            ema_score * self.weights["ema"] +
+            macd_score * self.weights["macd"] +
+            rsi_score * self.weights["rsi"] +
+            vwap_score * self.weights["vwap"]
         )
         
-        return TechScore(
-            overall_score=overall_score,
-            ema_score=ema_score,
-            macd_score=macd_score,
-            rsi_score=rsi_score,
-            vwap_score=vwap_score,
+        components = {
+            "ema": ema_score,
+            "macd": macd_score,
+            "rsi": rsi_score,
+            "vwap": vwap_score
+        }
+        
+        return TechScoreResult(
+            score=final_score,
+            components=components,
             timestamp=datetime.now()
         )
     
-    def _calculate_ema_score(self, indicators: Dict) -> float:
-        """EMA 점수 계산 - 20/50 EMA 관계"""
-        ema_20 = indicators.get("ema_20", 0)
-        ema_50 = indicators.get("ema_50", 0)
-        
-        if not ema_20 or not ema_50 or ema_50 == 0:
-            return 0.5  # 중립
-        
-        # EMA 비율 계산 (20EMA > 50EMA = 상승추세)
-        ema_ratio = (ema_20 - ema_50) / ema_50
-        
-        # -0.05 ~ +0.05 범위를 0~1로 정규화
-        # -5% = 0 (강한 하락), 0% = 0.5 (중립), +5% = 1 (강한 상승)
-        ema_score = np.clip((ema_ratio + 0.05) / 0.1, 0, 1)
-        
-        return ema_score
-    
-    def _calculate_macd_score(self, indicators: Dict) -> float:
-        """MACD 점수 계산 - MACD와 신호선 관계"""
-        macd = indicators.get("macd", 0)
-        macd_signal = indicators.get("macd_signal", 0)
-        
-        if macd is None or macd_signal is None:
-            return 0.5  # 중립
-        
-        # MACD 히스토그램 (MACD - Signal)
-        macd_histogram = macd - macd_signal
-        
-        # MACD 히스토그램을 0~1로 정규화
-        # -2 ~ +2 범위를 0~1로 정규화 (임의 범위)
-        macd_score = np.clip((macd_histogram + 2) / 4, 0, 1)
-        
-        return macd_score
-    
-    def _calculate_rsi_score(self, indicators: Dict) -> float:
-        """RSI 점수 계산 - RSI 14 기준"""
-        rsi = indicators.get("rsi", 50)
-        
-        if rsi is None:
-            return 0.5  # 중립
-        
-        # RSI를 0~1로 정규화 (상승장일수록 높은 점수)
-        # 0~100 범위를 0~1로 정규화
-        # 0 = 과매도, 50 = 중립, 100 = 과매수
-        rsi_score = np.clip(rsi / 100, 0, 1)
-        
-        return rsi_score
-    
-    def _calculate_vwap_score(self, indicators: Dict) -> float:
-        """VWAP 점수 계산 - 현재가와 VWAP 편차"""
-        current_price = indicators.get("current_price", 0)
-        vwap = indicators.get("vwap", 0)
-        
-        if not current_price or not vwap or vwap == 0:
-            return 0.5  # 중립
-        
-        # VWAP 편차 계산
-        vwap_deviation = (current_price - vwap) / vwap
-        
-        # 편차를 0~1로 정규화
-        # -0.05 ~ +0.05 범위를 0~1로 정규화
-        # -5% = 0 (VWAP 하단), 0% = 0.5 (VWAP), +5% = 1 (VWAP 상단)
-        vwap_score = np.clip((vwap_deviation + 0.05) / 0.1, 0, 1)
-        
-        return vwap_score
-    
-    def get_signal_direction(self, tech_score: TechScore) -> str:
-        """기술적 점수 기반 신호 방향"""
-        if tech_score.overall_score >= 0.7:
-            return "buy"
-        elif tech_score.overall_score <= 0.3:
-            return "sell"
+    def get_score_interpretation(self, score: float) -> str:
+        """TechScore 해석"""
+        if score >= 0.8:
+            return "매우 강한 상승 신호"
+        elif score >= 0.6:
+            return "강한 상승 신호"
+        elif score >= 0.4:
+            return "중립"
+        elif score >= 0.2:
+            return "강한 하락 신호"
         else:
-            return "neutral"
+            return "매우 강한 하락 신호"
+
+def main():
+    """테스트 실행"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
     
-    def get_signal_strength(self, tech_score: TechScore) -> float:
-        """신호 강도 (0~1)"""
-        if tech_score.overall_score >= 0.5:
-            # 매수 신호 강도
-            return (tech_score.overall_score - 0.5) * 2
-        else:
-            # 매도 신호 강도
-            return (0.5 - tech_score.overall_score) * 2
+    # 테스트용 가짜 데이터 생성
+    from dataclasses import dataclass
+    from datetime import datetime
     
-    def get_market_regime_score(self, tech_score: TechScore) -> str:
-        """시장 레짐 점수"""
-        if tech_score.overall_score >= 0.8:
-            return "strong_bull"
-        elif tech_score.overall_score >= 0.6:
-            return "bull"
-        elif tech_score.overall_score >= 0.4:
-            return "neutral"
-        elif tech_score.overall_score >= 0.2:
-            return "bear"
-        else:
-            return "strong_bear"
+    @dataclass
+    class Bar30s:
+        ticker: str
+        ts: datetime
+        o: float
+        h: float
+        l: float
+        c: float
+        v: int
+        spread_est: float
     
-    def get_breakout_score(self, indicators: Dict, candles: List) -> float:
-        """돌파 점수 계산 (추세 돌파 감지)"""
-        if len(candles) < 10:
-            return 0.0
-        
-        score = 0.0
-        
-        # 1. 최근 고점 돌파
-        recent_high = max(c.high for c in candles[-10:-1])  # 최근 9개 캔들
-        current_price = candles[-1].close
-        
-        if current_price > recent_high:
-            breakout_ratio = (current_price - recent_high) / recent_high
-            score += min(breakout_ratio * 10, 1.0)  # 10% 돌파 시 1.0
-        
-        # 2. VWAP 상단 돌파
-        vwap = indicators.get("vwap", 0)
-        if vwap and current_price > vwap:
-            vwap_deviation = indicators.get("vwap_deviation", 0)
-            if vwap_deviation > 0:
-                score += min(vwap_deviation * 5, 0.5)  # VWAP 10% 상단 시 0.5
-        
-        # 3. 거래량 동반
-        volume_spike = indicators.get("volume_spike", 0)
-        if volume_spike > 0.5:  # 거래량 50% 이상 증가
-            score += volume_spike * 0.3
-        
-        return min(score, 1.0)
+    # 상승장 데이터
+    bullish_candles = []
+    base_price = 100.0
+    for i in range(30):
+        price_change = 0.5 + (i * 0.2)  # 지속적 상승
+        candle = Bar30s(
+            ticker="TEST",
+            ts=datetime.now() - timedelta(minutes=30-i),
+            o=base_price + price_change,
+            h=base_price + price_change + 0.3,
+            l=base_price + price_change - 0.1,
+            c=base_price + price_change + 0.2,
+            v=1000,
+            spread_est=0.01
+        )
+        bullish_candles.append(candle)
+        base_price += price_change
     
-    def get_reversal_score(self, indicators: Dict, candles: List) -> float:
-        """반전 점수 계산 (평균회귀 감지)"""
-        if len(candles) < 5:
-            return 0.0
-        
-        score = 0.0
-        
-        # 1. RSI 극단값에서 반전
-        rsi = indicators.get("rsi", 50)
-        if rsi is not None:
-            if rsi <= 30:  # 과매도에서 반등 기대
-                score += (30 - rsi) / 30 * 0.5
-            elif rsi >= 70:  # 과매수에서 하락 기대
-                score += (rsi - 70) / 30 * 0.5
-        
-        # 2. 단기 모멘텀 반전
-        price_change_1m = indicators.get("price_change_1m", 0)
-        price_change_5m = indicators.get("price_change_5m", 0)
-        
-        if price_change_1m and price_change_5m:
-            # 단기와 중기 방향이 다르면 반전 신호
-            if (price_change_1m * price_change_5m) < 0:
-                score += min(abs(price_change_1m) * 10, 0.5)
-        
-        return min(score, 1.0)
+    # 하락장 데이터
+    bearish_candles = []
+    base_price = 100.0
+    for i in range(30):
+        price_change = -0.3 - (i * 0.1)  # 지속적 하락
+        candle = Bar30s(
+            ticker="TEST",
+            ts=datetime.now() - timedelta(minutes=30-i),
+            o=base_price + price_change,
+            h=base_price + price_change + 0.1,
+            l=base_price + price_change - 0.3,
+            c=base_price + price_change - 0.2,
+            v=1000,
+            spread_est=0.01
+        )
+        bearish_candles.append(candle)
+        base_price += price_change
+    
+    # TechScore 엔진 테스트
+    engine = TechScoreEngine()
+    
+    print("=== TechScore 테스트 ===")
+    
+    # 상승장 테스트
+    bullish_result = engine.calculate_tech_score(bullish_candles)
+    print(f"상승장 TechScore: {bullish_result.score:.3f}")
+    print(f"해석: {engine.get_score_interpretation(bullish_result.score)}")
+    print(f"구성요소: EMA={bullish_result.components['ema']:.3f}, MACD={bullish_result.components['macd']:.3f}, RSI={bullish_result.components['rsi']:.3f}, VWAP={bullish_result.components['vwap']:.3f}")
+    
+    # 하락장 테스트
+    bearish_result = engine.calculate_tech_score(bearish_candles)
+    print(f"하락장 TechScore: {bearish_result.score:.3f}")
+    print(f"해석: {engine.get_score_interpretation(bearish_result.score)}")
+    print(f"구성요소: EMA={bearish_result.components['ema']:.3f}, MACD={bearish_result.components['macd']:.3f}, RSI={bearish_result.components['rsi']:.3f}, VWAP={bearish_result.components['vwap']:.3f}")
+    
+    # 상승장일수록 TechScore가 높은지 확인
+    if bullish_result.score > bearish_result.score:
+        print("✅ 상승장일수록 TechScore↑ 확인 완료")
+    else:
+        print("❌ 상승장일수록 TechScore↑ 확인 실패")
+    
+    print("✅ TechScore 테스트 완료")
+
+if __name__ == "__main__":
+    main()

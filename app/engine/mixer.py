@@ -14,7 +14,7 @@ from enum import Enum
 import json
 
 from .regime import RegimeType, RegimeResult
-from .techscore import TechScore
+from .techscore import TechScoreResult
 from .llm_insight import LLMInsight
 
 logger = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ class SignalMixer:
     def mix_signals(self, 
                    ticker: str,
                    regime_result: RegimeResult,
-                   tech_score: TechScore,
+                   tech_score: TechScoreResult,
                    llm_insight: Optional[LLMInsight] = None,
                    edgar_filing: Optional[Dict] = None,
                    current_price: float = 0.0) -> Optional[TradingSignal]:
@@ -94,7 +94,7 @@ class SignalMixer:
             TradingSignal: 거래 시그널 (None if 신호 없음)
         """
         # 기본 점수 계산
-        tech_score_normalized = tech_score.overall_score
+        tech_score_normalized = tech_score.score
         sentiment_score = 0.0
         
         # LLM 인사이트가 있으면 감성 점수 사용
@@ -170,12 +170,7 @@ class SignalMixer:
             timestamp=datetime.now(),
             meta={
                 "regime_confidence": regime_result.confidence,
-                "tech_breakdown": {
-                    "ema": tech_score.ema_score,
-                    "macd": tech_score.macd_score,
-                    "rsi": tech_score.rsi_score,
-                    "vwap": tech_score.vwap_score
-                },
+                "tech_breakdown": tech_score.components,
                 "weights": weights,
                 "edgar_filing": edgar_filing
             }
@@ -241,7 +236,7 @@ class SignalMixer:
     
     def _calculate_confidence(self, 
                             regime_confidence: float,
-                            tech_score: TechScore,
+                            tech_score: TechScoreResult,
                             llm_insight: Optional[LLMInsight],
                             edgar_override: bool) -> float:
         """신뢰도 계산"""
@@ -254,10 +249,10 @@ class SignalMixer:
         
         # 기술적 점수 일관성 (각 지표 점수의 표준편차가 낮을수록 높은 신뢰도)
         tech_scores = [
-            tech_score.ema_score,
-            tech_score.macd_score,
-            tech_score.rsi_score,
-            tech_score.vwap_score
+            tech_score.components["ema"],
+            tech_score.components["macd"],
+            tech_score.components["rsi"],
+            tech_score.components["vwap"]
         ]
         tech_consistency = 1.0 - (max(tech_scores) - min(tech_scores))
         confidence += tech_consistency * 0.3
@@ -307,7 +302,7 @@ class SignalMixer:
     def _generate_trigger_summary(self,
                                 ticker: str,
                                 regime: RegimeType,
-                                tech_score: TechScore,
+                                tech_score: TechScoreResult,
                                 llm_insight: Optional[LLMInsight],
                                 edgar_filing: Optional[Dict]) -> Tuple[str, str]:
         """트리거와 요약 생성 (이유·호라이즌)"""
@@ -326,13 +321,13 @@ class SignalMixer:
             summary_parts.append("반등 기대")
         
         # 기술적 지표 기반
-        if tech_score.ema_score > 0.7:
+        if tech_score.components["ema"] > 0.7:
             trigger_parts.append("EMA 상승")
-        elif tech_score.macd_score > 0.7:
+        elif tech_score.components["macd"] > 0.7:
             trigger_parts.append("MACD 상승")
-        elif tech_score.rsi_score > 0.7:
+        elif tech_score.components["rsi"] > 0.7:
             trigger_parts.append("RSI 상승")
-        elif tech_score.vwap_score > 0.7:
+        elif tech_score.components["vwap"] > 0.7:
             trigger_parts.append("VWAP 상단")
         
         # LLM 인사이트 기반
