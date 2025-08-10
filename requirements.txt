@@ -28,6 +28,9 @@ structlog==23.2.0
 pydantic==2.5.0
 python-dateutil==2.8.2
 
+# LLM
+openai==1.99.6
+
 # 개발 도구 (선택사항)
 pytest==7.4.3
 pytest-asyncio==0.21.1
