@@ -9,9 +9,10 @@ EDGAR 이벤트면 ±0.1 보너스
 import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 import json
+import os
 
 from .regime import RegimeType, RegimeResult
 from .techscore import TechScoreResult
@@ -51,16 +52,19 @@ class SignalMixer:
     def __init__(self, 
                  buy_threshold: float = 0.6,
                  sell_threshold: float = -0.6,
-                 edgar_bonus: float = 0.1):
+                 edgar_bonus: float = 0.1,
+                 cooldown_seconds: int = 60):
         """
         Args:
             buy_threshold: 매수 임계값 (0.6)
             sell_threshold: 매도 임계값 (-0.6)
             edgar_bonus: EDGAR 오버라이드 보너스 (±0.1)
+            cooldown_seconds: 쿨다운 시간 (초)
         """
         self.buy_threshold = buy_threshold
         self.sell_threshold = sell_threshold
         self.edgar_bonus = edgar_bonus
+        self.cooldown_seconds = cooldown_seconds
         
         # 레짐별 가중치 (요구사항에 맞게 조정)
         self.regime_weights = {
@@ -70,7 +74,16 @@ class SignalMixer:
             RegimeType.SIDEWAYS: {"tech": 0.50, "sentiment": 0.50}
         }
         
-        logger.info(f"시그널 믹서 초기화: 매수 {buy_threshold}, 매도 {sell_threshold}, EDGAR 보너스 ±{edgar_bonus}")
+        # 쿨다운 캐시: 동일 티커 60초 내 재신호 제한
+        self.last_signal_by_ticker: Dict[str, Tuple[datetime, float]] = {}
+        
+        # EDGAR 오버라이드 아이템 (환경변수에서 로드)
+        self.edgar_override_items = os.getenv("EDGAR_OVERRIDE_ITEMS", "1.01,2.02").split(",")
+        
+        # Regulatory/소송 차단 키워드
+        self.regulatory_block_words = os.getenv("REGULATORY_BLOCK_WORDS", "regulatory,litigation,FTC,SEC,DoJ").split(",")
+        
+        logger.info(f"시그널 믹서 초기화: 매수 {buy_threshold}, 매도 {sell_threshold}, EDGAR 보너스 ±{edgar_bonus}, 쿨다운 {cooldown_seconds}초")
     
     def mix_signals(self, 
                    ticker: str,
@@ -93,16 +106,20 @@ class SignalMixer:
         Returns:
             TradingSignal: 거래 시그널 (None if 신호 없음)
         """
-        # 기본 점수 계산
-        tech_score_normalized = tech_score.score
+        # 입력 스케일 클램프: tech ∈ [-1,1], sent ∈ [-1,1]
+        tech_score_normalized = max(-1.0, min(1.0, tech_score.score))
         sentiment_score = 0.0
         
         # LLM 인사이트가 있으면 감성 점수 사용
         if llm_insight:
-            sentiment_score = llm_insight.sentiment
+            sentiment_score = max(-1.0, min(1.0, llm_insight.sentiment))
         elif edgar_filing:
             # EDGAR 공시가 있으면 기본 감성 점수
-            sentiment_score = self._get_edgar_sentiment(edgar_filing)
+            sentiment_score = max(-1.0, min(1.0, self._get_edgar_sentiment(edgar_filing)))
+        
+        # Regulatory/소송 트리거 필터: 롱 점수 0으로
+        if self._is_regulatory_block(edgar_filing, llm_insight):
+            sentiment_score = max(-1.0, min(0.0, sentiment_score))  # 롱 차단
         
         # 레짐별 가중치 적용
         regime = regime_result.regime
@@ -123,6 +140,11 @@ class SignalMixer:
                 edgar_bonus = -self.edgar_bonus  # -0.1
             
             final_score += edgar_bonus
+        
+        # 쿨다운 체크: 동일 티커 60초 내 재신호는 점수 개선 시에만
+        if not self._check_cooldown(ticker, final_score):
+            logger.debug(f"쿨다운 제한: {ticker} (점수 개선 없음)")
+            return None
         
         # 신호 타입 결정 (임계: score ≥ 0.6 → LONG, ≤ -0.6 → SHORT)
         signal_type = self._determine_signal_type(final_score)
@@ -176,9 +198,49 @@ class SignalMixer:
             }
         )
         
+        # 쿨다운 캐시 업데이트
+        self.last_signal_by_ticker[ticker] = (datetime.now(), final_score)
+        
         logger.info(f"시그널 생성: {ticker} {signal_type.value} (점수: {final_score:.2f}, 신뢰도: {confidence:.2f})")
         
         return signal
+    
+    def _is_regulatory_block(self, edgar_filing: Optional[Dict], llm_insight: Optional[LLMInsight]) -> bool:
+        """Regulatory/소송 트리거 확인"""
+        # EDGAR 공시에서 차단 키워드 확인
+        if edgar_filing:
+            summary = edgar_filing.get("summary", "").lower()
+            for word in self.regulatory_block_words:
+                if word.lower() in summary:
+                    logger.info(f"Regulatory 차단: {word} 키워드 발견")
+                    return True
+        
+        # LLM 인사이트에서 차단 키워드 확인
+        if llm_insight:
+            trigger = llm_insight.trigger.lower()
+            summary = llm_insight.summary.lower()
+            for word in self.regulatory_block_words:
+                if word.lower() in trigger or word.lower() in summary:
+                    logger.info(f"Regulatory 차단: {word} 키워드 발견")
+                    return True
+        
+        return False
+    
+    def _check_cooldown(self, ticker: str, current_score: float) -> bool:
+        """쿨다운 체크: 점수 개선 시에만 통과"""
+        if ticker not in self.last_signal_by_ticker:
+            return True
+        
+        last_time, last_score = self.last_signal_by_ticker[ticker]
+        time_diff = (datetime.now() - last_time).total_seconds()
+        
+        # 쿨다운 시간 내에 있으면 점수 개선 확인
+        if time_diff < self.cooldown_seconds:
+            score_improvement = current_score - last_score
+            if score_improvement < 0.10:  # +0.10 이상 개선이어야 함
+                return False
+        
+        return True
     
     def _get_edgar_sentiment(self, edgar_filing: Dict) -> float:
         """EDGAR 공시 기본 감성 점수"""
@@ -213,11 +275,9 @@ class SignalMixer:
         form_type = edgar_filing.get("form_type", "")
         items = edgar_filing.get("items", [])
         
-        # 8-K 중요 아이템
-        important_items = ["2.02", "1.01", "2.05"]  # 실적, 계약, 구조조정
-        
+        # 8-K 중요 아이템 (환경변수에서 로드)
         if form_type == "8-K":
-            return any(item in important_items for item in items)
+            return any(item in self.edgar_override_items for item in items)
         
         # Form 4는 항상 중요
         elif form_type == "4":

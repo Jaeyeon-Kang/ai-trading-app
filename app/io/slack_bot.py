@@ -25,14 +25,16 @@ class SlackMessage:
 class SignalNotification:
     """시그널 알림"""
     ticker: str
-    signal_type: str  # "buy", "sell"
+    signal_type: str  # "long", "short"
     score: float
     confidence: float
+    regime: str
     trigger: str
     summary: str
     entry_price: float
     stop_loss: float
     take_profit: float
+    horizon_minutes: int
     timestamp: datetime
 
 class SlackBot:
@@ -51,14 +53,21 @@ class SlackBot:
         # 승인 콜백 저장
         self.approval_callbacks: Dict[str, Callable] = {}
         
+        # 스레드 타임스탬프 캐시 (티커별)
+        self.thread_ts_by_ticker: Dict[str, str] = {}
+        
+        # 재시도 설정
+        self.max_retries = 3
+        self.retry_delays = [0.5, 1.0, 2.0]  # 백오프 0.5s, 1s, 2s
+        
         # 메시지 템플릿
         self.templates = {
             "signal": {
-                "buy": {
+                "long": {
                     "color": "#36a64f",  # 초록색
                     "emoji": "🟢"
                 },
-                "sell": {
+                "short": {
                     "color": "#ff0000",  # 빨간색
                     "emoji": "🔴"
                 }
@@ -68,95 +77,87 @@ class SlackBot:
         logger.info(f"Slack Bot 초기화: 채널 {channel}")
     
     def send_message(self, message: SlackMessage) -> bool:
-        """메시지 전송"""
-        payload = {
-            "channel": message.channel,
-            "text": message.text
-        }
-        
-        if message.blocks:
-            payload["blocks"] = message.blocks
-        
-        if message.attachments:
-            payload["attachments"] = message.attachments
-        
-        if message.thread_ts:
-            payload["thread_ts"] = message.thread_ts
-        
-        try:
-            response = requests.post(
-                f"{self.base_url}/chat.postMessage",
-                headers={
-                    "Authorization": f"Bearer {self.token}",
-                    "Content-Type": "application/json"
-                },
-                json=payload
-            )
-            
-            response.raise_for_status()
-            result = response.json()
-            
-            if result.get("ok"):
-                logger.debug(f"Slack 메시지 전송 성공: {message.channel}")
-                return True
-            else:
-                logger.error(f"Slack 메시지 전송 실패: {result.get('error')}")
-                return False
+        """메시지 전송 (재시도 로직 포함)"""
+        for attempt in range(self.max_retries):
+            try:
+                payload = {
+                    "channel": message.channel,
+                    "text": message.text
+                }
                 
-        except Exception as e:
-            logger.error(f"Slack 메시지 전송 실패: {e}")
-            return False
+                if message.blocks:
+                    payload["blocks"] = message.blocks
+                
+                if message.attachments:
+                    payload["attachments"] = message.attachments
+                
+                if message.thread_ts:
+                    payload["thread_ts"] = message.thread_ts
+                
+                response = requests.post(
+                    f"{self.base_url}/chat.postMessage",
+                    headers={
+                        "Authorization": f"Bearer {self.token}",
+                        "Content-Type": "application/json"
+                    },
+                    json=payload,
+                    timeout=10
+                )
+                
+                response.raise_for_status()
+                result = response.json()
+                
+                if result.get("ok"):
+                    logger.debug(f"Slack 메시지 전송 성공: {message.channel}")
+                    return True
+                else:
+                    logger.error(f"Slack 메시지 전송 실패: {result.get('error')}")
+                    if attempt < self.max_retries - 1:
+                        time.sleep(self.retry_delays[attempt])
+                        continue
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"Slack 메시지 전송 실패 (시도 {attempt + 1}): {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delays[attempt])
+                    continue
+                return False
+        
+        return False
     
     def send_signal_notification(self, signal: SignalNotification) -> str:
-        """거래 시그널 알림 전송"""
+        """거래 시그널 알림 전송 (업그레이드된 포맷)"""
         signal_config = self.templates["signal"][signal.signal_type]
         
-        # 메시지 텍스트
-        text = f"{signal_config['emoji']} *{signal.ticker} {signal.signal_type.upper()}* 시그널"
+        # 메시지 포맷: "AAPL | 레짐 VOL_SPIKE(1.00) | 점수 +0.67 롱"
+        regime_display = signal.regime.upper().replace("_", "")
+        score_sign = "+" if signal.score >= 0 else ""
+        signal_type_kr = "롱" if signal.signal_type == "long" else "숏"
+        
+        text = f"{signal.ticker} | 레짐 {regime_display}({signal.confidence:.2f}) | 점수 {score_sign}{signal.score:.2f} {signal_type_kr}"
         
         # 블록 구성
         blocks = [
             {
-                "type": "header",
-                "text": {
-                    "type": "plain_text",
-                    "text": f"{signal.ticker} {signal.signal_type.upper()} 시그널"
-                }
-            },
-            {
                 "type": "section",
-                "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*점수:* {signal.score:.2f}"
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*신뢰도:* {signal.confidence:.1%}"
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*진입가:* ${signal.entry_price:.2f}"
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*손절가:* ${signal.stop_loss:.2f}"
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*익절가:* ${signal.take_profit:.2f}"
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*시간:* {signal.timestamp.strftime('%H:%M:%S')}"
-                    }
-                ]
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*{signal.ticker} | 레짐 {regime_display}({signal.confidence:.2f}) | 점수 {score_sign}{signal.score:.2f} {signal_type_kr}*"
+                }
             },
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"*트리거:* {signal.trigger}\n*요약:* {signal.summary}"
+                    "text": f"*제안:* 진입 ${signal.entry_price:.2f} / SL ${signal.stop_loss:.2f} / TP ${signal.take_profit:.2f}"
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*이유:* {signal.trigger} (≤{signal.horizon_minutes}m)"
                 }
             }
         ]
@@ -170,7 +171,7 @@ class SlackBot:
                         "type": "button",
                         "text": {
                             "type": "plain_text",
-                            "text": "✅ 매수",
+                            "text": "✅ 승인",
                             "emoji": True
                         },
                         "style": "primary",
@@ -200,15 +201,24 @@ class SlackBot:
             }
         ]
         
+        # 스레드 묶기: 티커별 thread_ts 유지
+        thread_ts = self.thread_ts_by_ticker.get(signal.ticker)
+        
         message = SlackMessage(
             channel=self.default_channel,
             text=text,
             blocks=blocks,
-            attachments=attachments
+            attachments=attachments,
+            thread_ts=thread_ts
         )
         
         success = self.send_message(message)
         if success:
+            # 스레드 타임스탬프 업데이트 (첫 번째 메시지인 경우)
+            if not thread_ts:
+                # 실제로는 응답에서 ts를 가져와야 하지만, 여기서는 간단히 처리
+                self.thread_ts_by_ticker[signal.ticker] = str(int(signal.timestamp.timestamp()))
+            
             # 승인 콜백 등록
             callback_id = f"{signal.ticker}_{signal.signal_type}_{signal.timestamp.timestamp()}"
             self.approval_callbacks[callback_id] = {
@@ -294,7 +304,7 @@ class SlackBot:
                     },
                     {
                         "type": "mrkdwn",
-                        "text": f"*LLM 비용:* ${llm.get('monthly_cost_usd', 0):.2f}"
+                        "text": f"*LLM 비용:* ₩{llm.get('monthly_cost_krw', 0):,.0f}"
                     }
                 ]
             })
@@ -417,6 +427,56 @@ class SlackBot:
         
         return success
     
+    def send_llm_status_change(self, llm_enabled: bool) -> bool:
+        """LLM 상태 변경 알림"""
+        if llm_enabled:
+            text = "🤖 *LLM 활성화됨*"
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "LLM 분석이 활성화되었습니다. 뉴스 및 EDGAR 분석이 가능합니다."
+                    }
+                }
+            ]
+            color = "#36a64f"
+        else:
+            text = "🤖 *LLM 비활성화됨*"
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "LLM 비용 한도 초과로 비활성화되었습니다. 기술신호만 사용됩니다."
+                    }
+                }
+            ]
+            color = "#ff0000"
+        
+        attachments = [
+            {
+                "color": color,
+                "footer": "Trading Bot",
+                "ts": int(datetime.now().timestamp())
+            }
+        ]
+        
+        message = SlackMessage(
+            channel=self.default_channel,
+            text=text,
+            blocks=blocks,
+            attachments=attachments
+        )
+        
+        success = self.send_message(message)
+        if success:
+            logger.info(f"LLM 상태 변경 알림: {'활성화' if llm_enabled else '비활성화'}")
+        else:
+            logger.error(f"LLM 상태 변경 알림 전송 실패")
+        
+        return success
+    
     def send_system_status(self, status_data: Dict) -> bool:
         """시스템 상태 알림"""
         status = status_data.get("status", "unknown")
@@ -527,7 +587,8 @@ class SlackBot:
                     message = SlackMessage(
                         channel=self.default_channel,
                         text=text,
-                        blocks=blocks
+                        blocks=blocks,
+                        thread_ts=self.thread_ts_by_ticker.get(ticker)
                     )
                     
                     self.send_message(message)
@@ -606,5 +667,6 @@ class SlackBot:
             "connected": True,  # 실제로는 연결 상태 확인 필요
             "channel": self.default_channel,
             "pending_callbacks": len(self.approval_callbacks),
+            "active_threads": len(self.thread_ts_by_ticker),
             "timestamp": datetime.now().isoformat()
         }

@@ -31,7 +31,7 @@ class RedisStreams:
             db: Redis 데이터베이스 번호
         """
         self.redis_client = redis.Redis(host=host, port=port, db=db, decode_responses=True)
-        self.consumer_group = "trading_bot"
+        self.consumer_group = "bot"  # 요구사항에 맞게 변경
         self.consumer_name = "worker_1"
         
         # 스트림 키 정의
@@ -283,7 +283,7 @@ class RedisStreams:
             result = self.redis_client.xreadgroup(
                 group_name,
                 consumer_name,
-                {stream_key: ">"},
+                {stream_key: ">"},  # ">" = latest (요구사항)
                 count=count,
                 block=block_ms
             )
@@ -358,3 +358,85 @@ class RedisStreams:
                 "error": str(e),
                 "timestamp": datetime.now().isoformat()
             }
+
+class StreamConsumer:
+    """Redis Streams 소비자 (bot 그룹)"""
+    
+    def __init__(self, redis_streams: RedisStreams, consumer_name: str = "worker_1"):
+        """
+        Args:
+            redis_streams: Redis Streams 인스턴스
+            consumer_name: 컨슈머 이름
+        """
+        self.redis_streams = redis_streams
+        self.consumer_name = consumer_name
+        self.group_name = "bot"  # 요구사항에 맞게 고정
+        
+        # 소비할 스트림들
+        self.streams = [
+            "news.edgar",
+            "signals.tradable"
+        ]
+        
+        # 컨슈머 그룹 초기화
+        self._init_consumer_groups()
+        
+        logger.info(f"Stream Consumer 초기화: {consumer_name}")
+    
+    def _init_consumer_groups(self):
+        """컨슈머 그룹 초기화"""
+        for stream_key in self.streams:
+            try:
+                self.redis_streams.create_consumer_group(stream_key, self.group_name)
+            except Exception as e:
+                logger.error(f"컨슈머 그룹 초기화 실패 ({stream_key}): {e}")
+    
+    def consume_edgar_events(self, count: int = 10, block_ms: int = 1000) -> List[StreamMessage]:
+        """EDGAR 이벤트 소비"""
+        return self.redis_streams.read_from_group(
+            "news.edgar",
+            self.group_name,
+            self.consumer_name,
+            count=count,
+            block_ms=block_ms
+        )
+    
+    def consume_tradable_signals(self, count: int = 10, block_ms: int = 1000) -> List[StreamMessage]:
+        """거래 가능한 시그널 소비"""
+        return self.redis_streams.read_from_group(
+            "signals.tradable",
+            self.group_name,
+            self.consumer_name,
+            count=count,
+            block_ms=block_ms
+        )
+    
+    def consume_quotes(self, ticker: str, mic: str = "XNAS", 
+                      count: int = 10, block_ms: int = 1000) -> List[StreamMessage]:
+        """시세 데이터 소비 (동적 스트림)"""
+        stream_key = f"quotes.{mic}.{ticker}"
+        
+        # 동적 스트림의 경우 컨슈머 그룹 생성 시도
+        try:
+            self.redis_streams.create_consumer_group(stream_key, self.group_name)
+        except:
+            pass  # 이미 존재하거나 실패해도 계속 진행
+        
+        return self.redis_streams.read_from_group(
+            stream_key,
+            self.group_name,
+            self.consumer_name,
+            count=count,
+            block_ms=block_ms
+        )
+    
+    def acknowledge(self, stream_key: str, message_id: str):
+        """메시지 확인"""
+        self.redis_streams.acknowledge_message(stream_key, self.group_name, message_id)
+    
+    def get_pending_count(self, stream_key: str) -> int:
+        """대기 중인 메시지 수 조회"""
+        pending = self.redis_streams.get_pending_messages(stream_key, self.group_name)
+        if pending and len(pending) >= 4:
+            return pending[3]  # pending count
+        return 0

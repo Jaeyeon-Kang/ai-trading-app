@@ -1,173 +1,184 @@
 """
-LLM 인사이트 엔진 (해석 전용, 검색 금지)
-헤드라인/EDGAR 스니펫(≤1000자) → JSON(점수/원인/기간/요약), 캐시·비용가드
+LLM 인사이트 엔진
+뉴스 헤드라인 및 EDGAR 공시 분석
+입력: 헤드라인/EDGAR 스니펫(≤1000자)
+출력(JSON): {sentiment:-1~1, trigger:str, horizon_minutes:int, summary:str}
+24시간 캐시, 분당 1콜 제한, 월 비용 KRW 기준 집계
+→ LLM_MONTHLY_CAP_KRW 넘으면 자동 OFF(그때는 기술신호만)
 """
-import openai
-import json
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass
 import hashlib
-import time
-from enum import Enum
+import json
 import os
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+import time
+import numpy as np
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
-
-class LLMStatus(Enum):
-    """LLM 상태"""
-    ACTIVE = "active"
-    RATE_LIMITED = "rate_limited"
-    COST_LIMITED = "cost_limited"
-    ERROR = "error"
 
 @dataclass
 class LLMInsight:
     """LLM 인사이트 결과"""
     sentiment: float  # -1 ~ +1
-    trigger: str  # 원인
+    trigger: str  # 트리거 키워드
     horizon_minutes: int  # 영향 지속 시간 (분)
-    summary: str  # 한 줄 요약
+    summary: str  # 요약
     timestamp: datetime
-    cost_krw: float  # API 비용 (원화)
+    cost_krw: float  # 비용 (KRW)
 
 class LLMInsightEngine:
-    """LLM 인사이트 엔진 (해석 전용)"""
+    """LLM 인사이트 엔진"""
     
-    def __init__(self, api_key: Optional[str] = None, monthly_cap_krw: float = 80000):
+    def __init__(self, 
+                 api_key: str = None,
+                 monthly_cap_krw: float = 80000.0,  # 월 비용 한도 (KRW)
+                 usd_to_krw: float = 1300.0,  # USD/KRW 환율
+                 cache_hours: int = 24):  # 캐시 시간 (시간)
         """
         Args:
-            api_key: OpenAI API 키 (None이면 환경변수에서 로드)
-            monthly_cap_krw: 월 비용 상한 (원화)
+            api_key: OpenAI API 키 (환경변수 OPENAI_API_KEY에서 로드)
+            monthly_cap_krw: 월 비용 한도 (KRW)
+            usd_to_krw: USD/KRW 환율
+            cache_hours: 캐시 시간 (시간)
         """
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("OpenAI API 키가 필요합니다")
-        
         self.monthly_cap_krw = monthly_cap_krw
-        
-        # 비용 추적 (원화 기준)
-        self.monthly_cost_krw = 0.0
-        self.monthly_start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        
-        # 캐시 (24시간 TTL)
-        self.cache: Dict[str, Dict] = {}
-        self.cache_ttl_hours = 24
-        
-        # 속도 제한 (분당 1콜)
-        self.rate_limit_calls_per_minute = 1
-        self.last_call_time = None
-        
-        # 상태
-        self.status = LLMStatus.ACTIVE
+        self.usd_to_krw = usd_to_krw
+        self.cache_hours = cache_hours
         
         # OpenAI 클라이언트
-        openai.api_key = self.api_key
+        if self.api_key:
+            self.client = OpenAI(api_key=self.api_key)
+        else:
+            self.client = None
+            logger.warning("OpenAI API 키가 설정되지 않음")
         
-        # 환율 (고정값, 실제로는 API로 가져와야 함)
-        self.usd_to_krw = 1300
+        # 캐시 (메모리 기반, 실제로는 Redis 사용 권장)
+        self.cache: Dict[str, Dict] = {}
         
-        logger.info(f"LLM 인사이트 엔진 초기화: 월 상한 {monthly_cap_krw:,}원")
+        # 비용 추적
+        self.monthly_cost_krw = 0.0
+        self.current_month = datetime.now().month
+        
+        # 속도 제한
+        self.rate_limit_calls_per_minute = 1
+        self.last_call_time = 0
+        
+        # LLM 활성화 상태
+        self.llm_enabled = True
+        
+        # 슬랙 봇 참조 (상태 변경 알림용)
+        self.slack_bot = None
+        
+        logger.info(f"LLM 인사이트 엔진 초기화: 월 한도 {monthly_cap_krw:,.0f}원, 캐시 {cache_hours}시간")
     
-    def analyze_text(self, text: str, source: str = "unknown") -> Optional[LLMInsight]:
+    def set_slack_bot(self, slack_bot):
+        """슬랙 봇 설정 (상태 변경 알림용)"""
+        self.slack_bot = slack_bot
+    
+    def analyze_text(self, text: str, source: str = "") -> Optional[LLMInsight]:
         """
-        텍스트 분석 (해석 전용)
+        텍스트 분석
         
         Args:
             text: 분석할 텍스트 (≤1000자)
-            source: 텍스트 출처 (URL 등)
+            source: 소스 URL (캐시 키용)
             
         Returns:
-            LLMInsight: 분석 결과 (None if 제한/에러)
+            LLMInsight: 분석 결과 (None if 실패)
         """
         # 텍스트 길이 제한
         if len(text) > 1000:
             text = text[:1000]
-            logger.warning(f"텍스트가 1000자를 초과하여 잘렸습니다")
         
-        # 캐시 확인 (URL 기반)
+        # 캐시 확인
         cache_key = self._generate_cache_key(text, source)
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
             logger.debug(f"캐시 히트: {source}")
             return cached_result
         
-        # 제한 확인
+        # LLM 비활성화 상태 확인
+        if not self.llm_enabled:
+            logger.debug("LLM 비활성화 상태 - 캐시된 결과만 사용")
+            return None
+        
+        # 속도 제한 확인
         if not self._check_limits():
-            logger.warning(f"LLM 제한 도달: {self.status.value}")
+            logger.warning("속도 제한 또는 비용 한도 초과")
+            return None
+        
+        # LLM 호출
+        try:
+            result = self._call_llm(text)
+            if result:
+                # 캐시에 저장
+                self._cache_result(cache_key, result)
+                
+                # 비용 업데이트
+                self._update_cost(result.cost_krw)
+                
+                logger.info(f"LLM 분석 완료: {source} (비용: {result.cost_krw:.0f}원)")
+                return result
+            
+        except Exception as e:
+            logger.error(f"LLM 분석 실패: {e}")
+        
+        return None
+    
+    def _call_llm(self, text: str) -> Optional[LLMInsight]:
+        """LLM API 호출"""
+        if not self.client:
             return None
         
         try:
-            # LLM 호출
-            result = self._call_llm(text, source)
+            prompt = self._build_prompt(text)
             
-            # 캐시 저장
-            self._cache_result(cache_key, result)
+            response = self.client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "당신은 금융 분석가입니다. 주어진 텍스트를 분석하여 JSON 형태로 응답하세요. 검색하지 말고 텍스트만 해석하세요."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=150,
+                temperature=0.3
+            )
             
-            # 비용 추적
-            self._update_cost(result.cost_krw)
+            content = response.choices[0].message.content
+            result = self._parse_llm_response(content)
             
-            logger.info(f"LLM 분석 완료: {source} (점수: {result.sentiment:.2f})")
+            if result:
+                # 비용 계산 (GPT-3.5-turbo 기준)
+                input_tokens = len(text.split()) * 1.3  # 대략적 추정
+                output_tokens = len(content.split())
+                cost_usd = (input_tokens * 0.0000015) + (output_tokens * 0.000002)
+                cost_krw = cost_usd * self.usd_to_krw
+                
+                result.cost_krw = cost_krw
+                result.timestamp = datetime.now()
+            
             return result
             
         except Exception as e:
-            logger.error(f"LLM 분석 실패 ({source}): {e}")
-            self.status = LLMStatus.ERROR
+            logger.error(f"LLM API 호출 실패: {e}")
             return None
     
-    def _call_llm(self, text: str, source: str) -> LLMInsight:
-        """LLM API 호출 (해석 전용)"""
-        # 프롬프트 구성
-        prompt = self._build_prompt(text, source)
-        
-        # API 호출
-        response = openai.ChatCompletion.create(
-            model="gpt-4o-mini",  # 비용 절약을 위해 mini 사용
-            messages=[
-                {
-                    "role": "system", 
-                    "content": "당신은 금융 분석가입니다. 주어진 텍스트를 분석하여 JSON 형태로 응답하세요. 검색하지 말고 텍스트만 해석하세요."
-                },
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=150,
-            temperature=0.1
-        )
-        
-        # 응답 파싱
-        content = response.choices[0].message.content
-        result_data = self._parse_llm_response(content)
-        
-        # 비용 계산 (원화)
-        input_tokens = response.usage.prompt_tokens
-        output_tokens = response.usage.completion_tokens
-        cost_usd = (input_tokens * 0.00015 + output_tokens * 0.0006) / 1000
-        cost_krw = cost_usd * self.usd_to_krw
-        
-        return LLMInsight(
-            sentiment=result_data.get("sentiment", 0.0),
-            trigger=result_data.get("trigger", "unknown"),
-            horizon_minutes=result_data.get("horizon_minutes", 60),
-            summary=result_data.get("summary", ""),
-            timestamp=datetime.now(),
-            cost_krw=cost_krw
-        )
-    
-    def _build_prompt(self, text: str, source: str) -> str:
+    def _build_prompt(self, text: str) -> str:
         """프롬프트 구성"""
         return f"""
-다음 금융 텍스트를 분석하세요:
+다음 텍스트를 분석하여 JSON 형태로 응답하세요. 검색하지 말고 텍스트만 해석하세요.
 
 텍스트: {text}
-출처: {source}
 
 다음 JSON 형식으로만 응답하세요:
 {{
-    "sentiment": -1.0에서 1.0 사이의 실수 (매우 부정적 ~ 매우 긍정적),
-    "trigger": 감정을 일으킨 원인 (문자열),
-    "horizon_minutes": 이 감정이 지속될 시간 (분, 15-480),
-    "summary": 한 줄 요약 (한국어)
+    "sentiment": -1.0에서 1.0 사이의 감성 점수 (부정적=-1, 긍정적=+1),
+    "trigger": "주요 트리거 키워드나 이벤트",
+    "horizon_minutes": 15에서 480 사이의 영향 지속 시간 (분),
+    "summary": "한 줄 요약"
 }}
 
 예시:
@@ -177,78 +188,69 @@ class LLMInsightEngine:
     "horizon_minutes": 120,
     "summary": "실적 예상치 상회로 긍정적"
 }}
-
-JSON 응답:"""
+"""
     
-    def _parse_llm_response(self, content: str) -> Dict[str, Any]:
+    def _parse_llm_response(self, response: str) -> Optional[LLMInsight]:
         """LLM 응답 파싱"""
         try:
             # JSON 추출
-            start_idx = content.find('{')
-            end_idx = content.rfind('}') + 1
+            start = response.find('{')
+            end = response.rfind('}') + 1
+            if start == -1 or end == 0:
+                return None
             
-            if start_idx == -1 or end_idx == 0:
-                raise ValueError("JSON not found in response")
+            json_str = response[start:end]
+            data = json.loads(json_str)
             
-            json_str = content[start_idx:end_idx]
-            result = json.loads(json_str)
+            # 값 검증 및 클램핑
+            sentiment = np.clip(float(data.get("sentiment", 0)), -1.0, 1.0)
+            trigger = str(data.get("trigger", ""))
+            horizon_minutes = np.clip(int(data.get("horizon_minutes", 120)), 15, 480)
+            summary = str(data.get("summary", ""))
             
-            # 값 검증 및 정규화
-            sentiment = float(result.get("sentiment", 0.0))
-            sentiment = max(-1.0, min(1.0, sentiment))  # -1~1 범위로 제한
-            
-            horizon = int(result.get("horizon_minutes", 60))
-            horizon = max(15, min(480, horizon))  # 15~480분 범위로 제한
-            
-            return {
-                "sentiment": sentiment,
-                "trigger": str(result.get("trigger", "unknown")),
-                "horizon_minutes": horizon,
-                "summary": str(result.get("summary", ""))
-            }
+            return LLMInsight(
+                sentiment=sentiment,
+                trigger=trigger,
+                horizon_minutes=horizon_minutes,
+                summary=summary,
+                timestamp=datetime.now(),
+                cost_krw=0.0  # 나중에 설정
+            )
             
         except Exception as e:
             logger.error(f"LLM 응답 파싱 실패: {e}")
-            return {
-                "sentiment": 0.0,
-                "trigger": "parsing_error",
-                "horizon_minutes": 60,
-                "summary": "분석 실패"
-            }
+            return None
     
     def _generate_cache_key(self, text: str, source: str) -> str:
-        """캐시 키 생성 (URL 기반)"""
-        # 소스(URL) 기반 해시
-        source_hash = hashlib.md5(source.encode()).hexdigest()
-        # 텍스트 해시 (첫 200자만)
-        text_hash = hashlib.md5(text[:200].encode()).hexdigest()
+        """캐시 키 생성"""
+        source_hash = hashlib.md5(source.encode()).hexdigest()[:8]
+        text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
         return f"{source_hash}_{text_hash}"
     
     def _get_cached_result(self, cache_key: str) -> Optional[LLMInsight]:
         """캐시된 결과 조회"""
-        if cache_key not in self.cache:
-            return None
+        if cache_key in self.cache:
+            cached_data = self.cache[cache_key]
+            cached_time = datetime.fromisoformat(cached_data["timestamp"])
+            
+            # 캐시 만료 확인
+            if datetime.now() - cached_time < timedelta(hours=self.cache_hours):
+                return LLMInsight(
+                    sentiment=cached_data["sentiment"],
+                    trigger=cached_data["trigger"],
+                    horizon_minutes=cached_data["horizon_minutes"],
+                    summary=cached_data["summary"],
+                    timestamp=cached_time,
+                    cost_krw=0.0  # 캐시된 결과는 비용 없음
+                )
+            else:
+                # 만료된 캐시 삭제
+                del self.cache[cache_key]
         
-        cached = self.cache[cache_key]
-        cached_time = datetime.fromisoformat(cached["timestamp"])
-        
-        # TTL 확인 (24시간)
-        if datetime.now() - cached_time > timedelta(hours=self.cache_ttl_hours):
-            del self.cache[cache_key]
-            return None
-        
-        # LLMInsight 객체로 변환
-        return LLMInsight(
-            sentiment=cached["sentiment"],
-            trigger=cached["trigger"],
-            horizon_minutes=cached["horizon_minutes"],
-            summary=cached["summary"],
-            timestamp=cached_time,
-            cost_krw=0.0  # 캐시된 결과는 비용 0
-        )
+        return None
     
     def _cache_result(self, cache_key: str, result: LLMInsight):
-        """결과 캐시 저장"""
+        """결과 캐시"""
         self.cache[cache_key] = {
             "sentiment": result.sentiment,
             "trigger": result.trigger,
@@ -256,84 +258,102 @@ JSON 응답:"""
             "summary": result.summary,
             "timestamp": result.timestamp.isoformat()
         }
-        
-        # 캐시 크기 제한 (최대 1000개)
-        if len(self.cache) > 1000:
-            # 가장 오래된 항목 제거
-            oldest_key = min(self.cache.keys(), 
-                           key=lambda k: self.cache[k]["timestamp"])
-            del self.cache[oldest_key]
     
     def _check_limits(self) -> bool:
         """제한 확인"""
-        now = datetime.now()
+        current_time = time.time()
         
-        # 월 비용 제한 (원화 기준)
-        if now.month != self.monthly_start.month:
-            self.monthly_cost_krw = 0.0
-            self.monthly_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        
+        # 월 비용 확인
         if self.monthly_cost_krw >= self.monthly_cap_krw:
-            self.status = LLMStatus.COST_LIMITED
-            logger.warning(f"월 비용 한도 도달: {self.monthly_cost_krw:,.0f}원 / {self.monthly_cap_krw:,.0f}원")
+            if self.llm_enabled:
+                self._disable_llm()
             return False
         
-        # 분당 호출 제한 (1콜)
-        if self.last_call_time:
-            time_diff = (now - self.last_call_time).total_seconds()
-            if time_diff < 60:  # 1분 미만
-                self.status = LLMStatus.RATE_LIMITED
-                logger.warning(f"분당 호출 제한: {60 - time_diff:.1f}초 대기 필요")
-                return False
+        # 속도 제한 확인 (분당 1콜)
+        if current_time - self.last_call_time < 60:
+            logger.warning("속도 제한: 분당 1콜 초과")
+            return False
         
-        self.status = LLMStatus.ACTIVE
+        self.last_call_time = current_time
         return True
     
     def _update_cost(self, cost_krw: float):
         """비용 업데이트"""
-        self.monthly_cost_krw += cost_krw
-        self.last_call_time = datetime.now()
+        # 월 변경 확인
+        current_month = datetime.now().month
+        if current_month != self.current_month:
+            self.monthly_cost_krw = 0.0
+            self.current_month = current_month
         
-        logger.debug(f"비용 업데이트: +{cost_krw:.0f}원 (총 {self.monthly_cost_krw:,.0f}원)")
+        self.monthly_cost_krw += cost_krw
+        
+        # 한도 초과 확인
+        if self.monthly_cost_krw >= self.monthly_cap_krw and self.llm_enabled:
+            self._disable_llm()
     
-    def get_status(self) -> Dict[str, Any]:
+    def _disable_llm(self):
+        """LLM 비활성화"""
+        self.llm_enabled = False
+        logger.warning(f"LLM 비활성화: 월 비용 한도 초과 ({self.monthly_cost_krw:,.0f}원)")
+        
+        # 슬랙 알림
+        if self.slack_bot:
+            self.slack_bot.send_llm_status_change(False)
+    
+    def enable_llm(self):
+        """LLM 활성화"""
+        if not self.llm_enabled:
+            self.llm_enabled = True
+            logger.info("LLM 활성화됨")
+            
+            # 슬랙 알림
+            if self.slack_bot:
+                self.slack_bot.send_llm_status_change(True)
+    
+    def reset_monthly_cost(self):
+        """월 비용 리셋"""
+        self.monthly_cost_krw = 0.0
+        self.current_month = datetime.now().month
+        logger.info("월 비용 리셋됨")
+    
+    def get_status(self) -> Dict:
         """상태 정보"""
         return {
-            "status": self.status.value,
+            "llm_enabled": self.llm_enabled,
             "monthly_cost_krw": self.monthly_cost_krw,
             "monthly_cap_krw": self.monthly_cap_krw,
             "cache_size": len(self.cache),
-            "last_call": self.last_call_time.isoformat() if self.last_call_time else None,
-            "is_active": self.status == LLMStatus.ACTIVE
+            "current_month": self.current_month,
+            "timestamp": datetime.now().isoformat()
         }
     
     def reset_limits(self):
         """제한 리셋 (테스트용)"""
-        self.monthly_cost_krw = 0.0
-        self.last_call_time = None
-        self.status = LLMStatus.ACTIVE
-        logger.info("LLM 제한 리셋 완료")
+        self.last_call_time = 0
+        logger.info("제한 리셋됨")
     
-    def analyze_edgar_filing(self, filing_data: Dict) -> Optional[LLMInsight]:
+    def analyze_edgar_filing(self, filing: Dict) -> Optional[LLMInsight]:
         """EDGAR 공시 분석"""
-        ticker = filing_data.get("ticker", "")
-        form_type = filing_data.get("form_type", "")
-        summary = filing_data.get("summary", "")
-        items = filing_data.get("items", [])
-        
-        # 공시 타입별 텍스트 구성 (1000자 제한)
-        if form_type == "8-K":
-            text = f"8-K filing for {ticker}: Items {', '.join(items[:3])}. {summary}"
-        elif form_type == "4":
-            text = f"Form 4 filing for {ticker}: Insider trading activity. {summary}"
-        else:
-            text = f"{form_type} filing for {ticker}: {summary}"
-        
-        # 1000자 제한
-        if len(text) > 1000:
-            text = text[:1000]
-        
-        return self.analyze_text(text, f"EDGAR_{form_type}_{ticker}")
+        try:
+            ticker = filing.get("ticker", "")
+            form_type = filing.get("form_type", "")
+            items = filing.get("items", [])
+            summary = filing.get("summary", "")
+            
+            # 분석할 텍스트 구성
+            text_parts = [f"Form {form_type}"]
+            if items:
+                text_parts.append(f"Items: {', '.join(items[:3])}")  # 최대 3개 아이템
+            if summary:
+                text_parts.append(summary)
+            
+            text = " | ".join(text_parts)
+            
+            return self.analyze_text(text, f"edgar_{ticker}_{form_type}")
+            
+        except Exception as e:
+            logger.error(f"EDGAR 공시 분석 실패: {e}")
+            return None
     
     def analyze_news_headline(self, headline: str, url: str) -> Optional[LLMInsight]:
         """뉴스 헤드라인 분석"""

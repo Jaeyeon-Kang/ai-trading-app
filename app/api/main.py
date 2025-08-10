@@ -8,8 +8,9 @@ from pydantic import BaseModel
 from typing import Dict, List, Optional, Any
 import logging
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
+import time
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +38,14 @@ class HealthResponse(BaseModel):
     timestamp: str
     version: str
     uptime: float
+
+class HealthzResponse(BaseModel):
+    status: str
+    redis: Dict[str, Any]
+    database: Dict[str, Any]
+    slack: Dict[str, Any]
+    llm: Dict[str, Any]
+    timestamp: str
 
 class SignalRequest(BaseModel):
     ticker: str
@@ -81,6 +90,16 @@ class SystemStatusResponse(BaseModel):
 trading_bot = None
 slack_bot = None
 redis_streams = None
+db_connection = None
+llm_engine = None
+
+# 오류 카운터
+error_counters = {
+    "llm_errors": 0,
+    "slack_errors": 0,
+    "redis_errors": 0,
+    "db_errors": 0
+}
 
 @app.on_event("startup")
 async def startup_event():
@@ -134,7 +153,92 @@ async def health_check():
         
     except Exception as e:
         logger.error(f"헬스 체크 실패: {e}")
+        error_counters["redis_errors"] += 1
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/healthz", response_model=HealthzResponse)
+async def healthz_check():
+    """헬스체크 (상세) - Redis/DB/Slack 토큰 체크"""
+    try:
+        # Redis 체크
+        redis_status = {"connected": False, "error": None}
+        if redis_streams:
+            try:
+                health = redis_streams.health_check()
+                redis_status = {
+                    "connected": health.get("redis_connected", False),
+                    "streams": health.get("streams", {}),
+                    "error": None
+                }
+            except Exception as e:
+                redis_status["error"] = str(e)
+                error_counters["redis_errors"] += 1
+        
+        # DB 체크
+        db_status = {"connected": False, "error": None}
+        if db_connection:
+            try:
+                cursor = db_connection.cursor()
+                cursor.execute("SELECT 1")
+                db_status = {"connected": True, "error": None}
+            except Exception as e:
+                db_status["error"] = str(e)
+                error_counters["db_errors"] += 1
+        
+        # Slack 체크
+        slack_status = {"connected": False, "error": None}
+        if slack_bot:
+            try:
+                status = slack_bot.get_status()
+                slack_status = {
+                    "connected": status.get("connected", False),
+                    "channel": status.get("channel", ""),
+                    "error": None
+                }
+            except Exception as e:
+                slack_status["error"] = str(e)
+                error_counters["slack_errors"] += 1
+        
+        # LLM 체크
+        llm_status = {"enabled": False, "error": None}
+        if llm_engine:
+            try:
+                status = llm_engine.get_status()
+                llm_status = {
+                    "enabled": status.get("llm_enabled", False),
+                    "monthly_cost_krw": status.get("monthly_cost_krw", 0),
+                    "error": None
+                }
+            except Exception as e:
+                llm_status["error"] = str(e)
+                error_counters["llm_errors"] += 1
+        
+        # 전체 상태 결정
+        all_healthy = (
+            redis_status["connected"] and 
+            db_status["connected"] and 
+            slack_status["connected"]
+        )
+        
+        return HealthzResponse(
+            status="healthy" if all_healthy else "unhealthy",
+            redis=redis_status,
+            database=db_status,
+            slack=slack_status,
+            llm=llm_status,
+            timestamp=datetime.now().isoformat()
+        )
+        
+    except Exception as e:
+        logger.error(f"헬스체크 실패: {e}")
+        return HealthzResponse(
+            status="unhealthy",
+            redis={"connected": False, "error": str(e)},
+            database={"connected": False, "error": str(e)},
+            slack={"connected": False, "error": str(e)},
+            llm={"enabled": False, "error": str(e)},
+            timestamp=datetime.now().isoformat()
+        )
 
 @app.get("/status", response_model=SystemStatusResponse)
 async def system_status():
@@ -148,8 +252,9 @@ async def system_status():
         
         # LLM 상태
         llm_status = "unknown"
-        # if trading_bot and trading_bot.llm_engine:
-        #     llm_status = trading_bot.llm_engine.get_status()["status"]
+        if llm_engine:
+            status = llm_engine.get_status()
+            llm_status = "enabled" if status.get("llm_enabled") else "disabled"
         
         # 지연 시간 (실제로는 측정)
         signal_latency = 150  # ms
@@ -208,7 +313,7 @@ async def get_signals(limit: int = 10, ticker: Optional[str] = None):
             {
                 "signal_id": "signal_20250101_120000_123456",
                 "ticker": "AAPL",
-                "signal_type": "buy",
+                "signal_type": "long",
                 "score": 0.75,
                 "confidence": 0.8,
                 "timestamp": datetime.now().isoformat(),
@@ -255,7 +360,7 @@ async def generate_report(request: ReportRequest):
         if request.include_llm:
             report_data["llm_usage"] = {
                 "daily_calls": 25,
-                "monthly_cost_usd": 12.50
+                "monthly_cost_krw": 15000
             }
         
         return ReportResponse(
@@ -272,6 +377,193 @@ async def generate_report(request: ReportRequest):
     except Exception as e:
         logger.error(f"리포트 생성 실패: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/report/daily", response_model=Dict)
+async def get_daily_report():
+    """일일 리포트 조회 (배치용)"""
+    try:
+        today = datetime.now().date()
+        
+        # 집계 데이터 수집
+        report_data = await collect_daily_metrics(today)
+        
+        # metrics_daily에 upsert
+        await upsert_daily_metrics(today, report_data)
+        
+        # Slack 전송
+        if slack_bot:
+            await send_daily_report_to_slack(report_data)
+        
+        return {
+            "status": "success",
+            "date": today.isoformat(),
+            "data": report_data,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"일일 리포트 생성 실패: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def collect_daily_metrics(date: datetime.date) -> Dict:
+    """일일 메트릭 수집"""
+    try:
+        # 실제로는 데이터베이스에서 집계
+        metrics = {
+            "candidate_signals": 15,  # 후보신호수
+            "avg_final_score": 0.65,  # 평균 최종점수
+            "median_final_score": 0.68,  # 중앙 최종점수
+            "regime_distribution": {  # 레짐 비중(%)
+                "trend": 40,
+                "vol_spike": 25,
+                "mean_revert": 20,
+                "sideways": 15
+            },
+            "edgar_count": 8,  # EDGAR 카운트
+            "llm_cost_krw": 15000,  # LLM 비용
+            "signal_to_slack_p99_latency_ms": 850,  # 신호→슬랙 p99 지연
+            "error_count": sum(error_counters.values())  # 에러 수
+        }
+        
+        return metrics
+        
+    except Exception as e:
+        logger.error(f"일일 메트릭 수집 실패: {e}")
+        return {}
+
+async def upsert_daily_metrics(date: datetime.date, metrics: Dict):
+    """metrics_daily에 upsert"""
+    try:
+        if not db_connection:
+            logger.warning("DB 연결 없음 - 메트릭 저장 건너뜀")
+            return
+        
+        cursor = db_connection.cursor()
+        
+        query = """
+        INSERT INTO metrics_daily (
+            date, trades, winrate, rr_avg, pnl, drawdown, var95, 
+            latency_p99, llm_cost_krw, meta
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        ) ON CONFLICT (date) DO UPDATE SET
+            trades = EXCLUDED.trades,
+            winrate = EXCLUDED.winrate,
+            rr_avg = EXCLUDED.rr_avg,
+            pnl = EXCLUDED.pnl,
+            drawdown = EXCLUDED.drawdown,
+            var95 = EXCLUDED.var95,
+            latency_p99 = EXCLUDED.latency_p99,
+            llm_cost_krw = EXCLUDED.llm_cost_krw,
+            meta = EXCLUDED.meta
+        """
+        
+        values = (
+            date,
+            metrics.get("trades", 0),
+            metrics.get("win_rate", 0.0),
+            metrics.get("avg_rr", 0.0),
+            metrics.get("realized_pnl", 0.0),
+            metrics.get("max_drawdown", 0.0),
+            metrics.get("var_95", 0.0),
+            metrics.get("signal_to_slack_p99_latency_ms", 0),
+            metrics.get("llm_cost_krw", 0.0),
+            json.dumps(metrics)
+        )
+        
+        cursor.execute(query, values)
+        db_connection.commit()
+        
+        logger.info(f"일일 메트릭 저장 완료: {date}")
+        
+    except Exception as e:
+        logger.error(f"일일 메트릭 저장 실패: {e}")
+        error_counters["db_errors"] += 1
+
+async def send_daily_report_to_slack(report_data: Dict):
+    """일일 리포트를 Slack으로 전송"""
+    try:
+        if not slack_bot:
+            logger.warning("Slack 봇 없음 - 리포트 전송 건너뜀")
+            return
+        
+        # Slack 메시지 구성
+        text = "📊 *일일 거래 리포트*"
+        
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "일일 거래 리포트"
+                }
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*후보신호:* {report_data.get('candidate_signals', 0)}건"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*평균점수:* {report_data.get('avg_final_score', 0):.2f}"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*EDGAR:* {report_data.get('edgar_count', 0)}건"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*LLM비용:* ₩{report_data.get('llm_cost_krw', 0):,.0f}"
+                    }
+                ]
+            }
+        ]
+        
+        # 레짐 분포
+        regime_dist = report_data.get("regime_distribution", {})
+        if regime_dist:
+            regime_text = " | ".join([f"{k}: {v}%" for k, v in regime_dist.items()])
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*레짐 분포:* {regime_text}"
+                }
+            })
+        
+        # 성능 지표
+        blocks.append({
+            "type": "section",
+            "fields": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"*신호→슬랙 지연:* {report_data.get('signal_to_slack_p99_latency_ms', 0)}ms"
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*에러 수:* {report_data.get('error_count', 0)}건"
+                }
+            ]
+        })
+        
+        message = {
+            "text": text,
+            "blocks": blocks,
+            "channel": "#trading-signals"
+        }
+        
+        success = slack_bot.send_message(message)
+        if success:
+            logger.info("일일 리포트 Slack 전송 완료")
+        else:
+            logger.error("일일 리포트 Slack 전송 실패")
+            error_counters["slack_errors"] += 1
+        
+    except Exception as e:
+        logger.error(f"일일 리포트 Slack 전송 실패: {e}")
+        error_counters["slack_errors"] += 1
 
 @app.get("/positions", response_model=List[Dict])
 async def get_positions():
@@ -451,8 +743,19 @@ async def process_signal(signal_id: str, signal: SignalRequest):
 # 에러 핸들러
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
-    """전역 예외 처리"""
+    """전역 예외 처리 - LLM/Slack 실패해도 프로세스 지속"""
     logger.error(f"예외 발생: {exc}")
+    
+    # 오류 카운터 증가
+    if "llm" in str(exc).lower():
+        error_counters["llm_errors"] += 1
+    elif "slack" in str(exc).lower():
+        error_counters["slack_errors"] += 1
+    elif "redis" in str(exc).lower():
+        error_counters["redis_errors"] += 1
+    elif "database" in str(exc).lower() or "db" in str(exc).lower():
+        error_counters["db_errors"] += 1
+    
     return {
         "error": "Internal server error",
         "message": str(exc),

@@ -37,6 +37,11 @@ celery_app.conf.update(
 
 # 스케줄 설정
 celery_app.conf.beat_schedule = {
+    # 15초마다 파이프라인 실행 (E2E)
+    "pipeline-e2e": {
+        "task": "app.jobs.scheduler.pipeline_e2e",
+        "schedule": 15.0,  # 15초
+    },
     # 15초마다 시그널 생성
     "generate-signals": {
         "task": "app.jobs.scheduler.generate_signals",
@@ -62,10 +67,10 @@ celery_app.conf.beat_schedule = {
         "task": "app.jobs.scheduler.daily_reset",
         "schedule": crontab(hour=0, minute=0),  # 매일 00:00
     },
-    # 매일 18:00에 일일 리포트
+    # 매일 06:10 KST에 일일 리포트
     "daily-report": {
         "task": "app.jobs.scheduler.daily_report",
-        "schedule": crontab(hour=18, minute=0),  # 매일 18:00
+        "schedule": crontab(hour=6, minute=10),  # 매일 06:10 KST
     },
 }
 
@@ -81,7 +86,153 @@ trading_components = {
     "paper_ledger": None,
     "redis_streams": None,
     "slack_bot": None,
+    "stream_consumer": None,
 }
+
+@celery_app.task(bind=True, name="app.jobs.scheduler.pipeline_e2e")
+def pipeline_e2e(self):
+    """E2E 파이프라인: EDGAR 이벤트 → LLM → 레짐 → 믹서 → DB → Slack"""
+    try:
+        start_time = time.time()
+        logger.info("E2E 파이프라인 시작")
+        
+        # 컴포넌트 확인
+        if not all([
+            trading_components["stream_consumer"],
+            trading_components["llm_engine"],
+            trading_components["regime_detector"],
+            trading_components["signal_mixer"],
+            trading_components["slack_bot"]
+        ]):
+            logger.warning("일부 컴포넌트가 초기화되지 않음")
+            return {"status": "skipped", "reason": "components_not_ready"}
+        
+        stream_consumer = trading_components["stream_consumer"]
+        llm_engine = trading_components["llm_engine"]
+        regime_detector = trading_components["regime_detector"]
+        signal_mixer = trading_components["signal_mixer"]
+        slack_bot = trading_components["slack_bot"]
+        
+        signals_processed = 0
+        
+        # 1. EDGAR 이벤트 소비
+        edgar_events = stream_consumer.consume_edgar_events(count=5, block_ms=100)
+        
+        for event in edgar_events:
+            try:
+                ticker = event.data.get("ticker")
+                if not ticker:
+                    continue
+                
+                # 2. LLM 분석
+                llm_insight = None
+                if llm_engine:
+                    text = event.data.get("snippet_text", "")
+                    url = event.data.get("url", "")
+                    llm_insight = llm_engine.analyze_text(text, url)
+                
+                # 3. 시세 데이터 가져오기 (간단한 모의 데이터)
+                candles = get_mock_candles(ticker)
+                indicators = get_mock_indicators(ticker)
+                
+                # 4. 레짐 감지
+                regime_result = regime_detector.detect_regime(candles, indicators)
+                
+                # 5. 기술적 점수 계산
+                tech_score = get_mock_tech_score(ticker)
+                
+                # 6. 시그널 믹싱
+                current_price = 150.0  # 모의 가격
+                signal = signal_mixer.mix_signals(
+                    ticker=ticker,
+                    regime_result=regime_result,
+                    tech_score=tech_score,
+                    llm_insight=llm_insight,
+                    edgar_filing=event.data,
+                    current_price=current_price
+                )
+                
+                if signal:
+                    # 7. DB에 저장
+                    if trading_components.get("db_connection"):
+                        signal_mixer.save_signal_to_db(signal, trading_components["db_connection"])
+                    
+                    # 8. Slack 알림
+                    if slack_bot:
+                        slack_message = format_slack_message(signal)
+                        slack_bot.send_message(slack_message)
+                    
+                    # 9. 메시지 ACK
+                    stream_consumer.acknowledge("news.edgar", event.message_id)
+                    
+                    signals_processed += 1
+                    logger.info(f"파이프라인 완료: {ticker} {signal.signal_type.value}")
+                
+            except Exception as e:
+                logger.error(f"이벤트 처리 실패: {e}")
+                continue
+        
+        execution_time = time.time() - start_time
+        logger.info(f"E2E 파이프라인 완료: {signals_processed}개, {execution_time:.2f}초")
+        
+        return {
+            "status": "success",
+            "signals_processed": signals_processed,
+            "execution_time": execution_time,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"E2E 파이프라인 실패: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+def get_mock_candles(ticker: str) -> List:
+    """모의 캔들 데이터"""
+    # 실제로는 quotes_ingestor에서 가져옴
+    return []
+
+def get_mock_indicators(ticker: str) -> Dict:
+    """모의 기술적 지표"""
+    # 실제로는 quotes_ingestor에서 가져옴
+    return {
+        "adx": 25.0,
+        "ema_20": 150.0,
+        "ema_50": 148.0,
+        "rsi": 65.0,
+        "volume_spike": 0.3,
+        "price_change_5m": 0.02,
+        "realized_volatility": 0.03,
+        "current_price": 150.0,
+        "vwap": 149.5,
+        "vwap_deviation": 0.003,
+        "macd": 0.5,
+        "macd_signal": 0.3,
+        "bb_position": 0.6
+    }
+
+def get_mock_tech_score(ticker: str):
+    """모의 기술적 점수"""
+    # 실제로는 tech_score_engine에서 계산
+    from app.engine.techscore import TechScore
+    return TechScore(
+        overall_score=0.7,
+        ema_score=0.8,
+        macd_score=0.7,
+        rsi_score=0.6,
+        vwap_score=0.7,
+        timestamp=datetime.now()
+    )
+
+def format_slack_message(signal) -> Dict:
+    """Slack 메시지 포맷"""
+    return {
+        "text": f"{signal.ticker} | 레짐 {signal.regime.upper()}({signal.confidence:.2f}) | 점수 {signal.score:+.2f} {'롱' if signal.signal_type.value == 'long' else '숏'}",
+        "channel": "#trading-signals"
+    }
 
 @celery_app.task(bind=True, name="app.jobs.scheduler.generate_signals")
 def generate_signals(self):
@@ -156,7 +307,7 @@ def generate_signals(self):
                         "regime": signal.regime,
                         "tech_score": signal.tech_score,
                         "sentiment_score": signal.sentiment_score,
-                        "edgar_override": signal.edgar_override,
+                        "edgar_bonus": signal.edgar_bonus,
                         "trigger": signal.trigger,
                         "summary": signal.summary,
                         "entry_price": signal.entry_price,
@@ -266,11 +417,10 @@ def scan_edgar(self):
                 if llm_insight:
                     insight_data = {
                         "ticker": filing["ticker"],
-                        "sentiment_score": llm_insight.sentiment_score,
+                        "sentiment": llm_insight.sentiment,
                         "trigger": llm_insight.trigger,
                         "horizon_minutes": llm_insight.horizon_minutes,
                         "summary": llm_insight.summary,
-                        "confidence": llm_insight.confidence,
                         "timestamp": llm_insight.timestamp.isoformat()
                     }
                     redis_streams.publish_news(insight_data)
