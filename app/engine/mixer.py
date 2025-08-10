@@ -1,12 +1,17 @@
 """
 시그널 믹서 엔진
 레짐별 가중치 + EDGAR 오버라이드 → 최종 시그널
+가중치: Trend(0.75/0.25), Vol(0.30/0.70), Mean(0.60/0.40)
+최종점수 score = w_tech*tech + w_sent*sentiment
+EDGAR 이벤트면 ±0.1 보너스
+임계: score ≥ 0.6 → LONG, ≤ -0.6 → SHORT
 """
 import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+import json
 
 from .regime import RegimeType, RegimeResult
 from .techscore import TechScore
@@ -16,8 +21,8 @@ logger = logging.getLogger(__name__)
 
 class SignalType(Enum):
     """시그널 타입"""
-    BUY = "buy"
-    SELL = "sell"
+    LONG = "long"
+    SHORT = "short"
     HOLD = "hold"
 
 @dataclass
@@ -30,13 +35,13 @@ class TradingSignal:
     regime: str
     tech_score: float
     sentiment_score: float
-    edgar_override: bool
-    trigger: str
-    summary: str
+    edgar_bonus: float  # EDGAR 보너스 (±0.1)
+    trigger: str  # 이유
+    summary: str  # 한 줄 요약
     entry_price: float
     stop_loss: float
     take_profit: float
-    horizon_minutes: int
+    horizon_minutes: int  # 호라이즌
     timestamp: datetime
     meta: Dict = None
 
@@ -49,15 +54,15 @@ class SignalMixer:
                  edgar_bonus: float = 0.1):
         """
         Args:
-            buy_threshold: 매수 임계값
-            sell_threshold: 매도 임계값
-            edgar_bonus: EDGAR 오버라이드 보너스
+            buy_threshold: 매수 임계값 (0.6)
+            sell_threshold: 매도 임계값 (-0.6)
+            edgar_bonus: EDGAR 오버라이드 보너스 (±0.1)
         """
         self.buy_threshold = buy_threshold
         self.sell_threshold = sell_threshold
         self.edgar_bonus = edgar_bonus
         
-        # 레짐별 가중치 (기본값)
+        # 레짐별 가중치 (요구사항에 맞게 조정)
         self.regime_weights = {
             RegimeType.TREND: {"tech": 0.75, "sentiment": 0.25},
             RegimeType.VOL_SPIKE: {"tech": 0.30, "sentiment": 0.70},
@@ -65,7 +70,7 @@ class SignalMixer:
             RegimeType.SIDEWAYS: {"tech": 0.50, "sentiment": 0.50}
         }
         
-        logger.info(f"시그널 믹서 초기화: 매수 {buy_threshold}, 매도 {sell_threshold}")
+        logger.info(f"시그널 믹서 초기화: 매수 {buy_threshold}, 매도 {sell_threshold}, EDGAR 보너스 ±{edgar_bonus}")
     
     def mix_signals(self, 
                    ticker: str,
@@ -94,7 +99,7 @@ class SignalMixer:
         
         # LLM 인사이트가 있으면 감성 점수 사용
         if llm_insight:
-            sentiment_score = llm_insight.sentiment_score
+            sentiment_score = llm_insight.sentiment
         elif edgar_filing:
             # EDGAR 공시가 있으면 기본 감성 점수
             sentiment_score = self._get_edgar_sentiment(edgar_filing)
@@ -103,23 +108,23 @@ class SignalMixer:
         regime = regime_result.regime
         weights = self.regime_weights.get(regime, self.regime_weights[RegimeType.SIDEWAYS])
         
-        # 가중 평균 계산
+        # 최종점수 계산: score = w_tech*tech + w_sent*sentiment
         final_score = (
             tech_score_normalized * weights["tech"] +
             sentiment_score * weights["sentiment"]
         )
         
-        # EDGAR 오버라이드 확인
-        edgar_override = False
+        # EDGAR 보너스 적용 (±0.1)
+        edgar_bonus = 0.0
         if edgar_filing and self._is_important_edgar(edgar_filing):
-            edgar_override = True
-            # EDGAR 보너스 적용 (방향에 따라)
             if sentiment_score > 0:
-                final_score += self.edgar_bonus
+                edgar_bonus = self.edgar_bonus  # +0.1
             else:
-                final_score -= self.edgar_bonus
+                edgar_bonus = -self.edgar_bonus  # -0.1
+            
+            final_score += edgar_bonus
         
-        # 신호 타입 결정
+        # 신호 타입 결정 (임계: score ≥ 0.6 → LONG, ≤ -0.6 → SHORT)
         signal_type = self._determine_signal_type(final_score)
         
         # 신호가 없으면 None 반환
@@ -131,7 +136,7 @@ class SignalMixer:
             regime_result.confidence,
             tech_score,
             llm_insight,
-            edgar_override
+            edgar_bonus != 0.0
         )
         
         # 진입/손절/익절 가격 계산
@@ -139,7 +144,7 @@ class SignalMixer:
             current_price, signal_type, regime
         )
         
-        # 트리거와 요약 생성
+        # 트리거와 요약 생성 (이유·호라이즌)
         trigger, summary = self._generate_trigger_summary(
             ticker, regime, tech_score, llm_insight, edgar_filing
         )
@@ -155,7 +160,7 @@ class SignalMixer:
             regime=regime.value,
             tech_score=tech_score_normalized,
             sentiment_score=sentiment_score,
-            edgar_override=edgar_override,
+            edgar_bonus=edgar_bonus,
             trigger=trigger,
             summary=summary,
             entry_price=entry_price,
@@ -166,11 +171,13 @@ class SignalMixer:
             meta={
                 "regime_confidence": regime_result.confidence,
                 "tech_breakdown": {
-                    "trend": tech_score.trend_score,
-                    "momentum": tech_score.momentum_score,
-                    "volatility": tech_score.volatility_score,
-                    "volume": tech_score.volume_score
-                }
+                    "ema": tech_score.ema_score,
+                    "macd": tech_score.macd_score,
+                    "rsi": tech_score.rsi_score,
+                    "vwap": tech_score.vwap_score
+                },
+                "weights": weights,
+                "edgar_filing": edgar_filing
             }
         )
         
@@ -224,11 +231,11 @@ class SignalMixer:
         return False
     
     def _determine_signal_type(self, score: float) -> SignalType:
-        """신호 타입 결정"""
-        if score >= self.buy_threshold:
-            return SignalType.BUY
-        elif score <= self.sell_threshold:
-            return SignalType.SELL
+        """신호 타입 결정 (임계: score ≥ 0.6 → LONG, ≤ -0.6 → SHORT)"""
+        if score >= self.buy_threshold:  # 0.6
+            return SignalType.LONG
+        elif score <= self.sell_threshold:  # -0.6
+            return SignalType.SHORT
         else:
             return SignalType.HOLD
     
@@ -245,12 +252,12 @@ class SignalMixer:
         confidence += regime_confidence * 0.3
         weights += 0.3
         
-        # 기술적 점수 일관성 (각 카테고리 점수의 표준편차가 낮을수록 높은 신뢰도)
+        # 기술적 점수 일관성 (각 지표 점수의 표준편차가 낮을수록 높은 신뢰도)
         tech_scores = [
-            tech_score.trend_score,
-            tech_score.momentum_score,
-            tech_score.volatility_score,
-            tech_score.volume_score
+            tech_score.ema_score,
+            tech_score.macd_score,
+            tech_score.rsi_score,
+            tech_score.vwap_score
         ]
         tech_consistency = 1.0 - (max(tech_scores) - min(tech_scores))
         confidence += tech_consistency * 0.3
@@ -258,7 +265,7 @@ class SignalMixer:
         
         # LLM 신뢰도
         if llm_insight:
-            confidence += llm_insight.confidence * 0.2
+            confidence += 0.2
             weights += 0.2
         
         # EDGAR 오버라이드 보너스
@@ -288,10 +295,10 @@ class SignalMixer:
         
         entry_price = current_price
         
-        if signal_type == SignalType.BUY:
+        if signal_type == SignalType.LONG:
             stop_loss = current_price * (1 - ratios["stop_loss"])
             take_profit = current_price * (1 + ratios["take_profit"])
-        else:  # SELL
+        else:  # SHORT
             stop_loss = current_price * (1 + ratios["stop_loss"])
             take_profit = current_price * (1 - ratios["take_profit"])
         
@@ -303,7 +310,7 @@ class SignalMixer:
                                 tech_score: TechScore,
                                 llm_insight: Optional[LLMInsight],
                                 edgar_filing: Optional[Dict]) -> Tuple[str, str]:
-        """트리거와 요약 생성"""
+        """트리거와 요약 생성 (이유·호라이즌)"""
         trigger_parts = []
         summary_parts = []
         
@@ -319,12 +326,14 @@ class SignalMixer:
             summary_parts.append("반등 기대")
         
         # 기술적 지표 기반
-        if tech_score.trend_score > 0.7:
-            trigger_parts.append("강한 추세")
-        elif tech_score.momentum_score > 0.7:
-            trigger_parts.append("모멘텀 상승")
-        elif tech_score.volume_score > 0.7:
-            trigger_parts.append("거래량 급증")
+        if tech_score.ema_score > 0.7:
+            trigger_parts.append("EMA 상승")
+        elif tech_score.macd_score > 0.7:
+            trigger_parts.append("MACD 상승")
+        elif tech_score.rsi_score > 0.7:
+            trigger_parts.append("RSI 상승")
+        elif tech_score.vwap_score > 0.7:
+            trigger_parts.append("VWAP 상단")
         
         # LLM 인사이트 기반
         if llm_insight:
@@ -349,7 +358,7 @@ class SignalMixer:
     def _determine_horizon(self, 
                           regime: RegimeType,
                           llm_insight: Optional[LLMInsight]) -> int:
-        """영향 지속 시간 결정 (분)"""
+        """영향 지속 시간 결정 (분) - 호라이즌"""
         # LLM 인사이트가 있으면 그 값 사용
         if llm_insight:
             return llm_insight.horizon_minutes
@@ -364,6 +373,60 @@ class SignalMixer:
         
         return regime_horizons.get(regime, 120)
     
+    def save_signal_to_db(self, signal: TradingSignal, db_connection) -> bool:
+        """
+        시그널을 signals 테이블에 저장
+        
+        Args:
+            signal: 거래 시그널
+            db_connection: 데이터베이스 연결
+            
+        Returns:
+            bool: 저장 성공 여부
+        """
+        try:
+            cursor = db_connection.cursor()
+            
+            query = """
+            INSERT INTO signals (
+                ticker, signal_type, score, confidence, regime,
+                tech_score, sentiment_score, edgar_bonus,
+                trigger, summary, entry_price, stop_loss, take_profit,
+                horizon_minutes, timestamp, meta
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            """
+            
+            values = (
+                signal.ticker,
+                signal.signal_type.value,
+                signal.score,
+                signal.confidence,
+                signal.regime,
+                signal.tech_score,
+                signal.sentiment_score,
+                signal.edgar_bonus,
+                signal.trigger,
+                signal.summary,
+                signal.entry_price,
+                signal.stop_loss,
+                signal.take_profit,
+                signal.horizon_minutes,
+                signal.timestamp,
+                json.dumps(signal.meta) if signal.meta else None
+            )
+            
+            cursor.execute(query, values)
+            db_connection.commit()
+            
+            logger.info(f"시그널 저장 완료: {signal.ticker} {signal.signal_type.value}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"시그널 저장 실패: {e}")
+            return False
+    
     def get_signal_summary(self, signal: TradingSignal) -> Dict:
         """시그널 요약 정보"""
         return {
@@ -374,7 +437,7 @@ class SignalMixer:
             "regime": signal.regime,
             "tech_score": signal.tech_score,
             "sentiment_score": signal.sentiment_score,
-            "edgar_override": signal.edgar_override,
+            "edgar_bonus": signal.edgar_bonus,
             "trigger": signal.trigger,
             "summary": signal.summary,
             "entry_price": signal.entry_price,

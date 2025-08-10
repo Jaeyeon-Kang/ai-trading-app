@@ -26,18 +26,25 @@ CREATE TABLE IF NOT EXISTS bars_30s (
     spread_est DECIMAL(10,4) DEFAULT 0 -- 스프레드 추정치
 );
 
--- 시그널 테이블 (최소 요구사항에 맞춰 수정)
+-- 시그널 테이블 (새로운 요구사항에 맞게 수정)
 CREATE TABLE IF NOT EXISTS signals (
     id SERIAL PRIMARY KEY,
     ts TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     ticker VARCHAR(10) NOT NULL,
+    signal_type VARCHAR(10) NOT NULL, -- 'long', 'short', 'hold'
+    score DECIMAL(5,4) NOT NULL, -- 최종 점수 -1~1
+    confidence DECIMAL(5,4) NOT NULL, -- 신뢰도 0~1
     regime VARCHAR(20) NOT NULL, -- 'trend', 'vol_spike', 'mean_revert', 'sideways'
-    tech DECIMAL(5,4) NOT NULL, -- 기술적 점수 0~1
-    sentiment DECIMAL(5,4) NOT NULL, -- 감성 점수 0~1
-    score DECIMAL(5,4) NOT NULL, -- 최종 점수 0~1
-    reason TEXT, -- 시그널 발생 이유
-    horizon_min INTEGER, -- 예상 지속 시간 (분)
-    override BOOLEAN DEFAULT FALSE -- EDGAR 오버라이드 여부
+    tech_score DECIMAL(5,4) NOT NULL, -- 기술적 점수 0~1
+    sentiment_score DECIMAL(5,4) NOT NULL, -- 감성 점수 -1~1
+    edgar_bonus DECIMAL(5,4) DEFAULT 0, -- EDGAR 보너스 ±0.1
+    trigger TEXT, -- 시그널 발생 이유
+    summary TEXT, -- 한 줄 요약
+    entry_price DECIMAL(10,4), -- 진입가
+    stop_loss DECIMAL(10,4), -- 손절가
+    take_profit DECIMAL(10,4), -- 익절가
+    horizon_minutes INTEGER, -- 예상 지속 시간 (분)
+    meta JSONB -- 추가 메타데이터
 );
 
 -- 페이퍼 주문 테이블 (최소 요구사항)
@@ -220,6 +227,7 @@ CREATE INDEX IF NOT EXISTS idx_bars_30s_ticker ON bars_30s(ticker);
 CREATE INDEX IF NOT EXISTS idx_bars_30s_ts ON bars_30s(ts);
 CREATE INDEX IF NOT EXISTS idx_signals_ticker ON signals(ticker);
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts);
+CREATE INDEX IF NOT EXISTS idx_signals_signal_type ON signals(signal_type);
 CREATE INDEX IF NOT EXISTS idx_signals_regime ON signals(regime);
 CREATE INDEX IF NOT EXISTS idx_orders_paper_ticker ON orders_paper(ticker);
 CREATE INDEX IF NOT EXISTS idx_orders_paper_ts ON orders_paper(ts);
@@ -242,13 +250,16 @@ CREATE INDEX IF NOT EXISTS idx_system_logs_created_at ON system_logs(created_at)
 CREATE INDEX IF NOT EXISTS idx_performance_metrics_name ON performance_metrics(metric_name);
 CREATE INDEX IF NOT EXISTS idx_performance_metrics_timestamp ON performance_metrics(timestamp);
 
--- 뷰 생성 (최소 요구사항 기반)
+-- 뷰 생성 (새로운 signals 테이블 기반)
 CREATE OR REPLACE VIEW signal_summary_minimal AS
 SELECT 
     DATE(ts) as date,
     COUNT(*) as total_signals,
+    COUNT(CASE WHEN signal_type = 'long' THEN 1 END) as long_signals,
+    COUNT(CASE WHEN signal_type = 'short' THEN 1 END) as short_signals,
     AVG(score) as avg_score,
-    COUNT(CASE WHEN override = true THEN 1 END) as override_signals,
+    AVG(confidence) as avg_confidence,
+    COUNT(CASE WHEN edgar_bonus != 0 THEN 1 END) as edgar_signals,
     COUNT(CASE WHEN regime = 'trend' THEN 1 END) as trend_signals,
     COUNT(CASE WHEN regime = 'vol_spike' THEN 1 END) as vol_spike_signals,
     COUNT(CASE WHEN regime = 'mean_revert' THEN 1 END) as mean_revert_signals
