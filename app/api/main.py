@@ -11,6 +11,10 @@ import json
 from datetime import datetime, timedelta, timezone
 import os
 import time
+import hmac
+import hashlib
+from urllib.parse import parse_qs
+from fastapi import Request
 
 import redis
 import psycopg2
@@ -362,7 +366,7 @@ async def get_recent_signals(hours: int = 24):
     try:
         now = datetime.now(timezone.utc)
         kst = timezone(timedelta(hours=9))
-
+        
         dummy = [
             {
                 "ticker": "AAPL",
@@ -379,7 +383,7 @@ async def get_recent_signals(hours: int = 24):
                 "timestamp_kst": (now - timedelta(hours=1)).astimezone(kst).isoformat()
             }
         ]
-
+        
         cutoff = now - timedelta(hours=hours)
         signals = [s for s in dummy if datetime.fromisoformat(s["timestamp_kst"]).astimezone(timezone.utc) >= cutoff]
         return signals
@@ -387,44 +391,134 @@ async def get_recent_signals(hours: int = 24):
         logger.error(f"최근 시그널 조회 실패: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# Helper: paper order 저장 (DB 우선, 실패 시 None)
+def _save_paper_order(order: "PaperOrderRequest") -> Optional[str]:
+    order_id = None
+    dsn = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+    if dsn:
+        try:
+            conn = psycopg2.connect(dsn)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO orders_paper (ticker, side, qty, px_entry, sl, tp)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    order.ticker,
+                    order.side,
+                    order.qty,
+                    order.entry,
+                    order.sl,
+                    order.tp,
+                ),
+            )
+            order_id = str(cur.fetchone()[0])
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as db_err:
+            logger.error(f"페이퍼 주문 DB 기록 실패: {db_err}")
+    return order_id
+
+# Slack 서명 검증
+def _verify_slack_signature(request: Request, body: bytes) -> bool:
+    signing_secret = os.getenv("SLACK_SIGNING_SECRET")
+    if not signing_secret:
+        # 서명 비활성화 모드 (개발용)
+        return True
+    timestamp = request.headers.get("x-slack-request-timestamp", "")
+    slack_sig = request.headers.get("x-slack-signature", "")
+    if not timestamp or not slack_sig:
+        return False
+    basestring = f"v0:{timestamp}:{body.decode()}".encode()
+    my_sig = "v0=" + hmac.new(signing_secret.encode(), basestring, hashlib.sha256).hexdigest()
+    # 타이밍 안전 비교
+    return hmac.compare_digest(my_sig, slack_sig)
+
+# Slack 인터랙션 엔드포인트
+@app.post("/slack/interactions")
+async def slack_interactions(request: Request):
+    try:
+        raw_body = await request.body()
+        if not _verify_slack_signature(request, raw_body):
+            raise HTTPException(status_code=401, detail="invalid slack signature")
+        form = parse_qs(raw_body.decode())
+        payload_raw = form.get("payload", ["{}"])[0]
+        payload = json.loads(payload_raw)
+        actions = payload.get("actions", []) or []
+        if not actions:
+            return {"status": "ignored"}
+        action = actions[0]
+        action_id = action.get("action_id")
+        value = action.get("value", "")
+        if action_id == "approve_trade":
+            # value는 JSON({ticker, side, entry, sl, tp})로 발행됨
+            order_data = None
+            try:
+                order_data = json.loads(value)
+            except Exception:
+                # 구버전 포맷 fallback: approve_TICKER_SIDE_TS
+                parts = value.split("_")
+                if len(parts) >= 3:
+                    order_data = {
+                        "ticker": parts[1],
+                        "side": "buy" if "long" in parts[2].lower() else "sell",
+                        "entry": 0.0,
+                        "sl": 0.0,
+                        "tp": 0.0,
+                        "qty": 1,
+                    }
+            if not order_data:
+                return {"status": "error", "message": "invalid order payload"}
+            # 기본 수량
+            qty = int(order_data.get("qty", os.getenv("DEFAULT_QTY", 1)))
+            # 모델 생성
+            order = PaperOrderRequest(
+                ticker=order_data["ticker"],
+                side=order_data["side"],
+                qty=qty,
+                entry=float(order_data.get("entry", 0.0)),
+                sl=float(order_data.get("sl", 0.0)),
+                tp=float(order_data.get("tp", 0.0)),
+            )
+            order_id = _save_paper_order(order)
+            if not order_id:
+                order_id = f"paper_{int(time.time()*1000)}"
+                paper_orders.append({"id": order_id, **order.dict(), "ts": datetime.now().isoformat()})
+            # 확인 메시지 전송
+            if slack_bot:
+                from app.io.slack_bot import SlackMessage
+                confirm_text = f"✅ 페이퍼 주문 기록: {order.ticker} {order.side.upper()} x{order.qty} @ {order.entry:.2f}"
+                channel_id = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "#trading-signals")
+                slack_bot.send_message(SlackMessage(channel=channel_id, text=confirm_text))
+            return {"status": "ok", "order_id": order_id}
+        elif action_id == "reject_trade":
+            # 거부 알림만 전송
+            if slack_bot:
+                from app.io.slack_bot import SlackMessage
+                channel_id = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "#trading-signals")
+                slack_bot.send_message(SlackMessage(channel=channel_id, text="❌ 거래가 거부되었습니다"))
+            return {"status": "ok", "rejected": True}
+        return {"status": "ignored"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Slack 인터랙션 처리 실패: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/orders/paper", response_model=PaperOrderResponse)
 async def create_paper_order(order: PaperOrderRequest):
     """페이퍼 주문 기록"""
     try:
         # DB 기록 시도 (PostgreSQL)
-        order_id = None
-        dsn = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
-        if dsn:
-            try:
-                conn = psycopg2.connect(dsn)
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    INSERT INTO orders_paper (ticker, side, qty, px_entry, sl, tp)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        order.ticker,
-                        order.side,
-                        order.qty,
-                        order.entry,
-                        order.sl,
-                        order.tp,
-                    ),
-                )
-                order_id = str(cur.fetchone()[0])
-                conn.commit()
-                cur.close()
-                conn.close()
-            except Exception as db_err:
-                logger.error(f"페이퍼 주문 DB 기록 실패: {db_err}")
-
+        order_id = _save_paper_order(order)
+        
         # 메모리에도 기록 (DB 실패 대비)
         fallback_id = f"paper_{int(time.time()*1000)}"
         paper_orders.append({"id": order_id or fallback_id, **order.dict(), "ts": datetime.now().isoformat()})
-
+        
         return PaperOrderResponse(status="recorded", order_id=order_id or fallback_id)
     except Exception as e:
         logger.error(f"페이퍼 주문 실패: {e}")

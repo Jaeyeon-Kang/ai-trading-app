@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 import os
 import time
+import hashlib
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -406,7 +407,13 @@ def scan_edgar(self):
         
         edgar_scanner = trading_components["edgar_scanner"]
         redis_streams = trading_components["redis_streams"]
-        llm_engine = trading_components["llm_engine"]
+        redis_client = None
+        try:
+            # dedupe를 위한 raw redis 클라이언트 접근 (streams 내부 클라이언트 재사용)
+            if redis_streams:
+                redis_client = redis_streams.redis_client
+        except Exception:
+            redis_client = None
         
         if not edgar_scanner or not redis_streams:
             return {"status": "skipped", "reason": "components_not_ready"}
@@ -414,13 +421,27 @@ def scan_edgar(self):
         # EDGAR 공시 스캔
         filings = edgar_scanner.run_scan()
         
-        # Redis 스트림에 발행
+        # Redis 스트림에 발행 (중복 방지)
+        dedupe_key = "edgar:dedupe:snippets"
+        published = 0
         for filing in filings:
+            snippet_text = filing.get("summary") or filing.get("snippet_text") or ""
+            url = filing.get("url", "")
+            base = (snippet_text or url).encode()
+            snippet_hash = hashlib.md5(base).hexdigest()
+            if redis_client:
+                # 중복이면 스킵
+                added = redis_client.sadd(dedupe_key, snippet_hash)
+                if not added:
+                    continue
+            # 해시를 함께 저장해두기
+            filing["snippet_hash"] = snippet_hash
             redis_streams.publish_edgar(filing)
+            published += 1
             
-            # LLM 분석 (중요한 공시만)
-            if filing.get("impact_score", 0) > 0.7:
-                llm_insight = llm_engine.analyze_edgar_filing(filing) if llm_engine else None
+            # 중요 공시 LLM 처리
+            if filing.get("impact_score", 0) > 0.7 and llm_engine:
+                llm_insight = llm_engine.analyze_edgar_filing(filing)
                 if llm_insight:
                     insight_data = {
                         "ticker": filing["ticker"],
@@ -433,11 +454,11 @@ def scan_edgar(self):
                     redis_streams.publish_news(insight_data)
         
         execution_time = time.time() - start_time
-        logger.debug(f"EDGAR 스캔 완료: {len(filings)}개 공시, {execution_time:.2f}초")
+        logger.debug(f"EDGAR 스캔 완료: {published}개 발행, {execution_time:.2f}초")
         
         return {
             "status": "success",
-            "filings_found": len(filings),
+            "published": published,
             "execution_time": execution_time,
             "timestamp": datetime.now().isoformat()
         }

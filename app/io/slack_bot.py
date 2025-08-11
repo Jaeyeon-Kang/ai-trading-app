@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Callable
 from datetime import datetime
 import time
 from dataclasses import dataclass
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -51,14 +52,14 @@ class SlackBot:
         self.base_url = "https://slack.com/api"
         
         # 승인 콜백 저장
-        self.approval_callbacks: Dict[str, Callable] = {}
+        self.approval_callbacks: Dict[str, Dict] = {}
         
         # 스레드 타임스탬프 캐시 (티커별)
         self.thread_ts_by_ticker: Dict[str, str] = {}
         
         # 재시도 설정
         self.max_retries = 3
-        self.retry_delays = [0.5, 1.0, 2.0]  # 백오프 0.5s, 1s, 2s
+        self.retry_delays = [1, 2, 4]  # 백오프 0.5s, 1s, 2s
         
         # 메시지 템플릿
         self.templates = {
@@ -72,6 +73,11 @@ class SlackBot:
                     "emoji": "🔴"
                 }
             }
+        }
+        
+        self._headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json; charset=utf-8"
         }
         
         logger.info(f"Slack Bot 초기화: 채널 {channel}")
@@ -97,11 +103,8 @@ class SlackBot:
                 with httpx.Client(timeout=10) as client:
                     response = client.post(
                         f"{self.base_url}/chat.postMessage",
-                        headers={
-                            "Authorization": f"Bearer {self.token}",
-                            "Content-Type": "application/json"
-                        },
-                        json=payload
+                        headers=self._headers,
+                        data=json.dumps(payload)
                     )
                 
                 response.raise_for_status()
@@ -152,7 +155,7 @@ class SlackBot:
         
         # 승인 버튼 (반자동 모드에서만)
         if self._is_semi_auto_mode():
-            # 버튼 텍스트는 한글(매수/매도)로 표시하되, 실제 페이로드는 영문 buy/sell 사용
+            # 버튼 텍스트는 한글(매수/매도)로 표시하되, 실제 페이로드는 JSON 사용
             is_long = signal.signal_type == "long"
             action_text = "매수" if is_long else "매도"
             order_value = json.dumps({
@@ -160,7 +163,8 @@ class SlackBot:
                 "side": "buy" if is_long else "sell",
                 "entry": signal.entry_price,
                 "sl": signal.stop_loss,
-                "tp": signal.take_profit
+                "tp": signal.take_profit,
+                "qty": 1
             })
             blocks.append({
                 "type": "actions",
@@ -545,25 +549,46 @@ class SlackBot:
     def _handle_trade_approval(self, value: str, approved: bool) -> Dict:
         """거래 승인/거부 처리"""
         try:
-            # value 형식: "approve_TICKER_SIGNAL_TYPE_TIMESTAMP"
+            # 우선 JSON 기반
+            order_json = None
+            try:
+                order_json = json.loads(value)
+            except Exception:
+                order_json = None
+            if order_json and approved:
+                # 서버로 직접 페이퍼 주문 호출 시도 (내부 API)
+                api_url = os.getenv("API_BASE_URL") or "http://localhost:8000"
+                try:
+                    with httpx.Client(timeout=5) as client:
+                        resp = client.post(
+                            f"{api_url}/orders/paper",
+                            json={
+                                "ticker": order_json.get("ticker"),
+                                "side": order_json.get("side"),
+                                "qty": int(order_json.get("qty", 1)),
+                                "entry": float(order_json.get("entry", 0.0)),
+                                "sl": float(order_json.get("sl", 0.0)),
+                                "tp": float(order_json.get("tp", 0.0))
+                            }
+                        )
+                        if resp.status_code >= 400:
+                            logger.error(f"내부 주문 API 실패: {resp.text}")
+                except Exception as e:
+                    logger.error(f"내부 주문 API 호출 오류: {e}")
+            
+            # 이후 기존 콜백/확인 메시지 로직
             parts = value.split("_")
             if len(parts) >= 4:
                 ticker = parts[1]
                 signal_type = parts[2]
                 timestamp = parts[3]
-                
                 callback_id = f"{ticker}_{signal_type}_{timestamp}"
-                
                 if callback_id in self.approval_callbacks:
                     callback_data = self.approval_callbacks[callback_id]
                     signal = callback_data["signal"]
-                    
-                    # 승인/거부 메시지 전송
                     status = "승인" if approved else "거부"
                     emoji = "✅" if approved else "❌"
-                    
                     text = f"{emoji} *{signal.ticker} {signal.signal_type.upper()} {status}*"
-                    
                     blocks = [
                         {
                             "type": "section",
@@ -573,21 +598,15 @@ class SlackBot:
                             }
                         }
                     ]
-                    
                     message = SlackMessage(
                         channel=self.default_channel,
                         text=text,
                         blocks=blocks,
                         thread_ts=self.thread_ts_by_ticker.get(ticker)
                     )
-                    
                     self.send_message(message)
-                    
-                    # 콜백 제거
                     del self.approval_callbacks[callback_id]
-                    
                     logger.info(f"거래 {status}: {ticker} {signal_type}")
-                    
                     return {
                         "status": "success",
                         "action": "trade_approval",
@@ -595,10 +614,8 @@ class SlackBot:
                         "ticker": ticker,
                         "signal_type": signal_type
                     }
-        
         except Exception as e:
             logger.error(f"거래 승인 처리 실패: {e}")
-        
         return {"status": "error", "message": "거래 승인 처리 실패"}
     
     def _handle_emergency_stop(self) -> Dict:
