@@ -4,7 +4,7 @@
 가중치: Trend(0.75/0.25), Vol(0.30/0.70), Mean(0.60/0.40)
 최종점수 score = w_tech*tech + w_sent*sentiment
 EDGAR 이벤트면 ±0.1 보너스
-임계: score ≥ 0.6 → LONG, ≤ -0.6 → SHORT
+임계: score ≥ 0.68 → LONG, ≤ -0.68 → SHORT
 """
 import logging
 from typing import Dict, List, Optional, Tuple
@@ -49,15 +49,15 @@ class TradingSignal:
 class SignalMixer:
     """시그널 믹서"""
     
-    def __init__(self, 
-                 buy_threshold: float = 0.6,
-                 sell_threshold: float = -0.6,
+    def __init__(self,
+                 buy_threshold: float = 0.68,
+                 sell_threshold: float = -0.68,
                  edgar_bonus: float = 0.1,
                  cooldown_seconds: int = 60):
         """
         Args:
-            buy_threshold: 매수 임계값 (0.6)
-            sell_threshold: 매도 임계값 (-0.6)
+            buy_threshold: 매수 임계값 (0.68)
+            sell_threshold: 매도 임계값 (-0.68)
             edgar_bonus: EDGAR 오버라이드 보너스 (±0.1)
             cooldown_seconds: 쿨다운 시간 (초)
         """
@@ -146,7 +146,7 @@ class SignalMixer:
             logger.debug(f"쿨다운 제한: {ticker} (점수 개선 없음)")
             return None
         
-        # 신호 타입 결정 (임계: score ≥ 0.6 → LONG, ≤ -0.6 → SHORT)
+        # 신호 타입 결정 (임계: score ≥ 0.68 → LONG, ≤ -0.68 → SHORT)
         signal_type = self._determine_signal_type(final_score)
         
         # 신호가 없으면 None 반환
@@ -286,10 +286,10 @@ class SignalMixer:
         return False
     
     def _determine_signal_type(self, score: float) -> SignalType:
-        """신호 타입 결정 (임계: score ≥ 0.6 → LONG, ≤ -0.6 → SHORT)"""
-        if score >= self.buy_threshold:  # 0.6
+        """신호 타입 결정 (임계: score ≥ 0.68 → LONG, ≤ -0.68 → SHORT)"""
+        if score >= self.buy_threshold:  # 0.68
             return SignalType.LONG
-        elif score <= self.sell_threshold:  # -0.6
+        elif score <= self.sell_threshold:  # -0.68
             return SignalType.SHORT
         else:
             return SignalType.HOLD

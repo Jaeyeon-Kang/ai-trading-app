@@ -130,61 +130,51 @@ class SlackBot:
         """거래 시그널 알림 전송 (업그레이드된 포맷)"""
         signal_config = self.templates["signal"][signal.signal_type]
         
-        # 메시지 포맷: "AAPL | 레짐 VOL_SPIKE(1.00) | 점수 +0.67 롱"
+        # 메시지 포맷: "AAPL | 레짐 TREND(0.80) | 점수 +0.72 | 제안: 진입 224.5 / 손절 221.1 / 익절 231.2 | 이유: 가이던스 상향(<=120m)"
         regime_display = signal.regime.upper().replace("_", "")
         score_sign = "+" if signal.score >= 0 else ""
         signal_type_kr = "롱" if signal.signal_type == "long" else "숏"
-        
-        text = f"{signal.ticker} | 레짐 {regime_display}({signal.confidence:.2f}) | 점수 {score_sign}{signal.score:.2f} {signal_type_kr}"
-        
-        # 블록 구성
+
+        text = (
+            f"{signal.ticker} | 레짐 {regime_display}({signal.confidence:.2f}) | "
+            f"점수 {score_sign}{signal.score:.2f} | 제안: 진입 {signal.entry_price:.2f} / "
+            f"손절 {signal.stop_loss:.2f} / 익절 {signal.take_profit:.2f} | "
+            f"이유: {signal.trigger}(<={signal.horizon_minutes}m)"
+        )
+
+        # 블록 구성 - 한 줄 요약 + 버튼
         blocks = [
             {
                 "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*{signal.ticker} | 레짐 {regime_display}({signal.confidence:.2f}) | 점수 {score_sign}{signal.score:.2f} {signal_type_kr}*"
-                }
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*제안:* 진입 ${signal.entry_price:.2f} / SL ${signal.stop_loss:.2f} / TP ${signal.take_profit:.2f}"
-                }
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*이유:* {signal.trigger} (≤{signal.horizon_minutes}m)"
-                }
+                "text": {"type": "mrkdwn", "text": f"*{text}*"}
             }
         ]
         
         # 승인 버튼 (반자동 모드에서만)
         if self._is_semi_auto_mode():
+            # 버튼 텍스트는 한글(매수/매도)로 표시하되, 실제 페이로드는 영문 buy/sell 사용
+            is_long = signal.signal_type == "long"
+            action_text = "매수" if is_long else "매도"
+            order_value = json.dumps({
+                "ticker": signal.ticker,
+                "side": "buy" if is_long else "sell",
+                "entry": signal.entry_price,
+                "sl": signal.stop_loss,
+                "tp": signal.take_profit
+            })
             blocks.append({
                 "type": "actions",
                 "elements": [
                     {
                         "type": "button",
-                        "text": {
-                            "type": "plain_text",
-                            "text": "✅ 승인",
-                            "emoji": True
-                        },
+                        "text": {"type": "plain_text", "text": f"✅ {action_text}", "emoji": True},
                         "style": "primary",
-                        "value": f"approve_{signal.ticker}_{signal.signal_type}_{signal.timestamp.timestamp()}",
+                        "value": order_value,
                         "action_id": "approve_trade"
                     },
                     {
                         "type": "button",
-                        "text": {
-                            "type": "plain_text",
-                            "text": "❌ 패스",
-                            "emoji": True
-                        },
+                        "text": {"type": "plain_text", "text": "❌ 패스", "emoji": True},
                         "style": "danger",
                         "value": f"reject_{signal.ticker}_{signal.signal_type}_{signal.timestamp.timestamp()}",
                         "action_id": "reject_trade"
