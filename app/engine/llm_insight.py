@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 import time
 import numpy as np
 from openai import OpenAI
+import redis
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,15 @@ class LLMInsightEngine:
         
         # 슬랙 봇 참조 (상태 변경 알림용)
         self.slack_bot = None
+
+        # 메트릭 기록용 Redis (선택)
+        self.redis = None
+        try:
+            redis_url = os.getenv("REDIS_URL")
+            if redis_url:
+                self.redis = redis.from_url(redis_url)
+        except Exception:
+            self.redis = None
         
         logger.info(f"LLM 인사이트 엔진 초기화: 월 한도 {monthly_cap_krw:,.0f}원, 캐시 {cache_hours}시간")
     
@@ -99,8 +109,9 @@ class LLMInsightEngine:
             logger.debug(f"LLM 호출 조건 불충족: edgar_event={edgar_event}, regime={regime}")
             return False
         
-        # 조건 2: RTH(정규장) 시간대만 허용 (09:30-16:00 ET)
-        if not self._is_rth_time():
+        # 조건 2: RTH(정규장) 시간대만 허용 (09:30-16:00 ET) — RTH_ONLY=true일 때만 적용
+        rth_only = os.getenv("RTH_ONLY", "false").lower() in ("1", "true", "yes", "on")
+        if rth_only and not self._is_rth_time():
             logger.debug("LLM 호출 제한: 정규장 시간이 아님")
             return False
         
@@ -179,6 +190,17 @@ class LLMInsightEngine:
                 
                 # 비용 업데이트
                 self._update_cost(result.cost_krw)
+
+                # 메트릭 기록 (Redis HINCRBY/HINCRBYFLOAT)
+                try:
+                    if self.redis:
+                        key = f"metrics:llm:{datetime.utcnow():%Y%m%d}"
+                        trigger = "edgar" if edgar_event else (regime or "unknown")
+                        self.redis.hincrby(key, "total", 1)
+                        self.redis.hincrbyfloat(key, "cost_krw", float(result.cost_krw or 0.0))
+                        self.redis.hincrby(key, f"by_trigger:{trigger}", 1)
+                except Exception:
+                    pass
                 
                 logger.info(f"LLM 분석 완료: {source} (비용: {result.cost_krw:.0f}원)")
                 return result

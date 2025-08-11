@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import os
 import time
 import hashlib
+import psycopg2
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -74,6 +75,11 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(hour=21, minute=10),  # 매일 21:10 UTC = 06:10 KST
         "args": [False, True],  # force=False, post=True (슬랙으로 보내기)
     },
+    # 5초마다 EDGAR 스트림 수집 → DB 적재 (dedupe는 DB UNIQUE와 ON CONFLICT로 보강)
+    "ingest-edgar": {
+        "task": "app.jobs.scheduler.ingest_edgar_stream",
+        "schedule": 5.0,
+    },
 }
 
 # 전역 변수 (실제로는 의존성 주입 사용)
@@ -89,6 +95,7 @@ trading_components = {
     "redis_streams": None,
     "slack_bot": None,
     "stream_consumer": None,
+    "db_connection": None,
 }
 
 @celery_app.task(bind=True, name="app.jobs.scheduler.pipeline_e2e")
@@ -637,6 +644,78 @@ def initialize_components(components: Dict):
     global trading_components
     trading_components.update(components)
     logger.info("스케줄러 컴포넌트 초기화 완료")
+
+
+@celery_app.task(bind=True, name="app.jobs.scheduler.ingest_edgar_stream")
+def ingest_edgar_stream(self):
+    """Redis Streams(news.edgar) → DB(edgar_events) 적재. DB UNIQUE(snippet_hash)로 최종 dedupe.
+    워커 부팅 후 readiness 통과 시 주기적으로 실행된다.
+    """
+    try:
+        from app.io.streams import RedisStreams, StreamConsumer
+        rs = trading_components.get("redis_streams")
+        if rs is None:
+            # env에서 연결
+            import urllib.parse as _u
+            redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+            parsed = _u.urlparse(redis_url)
+            host = parsed.hostname or "redis"
+            port = int(parsed.port or 6379)
+            db = int(parsed.path.lstrip("/") or 0)
+            rs = RedisStreams(host=host, port=port, db=db)
+            trading_components["redis_streams"] = rs
+        consumer = trading_components.get("stream_consumer") or StreamConsumer(rs)
+        trading_components["stream_consumer"] = consumer
+
+        # DB 연결 확보/재사용
+        conn = trading_components.get("db_connection")
+        if conn is None or conn.closed:
+            conn = psycopg2.connect(os.getenv("POSTGRES_URL"))
+            conn.autocommit = True
+            trading_components["db_connection"] = conn
+
+        messages = consumer.consume_edgar_events(count=20, block_ms=100)
+        inserted = 0
+        with conn.cursor() as cur:
+            for msg in messages:
+                d = msg.data
+                # 문자열로 온 JSON을 원상복구 시도
+                def _norm(key):
+                    val = d.get(key)
+                    if val is None:
+                        return None
+                    try:
+                        return json.loads(val)
+                    except Exception:
+                        return val
+
+                ticker = _norm("ticker") or d.get("ticker")
+                form = _norm("form") or d.get("form")
+                item = _norm("item") or d.get("item")
+                url = _norm("url") or d.get("url")
+                snippet_text = _norm("snippet_text") or d.get("snippet_text")
+                snippet_hash = _norm("snippet_hash") or d.get("snippet_hash")
+
+                cur.execute(
+                    """
+                    INSERT INTO edgar_events (ticker, form, item, url, snippet_hash, snippet_text)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (snippet_hash) DO NOTHING
+                    """,
+                    (str(ticker) if ticker is not None else None,
+                     str(form) if form is not None else None,
+                     str(item) if item is not None else None,
+                     str(url) if url is not None else None,
+                     str(snippet_hash) if snippet_hash is not None else None,
+                     str(snippet_text) if snippet_text is not None else None)
+                )
+                consumer.acknowledge("news.edgar", msg.message_id)
+                inserted += 1
+
+        return {"status": "success", "inserted": inserted, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"EDGAR 스트림 적재 실패: {e}")
+        return {"status": "error", "error": str(e), "timestamp": datetime.now().isoformat()}
 
 def get_task_status(task_id: str) -> Dict:
     """작업 상태 조회"""

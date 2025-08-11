@@ -598,22 +598,39 @@ async def get_daily_report(force: bool = False, post: bool = False):
 async def collect_daily_metrics(date: datetime.date) -> Dict:
     """일일 메트릭 수집"""
     try:
-        # 실제로는 데이터베이스에서 집계
+        # 기본 집계 (임시 값)
         metrics = {
-            "candidate_signals": 15,  # 후보신호수
-            "avg_final_score": 0.65,  # 평균 최종점수
-            "median_final_score": 0.68,  # 중앙 최종점수
-            "regime_distribution": {  # 레짐 비중(%)
+            "candidate_signals": 15,
+            "avg_final_score": 0.65,
+            "median_final_score": 0.68,
+            "regime_distribution": {
                 "trend": 40,
                 "vol_spike": 25,
                 "mean_revert": 20,
                 "sideways": 15
             },
-            "edgar_count": 8,  # EDGAR 카운트
-            "llm_cost_krw": 15000,  # LLM 비용
-            "signal_to_slack_p99_latency_ms": 850,  # 신호→슬랙 p99 지연
-            "error_count": sum(error_counters.values())  # 에러 수
+            "edgar_count": 8,
+            "llm_cost_krw": 0.0,
+            "signal_to_slack_p99_latency_ms": 850,
+            "error_count": sum(error_counters.values())
         }
+
+        # Redis에 저장된 LLM 사용량 메트릭 취합
+        try:
+            import redis as _redis
+            redis_url = os.getenv("REDIS_URL")
+            if redis_url:
+                r = _redis.from_url(redis_url)
+                key = f"metrics:llm:{datetime.utcnow():%Y%m%d}"
+                h = r.hgetall(key) or {}
+                cost = float(h.get("cost_krw", 0.0) or 0.0)
+                total = int(h.get("total", 0) or 0)
+                by_trigger = {k.split(":",1)[1]: int(v) for k, v in h.items() if k.startswith("by_trigger:")}
+                metrics["llm_cost_krw"] = cost
+                metrics["llm_calls"] = total
+                metrics["llm_calls_by_trigger"] = by_trigger
+        except Exception:
+            pass
         
         return metrics
         
