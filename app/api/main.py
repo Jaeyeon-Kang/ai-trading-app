@@ -72,6 +72,18 @@ class SignalResponse(BaseModel):
     status: str
     message: str
 
+class PaperOrderRequest(BaseModel):
+    ticker: str
+    side: str
+    qty: int = 1
+    entry: float
+    sl: float
+    tp: float
+
+class PaperOrderResponse(BaseModel):
+    status: str
+    order_id: str
+
 class ReportRequest(BaseModel):
     date: str
     include_risk: bool = True
@@ -101,6 +113,9 @@ slack_bot = None
 redis_streams = None
 db_connection = None
 llm_engine = None
+
+# 메모리 기반 페이퍼 주문 저장소
+paper_orders: List[Dict] = []
 
 # 오류 카운터
 error_counters = {
@@ -338,6 +353,81 @@ async def get_signals(limit: int = 10, ticker: Optional[str] = None):
         
     except Exception as e:
         logger.error(f"시그널 조회 실패: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/signals/recent", response_model=List[Dict])
+async def get_recent_signals(hours: int = 24):
+    """최근 N시간 시그널 조회 (KST 시간 포함)"""
+    try:
+        now = datetime.now(timezone.utc)
+        kst = timezone(timedelta(hours=9))
+
+        dummy = [
+            {
+                "ticker": "AAPL",
+                "regime": "trend",
+                "score": 0.72,
+                "reason": "가이던스 상향",
+                "timestamp_kst": (now - timedelta(minutes=30)).astimezone(kst).isoformat()
+            },
+            {
+                "ticker": "TSLA",
+                "regime": "vol_spike",
+                "score": -0.70,
+                "reason": "배터리 화재",
+                "timestamp_kst": (now - timedelta(hours=1)).astimezone(kst).isoformat()
+            }
+        ]
+
+        cutoff = now - timedelta(hours=hours)
+        signals = [s for s in dummy if datetime.fromisoformat(s["timestamp_kst"]).astimezone(timezone.utc) >= cutoff]
+        return signals
+    except Exception as e:
+        logger.error(f"최근 시그널 조회 실패: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/orders/paper", response_model=PaperOrderResponse)
+async def create_paper_order(order: PaperOrderRequest):
+    """페이퍼 주문 기록"""
+    try:
+        # DB 기록 시도 (PostgreSQL)
+        order_id = None
+        dsn = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+        if dsn:
+            try:
+                conn = psycopg2.connect(dsn)
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO orders_paper (ticker, side, qty, px_entry, sl, tp)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        order.ticker,
+                        order.side,
+                        order.qty,
+                        order.entry,
+                        order.sl,
+                        order.tp,
+                    ),
+                )
+                order_id = str(cur.fetchone()[0])
+                conn.commit()
+                cur.close()
+                conn.close()
+            except Exception as db_err:
+                logger.error(f"페이퍼 주문 DB 기록 실패: {db_err}")
+
+        # 메모리에도 기록 (DB 실패 대비)
+        fallback_id = f"paper_{int(time.time()*1000)}"
+        paper_orders.append({"id": order_id or fallback_id, **order.dict(), "ts": datetime.now().isoformat()})
+
+        return PaperOrderResponse(status="recorded", order_id=order_id or fallback_id)
+    except Exception as e:
+        logger.error(f"페이퍼 주문 실패: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/report", response_model=ReportResponse)
