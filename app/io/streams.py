@@ -48,6 +48,23 @@ class RedisStreams:
         
         logger.info(f"Redis Streams 초기화: {host}:{port}")
     
+    def _coerce_message_fields(self, data: Dict) -> Dict:
+        """Redis XADD는 값으로 bytes/str/int/float만 허용한다.
+        dict/list/None 등은 안전하게 문자열로 변환한다.
+        """
+        coerced: Dict[str, Any] = {}
+        for key, value in data.items():
+            if isinstance(value, (dict, list)):
+                try:
+                    coerced[key] = json.dumps(value, ensure_ascii=False)
+                except Exception:
+                    coerced[key] = str(value)
+            elif value is None:
+                coerced[key] = ""
+            else:
+                coerced[key] = value
+        return coerced
+    
     def publish_quote(self, ticker: str, mic: str, data: Dict):
         """시세 데이터 발행"""
         stream_key = f"quotes.{mic}.{ticker}"
@@ -57,6 +74,7 @@ class RedisStreams:
             "timestamp": datetime.now().isoformat(),
             **data
         }
+        message = self._coerce_message_fields(message)
         
         try:
             message_id = self.redis_client.xadd(stream_key, message)
@@ -72,6 +90,7 @@ class RedisStreams:
             "timestamp": datetime.now().isoformat(),
             **data
         }
+        message = self._coerce_message_fields(message)
         
         try:
             message_id = self.redis_client.xadd("news.headlines", message)
@@ -87,6 +106,7 @@ class RedisStreams:
             "timestamp": datetime.now().isoformat(),
             **data
         }
+        message = self._coerce_message_fields(message)
         
         try:
             message_id = self.redis_client.xadd("news.edgar", message)
@@ -102,6 +122,7 @@ class RedisStreams:
             "timestamp": datetime.now().isoformat(),
             **signal_data
         }
+        message = self._coerce_message_fields(message)
         
         try:
             message_id = self.redis_client.xadd("signals.raw", message)
@@ -117,6 +138,7 @@ class RedisStreams:
             "timestamp": datetime.now().isoformat(),
             **signal_data
         }
+        message = self._coerce_message_fields(message)
         
         try:
             message_id = self.redis_client.xadd("signals.tradable", message)
@@ -132,6 +154,7 @@ class RedisStreams:
             "timestamp": datetime.now().isoformat(),
             **order_data
         }
+        message = self._coerce_message_fields(message)
         
         try:
             message_id = self.redis_client.xadd("orders.submitted", message)
@@ -147,6 +170,7 @@ class RedisStreams:
             "timestamp": datetime.now().isoformat(),
             **fill_data
         }
+        message = self._coerce_message_fields(message)
         
         try:
             message_id = self.redis_client.xadd("orders.fills", message)
@@ -162,6 +186,7 @@ class RedisStreams:
             "timestamp": datetime.now().isoformat(),
             **risk_data
         }
+        message = self._coerce_message_fields(message)
         
         try:
             message_id = self.redis_client.xadd("risk.pnl", message)
