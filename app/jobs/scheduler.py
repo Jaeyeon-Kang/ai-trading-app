@@ -11,6 +11,7 @@ import os
 import time
 import hashlib
 import psycopg2
+import json
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -414,8 +415,16 @@ def scan_edgar(self):
         start_time = time.time()
         logger.debug("EDGAR 스캔 시작")
         
-        edgar_scanner = trading_components["edgar_scanner"]
-        redis_streams = trading_components["redis_streams"]
+        # EDGAR 스캐너 준비
+        try:
+            from app.io.edgar import EDGARScanner
+        except Exception:
+            EDGARScanner = None  # type: ignore
+        edgar_scanner = trading_components.get("edgar_scanner")
+        if edgar_scanner is None and EDGARScanner is not None:
+            edgar_scanner = EDGARScanner()
+            trading_components["edgar_scanner"] = edgar_scanner
+        redis_streams = trading_components.get("redis_streams")
         redis_client = None
         try:
             # dedupe를 위한 raw redis 클라이언트 접근 (streams 내부 클라이언트 재사용)
@@ -424,7 +433,7 @@ def scan_edgar(self):
         except Exception:
             redis_client = None
         
-        if not edgar_scanner or not redis_streams:
+        if not redis_streams:
             return {"status": "skipped", "reason": "components_not_ready"}
         
         # EDGAR 공시 스캔
@@ -445,7 +454,9 @@ def scan_edgar(self):
                     continue
             # 해시를 함께 저장해두기
             filing["snippet_hash"] = snippet_hash
-            redis_streams.publish_edgar(filing)
+            # Streams는 문자열 값이 안전하므로 dict/list는 JSON 문자열로 변환
+            payload = {k: json.dumps(v) if isinstance(v, (dict, list)) else (v if v is not None else "") for k, v in filing.items()}
+            redis_streams.publish_edgar(payload)
             published += 1
             
             # 중요 공시 LLM 처리
@@ -646,6 +657,15 @@ def initialize_components(components: Dict):
     global trading_components
     trading_components.update(components)
     logger.info("스케줄러 컴포넌트 초기화 완료")
+
+    # Quotes ingestor 기본 주입(딜레이드)
+    try:
+        from app.io.quotes_delayed import DelayedQuotesIngestor
+        if trading_components.get("quotes_ingestor") is None:
+            trading_components["quotes_ingestor"] = DelayedQuotesIngestor()
+            logger.info("딜레이드 Quotes 인제스터 초기화")
+    except Exception as e:
+        logger.warning(f"Quotes 인제스터 초기화 실패: {e}")
 
 
 @celery_app.task(bind=True, name="app.jobs.scheduler.ingest_edgar_stream")
