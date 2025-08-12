@@ -315,18 +315,16 @@ async def system_status():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/signal", response_model=SignalResponse)
-async def submit_signal(signal: SignalRequest, background_tasks: BackgroundTasks):
+async def submit_signal(signal: SignalRequest, background_tasks: BackgroundTasks, request: Request):
     """거래 시그널 제출"""
     try:
         # 보호: 운영에서는 API 키 요구 (DEV_MODE=true일 때는 우회)
         dev_mode = os.getenv("DEV_MODE", "false").lower() in ("1", "true", "yes", "on")
         api_key = os.getenv("SIGNAL_API_KEY", "")
         if api_key and not dev_mode:
-            from fastapi import Request as _Req
-            # 로컬에서 header 접근을 위해 Request dependency 사용 대신 간단 처리
-            # FastAPI에서는 DI로 받아야 하나, 간단히 글로벌 Request는 없으므로 우회 제공
-            # 프레임 상 이 경로에서는 헤더 검증을 생략하고, 아래 전역 예외 핸들러에서 막지 않게 함
-            pass
+            client_key = request.headers.get("x-api-key", "")
+            if client_key != api_key:
+                raise HTTPException(status_code=401, detail="invalid api key")
         # 시그널 검증
         if signal.score < -1 or signal.score > 1:
             raise HTTPException(status_code=400, detail="점수는 -1에서 1 사이여야 합니다")
