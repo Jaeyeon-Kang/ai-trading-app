@@ -145,7 +145,7 @@ def pipeline_e2e(self):
                 indicators = get_mock_indicators(ticker)
                 
                 # 4. 레짐 감지
-                regime_result = regime_detector.detect_regime(candles, indicators)
+                regime_result = regime_detector.detect_regime(candles)
                 
                 # 5. 기술적 점수 계산
                 tech_score = get_mock_tech_score(ticker)
@@ -226,13 +226,15 @@ def get_mock_indicators(ticker: str) -> Dict:
 def get_mock_tech_score(ticker: str):
     """모의 기술적 점수"""
     # 실제로는 tech_score_engine에서 계산
-    from app.engine.techscore import TechScore
-    return TechScore(
-        overall_score=0.7,
-        ema_score=0.8,
-        macd_score=0.7,
-        rsi_score=0.6,
-        vwap_score=0.7,
+    from app.engine.techscore import TechScoreResult
+    return TechScoreResult(
+        score=0.7,
+        components={
+            "ema": 0.8,
+            "macd": 0.7,
+            "rsi": 0.6,
+            "vwap": 0.7,
+        },
         timestamp=datetime.now()
     )
 
@@ -279,10 +281,10 @@ def generate_signals(self):
                     continue
                 
                 # 3. 레짐 감지
-                regime_result = regime_detector.detect_regime(candles, indicators)
+                regime_result = regime_detector.detect_regime(candles)
                 
                 # 4. 기술적 점수 계산
-                tech_score = tech_score_engine.calculate_tech_score(indicators, candles)
+                tech_score = tech_score_engine.calculate_tech_score(candles)
                 
                 # 5. EDGAR 공시 확인
                 edgar_filing = None
@@ -670,7 +672,10 @@ def ingest_edgar_stream(self):
         # DB 연결 확보/재사용
         conn = trading_components.get("db_connection")
         if conn is None or conn.closed:
-            conn = psycopg2.connect(os.getenv("POSTGRES_URL"))
+            dsn = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+            if not dsn:
+                return {"status": "skipped", "reason": "missing_db_dsn", "timestamp": datetime.now().isoformat()}
+            conn = psycopg2.connect(dsn)
             conn.autocommit = True
             trading_components["db_connection"] = conn
 

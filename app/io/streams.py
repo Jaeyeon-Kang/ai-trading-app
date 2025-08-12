@@ -437,6 +437,12 @@ class StreamConsumer:
     def get_pending_count(self, stream_key: str) -> int:
         """대기 중인 메시지 수 조회"""
         pending = self.redis_streams.get_pending_messages(stream_key, self.group_name)
-        if pending and len(pending) >= 4:
-            return pending[3]  # pending count
+        # redis-py 버전에 따라 dict 또는 tuple/list 반환 가능
+        try:
+            if isinstance(pending, dict):
+                return int(pending.get("pending", 0))
+            if isinstance(pending, (list, tuple)) and len(pending) >= 4:
+                return int(pending[3])
+        except Exception:
+            pass
         return 0

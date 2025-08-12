@@ -16,6 +16,15 @@ import hashlib
 from urllib.parse import parse_qs
 from fastapi import Request
 
+# .env 로드 (로컬 개발 편의)
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
+ 
+
 import redis
 import psycopg2
 import httpx
@@ -24,10 +33,7 @@ import httpx
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 전역 변수
-trading_bot = None
-slack_bot = None
-redis_streams = None
+START_TIME = datetime.now()
 
 # FastAPI 앱 생성
 app = FastAPI(
@@ -232,7 +238,7 @@ async def health_check():
             status=status,
             timestamp=datetime.now().isoformat(),
             version="1.0.0",
-            uptime=0.0  # 실제로는 시작 시간부터 계산
+            uptime=(datetime.now() - START_TIME).total_seconds()
         )
         
     except Exception as e:
@@ -241,7 +247,7 @@ async def health_check():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/healthz", response_model=HealthzResponse)
-async def healthz_check():
+async def healthz_check(skip_external: bool = False):
     """헬스체크 (상세) - Redis/DB/Slack 토큰 체크"""
     # 환경변수에서 직접 읽어와 자가검사 (전역 객체 의존 X)
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
@@ -249,12 +255,21 @@ async def healthz_check():
     slack_token = os.getenv("SLACK_BOT_TOKEN", "")
     slack_channel = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "")
 
-    r_ok, r_err, r_ms = check_redis(redis_url)
-    d_ok, d_err, d_ms = check_db(db_dsn) if db_dsn else (False, "missing_db_dsn", 0)
-    s_ok, s_err, s_ms = check_slack(slack_token, slack_channel)
-    l_ok, l_meta = check_llm()
+    # 개발 편의: 외부 의존성 체크 스킵
+    skip_external = skip_external or (os.getenv("HEALTHZ_SKIP_EXTERNAL", "0").lower() in ("1", "true", "yes", "on"))
 
-    overall = r_ok and d_ok and s_ok and l_ok
+    if skip_external:
+        r_ok, r_err, r_ms = True, None, 0
+        d_ok, d_err, d_ms = True, None, 0
+        s_ok, s_err, s_ms = True, None, 0
+        l_ok, l_meta = check_llm()
+        overall = True  # 외부 의존성은 개발 모드에서 강제 통과
+    else:
+        r_ok, r_err, r_ms = check_redis(redis_url)
+        d_ok, d_err, d_ms = check_db(db_dsn) if db_dsn else (False, "missing_db_dsn", 0)
+        s_ok, s_err, s_ms = check_slack(slack_token, slack_channel)
+        l_ok, l_meta = check_llm()
+        overall = r_ok and d_ok and s_ok and l_ok
 
     return HealthzResponse(
         status="healthy" if overall else "unhealthy",

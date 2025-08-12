@@ -82,8 +82,17 @@ class SlackBot:
         
         logger.info(f"Slack Bot 초기화: 채널 {channel}")
     
-    def send_message(self, message: SlackMessage) -> bool:
-        """메시지 전송 (재시도 로직 포함)"""
+    def send_message(self, message) -> bool:
+        """메시지 전송 (재시도 로직 포함). dict 또는 SlackMessage 모두 허용"""
+        # dict 입력 호환 처리
+        if isinstance(message, dict):
+            message = SlackMessage(
+                channel=message.get("channel", self.default_channel),
+                text=message.get("text", ""),
+                blocks=message.get("blocks"),
+                attachments=message.get("attachments"),
+                thread_ts=message.get("thread_ts"),
+            )
         for attempt in range(self.max_retries):
             try:
                 payload = {
@@ -129,8 +138,38 @@ class SlackBot:
         
         return False
     
-    def send_signal_notification(self, signal: SignalNotification) -> str:
-        """거래 시그널 알림 전송 (업그레이드된 포맷)"""
+    def send_signal_notification(self, signal) -> str:
+        """거래 시그널 알림 전송 (업그레이드된 포맷). dict 또는 SignalNotification 허용"""
+        # dict 입력 호환 처리
+        if isinstance(signal, dict):
+            # 필수 필드 보정
+            try:
+                ts = signal.get("timestamp")
+                if isinstance(ts, str):
+                    # best-effort: ISO 파싱 실패 시 현재 시간
+                    try:
+                        from datetime import datetime as _dt
+                        ts = _dt.fromisoformat(ts)
+                    except Exception:
+                        ts = datetime.now()
+                elif ts is None:
+                    ts = datetime.now()
+                signal = SignalNotification(
+                    ticker=signal.get("ticker", "UNKNOWN"),
+                    signal_type=signal.get("signal_type", "long"),
+                    score=float(signal.get("score", 0.0)),
+                    confidence=float(signal.get("confidence", 0.0)),
+                    regime=str(signal.get("regime", "trend")),
+                    trigger=signal.get("trigger", ""),
+                    summary=signal.get("summary", ""),
+                    entry_price=float(signal.get("entry_price", 0.0)),
+                    stop_loss=float(signal.get("stop_loss", 0.0)),
+                    take_profit=float(signal.get("take_profit", 0.0)),
+                    horizon_minutes=int(signal.get("horizon_minutes", 120)),
+                    timestamp=ts,
+                )
+            except Exception:
+                return ""
         signal_config = self.templates["signal"][signal.signal_type]
         
         # 메시지 포맷: "AAPL | 레짐 TREND(0.80) | 점수 +0.72 | 제안: 진입 224.5 / 손절 221.1 / 익절 231.2 | 이유: 가이던스 상향(<=120m)"
@@ -648,10 +687,8 @@ class SlackBot:
         }
     
     def _is_semi_auto_mode(self) -> bool:
-        """반자동 모드 여부 확인"""
-        # 환경변수나 설정에서 확인
-        # 여기서는 간단히 True 반환
-        return True
+        """반자동 모드 여부 확인: AUTO_MODE가 1/true일 때만 버튼 표시"""
+        return os.getenv("AUTO_MODE", "0").lower() in ("1", "true", "yes", "on")
     
     def cleanup_old_callbacks(self, max_age_hours: int = 24):
         """오래된 콜백 정리"""

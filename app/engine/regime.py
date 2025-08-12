@@ -244,14 +244,18 @@ class RegimeDetector:
         adx = indicators["adx"]
         slope_20 = (ema_20 - indicators["ema_20"][-2]) / max(indicators["ema_20"][-2], 1e-9) if len(indicators["ema_20"]) > 1 else 0
         slope_50 = (ema_50 - indicators["ema_50"][-2]) / max(indicators["ema_50"][-2], 1e-9) if len(indicators["ema_50"]) > 1 else 0
-        print(f"[Trend DEBUG] ema20={ema_20:.2f} ema50={ema_50:.2f} price={price:.2f} "
-              f"slope20={slope_20:.4f} slope50={slope_50:.4f} adx={adx:.2f} score={trend_score:.3f}")
+        logger.debug(
+            f"[Trend DEBUG] ema20={ema_20:.2f} ema50={ema_50:.2f} price={price:.2f} "
+            f"slope20={slope_20:.4f} slope50={slope_50:.4f} adx={adx:.2f} score={trend_score:.3f}"
+        )
         
         if mean_revert_score > 0:
             rsi_now = indicators["rsi"]
             adx = indicators["adx"]
             bb_pos = (candles[-1].c - indicators["bb"]["lower"]) / (indicators["bb"]["upper"] - indicators["bb"]["lower"]) if (indicators["bb"]["upper"] - indicators["bb"]["lower"]) > 0 else 0.5
-            print(f"[Mean DEBUG] rsi_now={rsi_now:.1f} bb_pos={bb_pos:.2f} adx={adx:.1f} score={mean_revert_score:.3f}")
+            logger.debug(
+                f"[Mean DEBUG] rsi_now={rsi_now:.1f} bb_pos={bb_pos:.2f} adx={adx:.1f} score={mean_revert_score:.3f}"
+            )
         
         # 가장 높은 점수의 레짐 선택
         scores = {

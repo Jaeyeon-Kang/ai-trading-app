@@ -16,7 +16,7 @@ import json
 import os
 from typing import Dict, List, Optional
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
 import time
 import numpy as np
 from openai import OpenAI
@@ -134,8 +134,8 @@ class LLMInsightEngine:
         current_time = et_time.time()
         
         # 정규장 시간: 09:30-16:00 ET
-        market_open = time(9, 30)
-        market_close = time(16, 0)
+        market_open = dtime(9, 30)
+        market_close = dtime(16, 0)
         
         is_rth = market_open <= current_time <= market_close
         
