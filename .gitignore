@@ -143,3 +143,5 @@ dmypy.json
 logs/
 data/
 cache/
+signal.json 
+$null 
