@@ -23,6 +23,7 @@ try:
 except Exception:
     pass
 
+
  
 
 import redis
@@ -842,6 +843,17 @@ async def get_trades(limit: int = 20, ticker: Optional[str] = None):
         
     except Exception as e:
         logger.error(f"거래 조회 실패: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/report/perf", response_model=Dict)
+async def report_perf(days: int = 1):
+    """OCO 시뮬 기반 성과 리포트 (경량)"""
+    try:
+        from app.engine.perf import simulate_and_summarize
+        result = simulate_and_summarize(days=days, write_trades=False)
+        return result
+    except Exception as e:
+        logger.error(f"성과 리포트 생성 실패: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/emergency-stop")
