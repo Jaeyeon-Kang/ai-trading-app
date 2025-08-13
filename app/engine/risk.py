@@ -1,3 +1,28 @@
+from __future__ import annotations
+
+import numpy as np
+
+def rolling_var95(ret_samples: list[float]) -> float:
+    """Compute simple 95% one-tailed VaR on return samples.
+    Negative returns expected; returns absolute loss threshold (>0).
+    """
+    if not ret_samples:
+        return 0.0
+    arr = np.array(ret_samples, dtype=float)
+    # 5th percentile of returns distribution (loss tail)
+    q = np.percentile(arr, 5)
+    return float(abs(min(q, 0.0)))
+
+def suggest_position_qty(default_qty: int, var95: float, max_risk_r: float = 1.0) -> int:
+    """Propose position qty so that expected loss in R does not exceed max_risk_r.
+    Here we scale linearly on VaR proxy; for demo keep within 1..3x default.
+    """
+    if var95 <= 0:
+        return default_qty
+    scale = max(0.5, min(1.5, max_risk_r / var95))
+    qty = int(round(default_qty * scale))
+    return max(1, min(3 * default_qty, qty))
+
 """
 리스크 관리 엔진
 PnL, VaR95, 셧다운 로직

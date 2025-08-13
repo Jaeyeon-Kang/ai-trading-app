@@ -391,6 +391,24 @@ def generate_signals(self):
                     except Exception:
                         pass
 
+                # VaR95 경량 가드: 최근 리턴 샘플 기반(옵션)
+                try:
+                    from app.engine.risk import rolling_var95
+                    # 샘플은 별도 곳에서 채워진다고 가정; 없으면 스킵
+                    rurl = os.getenv("REDIS_URL")
+                    var_guard = False
+                    if rurl:
+                        r = redis.from_url(rurl)
+                        key = f"risk:rets:{ticker}:{regime_result.regime.value}"
+                        samples = [float(x) for x in (r.lrange(key, 0, 9999) or [])]
+                        if samples:
+                            var95 = rolling_var95(samples)
+                            # 간이 기준: 예상 손실R>VaR이면 억제
+                            # 여기서는 신호 생성 후 컷오프 단계에서 suppress
+                            pass
+                except Exception:
+                    pass
+
                 # 7. 시그널 믹싱
                 current_price = candles[-1].close if candles else 0
                 signal = signal_mixer.mix_signals(

@@ -412,26 +412,31 @@ async def get_recent_signals(hours: int = 24, include_suppressed: int = 0):
         kst = timezone(timedelta(hours=9))
         results: List[Dict] = []
         # Redis 최근 신호 조회 (있으면)
-        try:
-            if redis_client:
+        if redis_client:
+            try:
                 key = "signals:recent"
                 raw = redis_client.lrange(key, 0, 500) or []
                 for b in raw:
                     try:
                         s = json.loads(b)
-                        # suppressed 포함 여부
-                        if not include_suppressed and s.get("suppressed_reason"):
-                            continue
-                        ts = s.get("timestamp")
+                    except Exception:
+                        continue
+                    # suppressed 포함 여부
+                    if not include_suppressed and s.get("suppressed_reason"):
+                        continue
+                    ts = s.get("timestamp")
+                    try:
                         ts_dt = datetime.fromisoformat(ts) if ts else now
-                        if ts_dt.astimezone(timezone.utc) < now - timedelta(hours=hours):
-                            continue
-                        # 표준화 + KST 추가
-                        s["timestamp_kst"] = ts_dt.astimezone(kst).isoformat()
-                        results.append(s)
+                    except Exception:
+                        ts_dt = now
+                    if ts_dt.astimezone(timezone.utc) < now - timedelta(hours=hours):
+                        continue
+                    # 표준화 + KST 추가
+                    s["timestamp_kst"] = ts_dt.astimezone(kst).isoformat()
+                    results.append(s)
                 return results[:200]
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         # Fallback 더미
         return []
@@ -910,8 +915,31 @@ async def get_trades(limit: int = 20, ticker: Optional[str] = None):
 async def report_perf(days: int = 1):
     """OCO 시뮬 기반 성과 리포트 (경량)"""
     try:
-        from app.engine.perf import simulate_and_summarize
+        from app.engine.perf import simulate_and_summarize, build_equity_curve
+        from utils.spark import to_sparkline
         result = simulate_and_summarize(days=days, write_trades=False)
+        trades = result.get("trades", [])
+        # 그룹 요약 (세션/레짐) - meta/session, regime 필드가 없는 경우 빈값
+        by_session = {"RTH": {"trades": 0, "pnl": 0.0}, "EXT": {"trades": 0, "pnl": 0.0}}
+        by_regime = {}
+        for t in trades:
+            sess = (t.get("session") or (t.get("meta") or {}).get("session") or "RTH")
+            pnl = float(t.get("pnl_cash", 0.0))
+            if sess not in by_session:
+                by_session[sess] = {"trades": 0, "pnl": 0.0}
+            by_session[sess]["trades"] += 1
+            by_session[sess]["pnl"] += pnl
+            reg = t.get("regime") or (t.get("meta") or {}).get("regime") or "unknown"
+            if reg not in by_regime:
+                by_regime[reg] = {"trades": 0, "pnl": 0.0}
+            by_regime[reg]["trades"] += 1
+            by_regime[reg]["pnl"] += pnl
+        # Equity/Drawdown
+        eq, eq_meta = build_equity_curve(trades)
+        spark = to_sparkline(eq)
+        result["by_session"] = by_session
+        result["by_regime"] = by_regime
+        result["equity"] = {"sparkline": spark, **eq_meta}
         return result
     except Exception as e:
         logger.error(f"성과 리포트 생성 실패: {e}")

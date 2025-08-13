@@ -16,6 +16,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
+import math
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -153,5 +154,92 @@ def simulate_and_summarize(days: int = 1, write_trades: bool = False) -> Dict:
     }
 
     return {"summary": summary, "trades": results}
+
+
+# Day4 additions
+def compute_trade_metrics(candles: List[Candle], entry_px: float, exit_px: float, side: str, sl_px: Optional[float], tp_px: Optional[float]) -> Dict:
+    """Compute MFE/MAE in basis points, hold_minutes, realized R.
+    Simplified: walk bars between entry and exit and find best/worst excursion vs entry.
+    """
+    if not candles:
+        return {"mfe_bp": 0, "mae_bp": 0, "hold_minutes": 0, "realized_r": 0.0}
+    # find segment: assume candles sorted
+    idx_start = 0
+    idx_end = len(candles) - 1
+    # best-effort: choose last bar <= exit_px timestamp unknown -> use all bars
+    mfe_bp = 0.0
+    mae_bp = 0.0
+    for c in candles[idx_start:idx_end+1]:
+        # consider intrabar extremes
+        up = (c.h - entry_px) / max(entry_px, 1e-9)
+        dn = (entry_px - c.l) / max(entry_px, 1e-9)
+        if side == "buy":
+            mfe_bp = max(mfe_bp, up * 10000.0)
+            mae_bp = max(mae_bp, dn * 10000.0)
+        else:
+            # short: invert
+            mfe_bp = max(mfe_bp, dn * 10000.0)
+            mae_bp = max(mae_bp, up * 10000.0)
+    # hold minutes rough: number of bars * bar_sec/60 (unknown bar_sec → assume 0.5m per bar)
+    hold_minutes = int(round(len(candles[idx_start:idx_end+1]) * 0.5))
+    # realized R: (exit-entry)/(|entry-tp| or |entry-sl|) depending on side
+    if side == "buy":
+        r_denom = None
+        if tp_px:
+            r_denom = abs(tp_px - entry_px)
+        if sl_px:
+            r_denom = min(r_denom, abs(entry_px - sl_px)) if r_denom else abs(entry_px - sl_px)
+        realized_r = ((exit_px - entry_px) / r_denom) if r_denom and r_denom > 0 else 0.0
+    else:
+        r_denom = None
+        if tp_px:
+            r_denom = abs(entry_px - tp_px)
+        if sl_px:
+            r_denom = min(r_denom, abs(sl_px - entry_px)) if r_denom else abs(sl_px - entry_px)
+        realized_r = ((entry_px - exit_px) / r_denom) if r_denom and r_denom > 0 else 0.0
+    return {
+        "mfe_bp": int(round(mfe_bp)),
+        "mae_bp": int(round(mae_bp)),
+        "hold_minutes": hold_minutes,
+        "realized_r": float(realized_r),
+    }
+
+
+def estimate_slippage_bp(entry_quote: Optional[Dict], entry_px: float) -> int:
+    """Estimate slippage in bp from spread proxy.
+    entry_quote may include 'spread_bp'. If absent, fallback to 5 bp.
+    """
+    try:
+        if entry_quote and entry_quote.get("spread_bp") is not None:
+            # assume half-spread paid + small impact
+            sp = float(entry_quote["spread_bp"]) * 0.5 + 3.0
+            return int(max(0, round(sp)))
+    except Exception:
+        pass
+    return 5
+
+
+def build_equity_curve(trades: List[Dict]) -> Tuple[List[float], Dict]:
+    """Build cumulative equity curve and drawdown stats (bp, rough).
+    Returns (equity_series, {dd_max_bp, last}).
+    """
+    eq = []
+    total = 0.0
+    for t in trades:
+        total += float(t.get("pnl_cash", 0.0))
+        eq.append(total)
+    if not eq:
+        return [], {"dd_max_bp": 0, "last": 0.0}
+    peak = -1e18
+    dd_max = 0.0
+    for v in eq:
+        if v > peak:
+            peak = v
+        dd = (peak - v)
+        dd_max = max(dd_max, dd)
+    # convert to bp relative to equity peak scale (avoid zero)
+    scale = max(abs(max(eq)), 1.0)
+    dd_max_bp = int(round((dd_max / scale) * 10000.0))
+    return eq, {"dd_max_bp": dd_max_bp, "last": eq[-1]}
 
 
