@@ -1,0 +1,9 @@
+version: '3.8'
+services:
+  celery_worker:
+    environment:
+      LOG_LEVEL: DEBUG
+      SIGNAL_CUTOFF: "0.60"
+  celery_beat:
+    environment:
+      SIGNAL_CUTOFF: "0.60"

@@ -3,6 +3,7 @@ Celery beat 스케줄러
 15-30초 주기로 시그널 생성 및 거래 실행
 """
 from celery import Celery
+from celery.signals import worker_ready, beat_init, worker_process_init, task_prerun
 from celery.schedules import crontab
 import logging
 from typing import Dict, List, Optional
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta
 import os
 import time
 import hashlib
+import urllib.parse as _urlparse
 import psycopg2
 import json
 import redis
@@ -110,6 +112,141 @@ trading_components = {
     "db_connection": None,
 }
 
+def _parse_redis_url(url: str) -> tuple[str, int, int]:
+    try:
+        parsed = _urlparse.urlparse(url)
+        host = parsed.hostname or "redis"
+        port = int(parsed.port or 6379)
+        db = int((parsed.path or "/0").lstrip("/") or 0)
+        return host, port, db
+    except Exception:
+        return "redis", 6379, 0
+
+def _autoinit_components_if_enabled() -> None:
+    """Best-effort 컴포넌트 자동 초기화 (워커/비트 프로세스 기동 시).
+    필수 구성만이라도 준비해 components_not_ready 스킵을 줄인다.
+    """
+    if os.getenv("AUTO_INIT_COMPONENTS", "true").lower() not in ("1","true","yes","on"):  # opt-out
+        return
+    try:
+        from app.io.quotes_delayed import DelayedQuotesIngestor
+        from app.engine.regime import RegimeDetector
+        from app.engine.techscore import TechScoreEngine
+        from app.engine.mixer import SignalMixer
+        from app.engine.risk import RiskEngine
+        from app.adapters.paper_ledger import PaperLedger
+        from app.io.streams import RedisStreams, StreamConsumer
+        from app.engine.llm_insight import LLMInsightEngine
+        from app.io.slack_bot import SlackBot
+    except Exception as e:
+        logger.warning(f"컴포넌트 임포트 실패: {e}")
+        return
+
+    components: Dict[str, object] = {}
+
+    # Quotes ingestor
+    try:
+        components["quotes_ingestor"] = DelayedQuotesIngestor()
+        # 워밍업으로 빈 버퍼 방지
+        components["quotes_ingestor"].warmup_backfill()  # type: ignore
+        logger.info("딜레이드 Quotes 인제스터 워밍업 완료")
+    except Exception as e:
+        logger.warning(f"Quotes 인제스터 준비 실패: {e}")
+
+    # Regime/Tech/Mixer
+    try:
+        components["regime_detector"] = RegimeDetector()
+    except Exception as e:
+        logger.warning(f"RegimeDetector 준비 실패: {e}")
+    try:
+        components["tech_score_engine"] = TechScoreEngine()
+    except Exception as e:
+        logger.warning(f"TechScoreEngine 준비 실패: {e}")
+    try:
+        thr = float(os.getenv("SIGNAL_CUTOFF", "0.68"))
+        components["signal_mixer"] = SignalMixer(buy_threshold=thr, sell_threshold=-thr)
+    except Exception as e:
+        logger.warning(f"SignalMixer 준비 실패: {e}")
+
+    # Risk/Paper ledger
+    try:
+        init_cap = float(os.getenv("INITIAL_CAPITAL", "1000000"))
+        components["risk_engine"] = RiskEngine(initial_capital=init_cap)
+    except Exception as e:
+        logger.warning(f"RiskEngine 준비 실패: {e}")
+    try:
+        components["paper_ledger"] = PaperLedger(initial_cash=float(os.getenv("INITIAL_CAPITAL", "1000000")))
+    except Exception as e:
+        logger.warning(f"PaperLedger 준비 실패: {e}")
+
+    # Redis streams / consumer
+    try:
+        rurl = os.getenv("REDIS_URL", "redis://redis:6379/0")
+        host, port, db = _parse_redis_url(rurl)
+        rs = RedisStreams(host=host, port=port, db=db)
+        components["redis_streams"] = rs
+        components["stream_consumer"] = StreamConsumer(rs)
+    except Exception as e:
+        logger.warning(f"Redis Streams 준비 실패: {e}")
+
+    # Slack bot (optional)
+    try:
+        token = os.getenv("SLACK_BOT_TOKEN")
+        channel = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "#trading-signals")
+        if token:
+            components["slack_bot"] = SlackBot(token=token, channel=channel)
+            logger.info(f"Slack 봇 준비: 채널 {channel}")
+        else:
+            logger.warning("Slack 토큰 없음 - 슬랙 비활성")
+    except Exception as e:
+        logger.warning(f"SlackBot 준비 실패: {e}")
+
+    # LLM (optional)
+    try:
+        llm = LLMInsightEngine()
+        if components.get("slack_bot"):
+            llm.set_slack_bot(components["slack_bot"])  # type: ignore
+        components["llm_engine"] = llm
+    except Exception as e:
+        logger.warning(f"LLM 엔진 준비 실패: {e}")
+
+    if components:
+        try:
+            initialize_components(components)  # 기존 헬퍼로 주입
+        except Exception as e:
+            logger.warning(f"컴포넌트 주입 실패: {e}")
+
+# Celery 신호에 자동 초기화 연결
+@worker_ready.connect
+def _on_worker_ready(sender=None, **kwargs):
+    _autoinit_components_if_enabled()
+
+@beat_init.connect
+def _on_beat_init(sender=None, **kwargs):
+    _autoinit_components_if_enabled()
+
+# 각 워커 프로세스(prefork)에서 한 번씩 초기화
+@worker_process_init.connect
+def _on_worker_process_init(sender=None, **kwargs):
+    _autoinit_components_if_enabled()
+
+# 태스크 직전에도 필수 컴포넌트가 없으면 마지막 시도
+@task_prerun.connect
+def _ensure_components_before_task(task=None, **kwargs):
+    try:
+        required_keys = [
+            "quotes_ingestor",
+            "regime_detector",
+            "tech_score_engine",
+            "signal_mixer",
+        ]
+        missing = [k for k in required_keys if not trading_components.get(k)]
+        if missing:
+            logger.warning(f"필수 컴포넌트 미준비(prerun): {missing} → 자동 초기화 시도")
+            _autoinit_components_if_enabled()
+    except Exception as e:
+        logger.warning(f"prerun 자동 초기화 실패: {e}")
+
 @celery_app.task(bind=True, name="app.jobs.scheduler.pipeline_e2e")
 def pipeline_e2e(self):
     """E2E 파이프라인: EDGAR 이벤트 → LLM → 레짐 → 믹서 → DB → Slack"""
@@ -117,15 +254,14 @@ def pipeline_e2e(self):
         start_time = time.time()
         logger.info("E2E 파이프라인 시작")
         
-        # 컴포넌트 확인
+        # 컴포넌트 확인 (필수 최소 구성만 강제, LLM은 선택)
         if not all([
             trading_components["stream_consumer"],
-            trading_components["llm_engine"],
             trading_components["regime_detector"],
             trading_components["signal_mixer"],
             trading_components["slack_bot"]
         ]):
-            logger.warning("일부 컴포넌트가 초기화되지 않음")
+            logger.warning("필수 컴포넌트 미준비(stream_consumer/regime_detector/signal_mixer/slack_bot)")
             return {"status": "skipped", "reason": "components_not_ready"}
         
         stream_consumer = trading_components["stream_consumer"]
@@ -270,10 +406,17 @@ def generate_signals(self):
         start_time = time.time()
         logger.info("시그널 생성 시작")
         
-        # 컴포넌트 확인
-        if not all(trading_components.values()):
-            logger.warning("일부 컴포넌트가 초기화되지 않음")
-            return {"status": "skipped", "reason": "components_not_ready"}
+        # 필수 컴포넌트 확인 (필요 최소만)
+        required_keys = [
+            "quotes_ingestor",
+            "regime_detector",
+            "tech_score_engine",
+            "signal_mixer",
+        ]
+        missing = [k for k in required_keys if not trading_components.get(k)]
+        if missing:
+            logger.warning(f"필수 컴포넌트 미준비: {missing}")
+            return {"status": "skipped", "reason": "components_not_ready", "missing": missing}
         
         quotes_ingestor = trading_components["quotes_ingestor"]
         edgar_scanner = trading_components["edgar_scanner"]

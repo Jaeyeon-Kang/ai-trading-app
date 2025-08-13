@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  celery_worker:
+    environment:
+      EXTENDED_PRICE_SIGNALS: "true"
+      EXT_MIN_DOLLAR_VOL_5M: "100000"
+      EXT_MAX_SPREAD_BP: "200"
+      EXT_COOLDOWN_MIN: "2"
+  celery_beat:
+    environment:
+      EXTENDED_PRICE_SIGNALS: "true"
+      EXT_MIN_DOLLAR_VOL_5M: "100000"
+      EXT_MAX_SPREAD_BP: "200"
+      EXT_COOLDOWN_MIN: "2"
