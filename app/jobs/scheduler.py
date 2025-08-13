@@ -12,6 +12,7 @@ import time
 import hashlib
 import psycopg2
 import json
+import redis
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -80,6 +81,16 @@ celery_app.conf.beat_schedule = {
     "ingest-edgar": {
         "task": "app.jobs.scheduler.ingest_edgar_stream",
         "schedule": 5.0,
+    },
+    # 15분마다 유니버스 재적용 (권장 분리)
+    "refresh-universe": {
+        "task": "app.jobs.scheduler.refresh_universe",
+        "schedule": 900.0,
+    },
+    # 매일 05:55 KST 적응형 컷오프 갱신 (리포트 직전)
+    "adaptive-cutoff": {
+        "task": "app.jobs.scheduler.adaptive_cutoff",
+        "schedule": crontab(hour=20, minute=55),  # 05:55 KST = 20:55 UTC 전날
     },
 }
 
@@ -163,6 +174,12 @@ def pipeline_e2e(self):
                 )
                 
                 if signal:
+                    # 메타에 세션/품질 지표 심기 → Slack 헤더 라벨용
+                    if not signal.meta:
+                        signal.meta = {}
+                    signal.meta["session"] = session_label
+                    signal.meta["spread_bp"] = spread_bp
+                    signal.meta["dollar_vol_5m"] = dvol5m
                     # 7. DB에 저장
                     if trading_components.get("db_connection"):
                         signal_mixer.save_signal_to_db(signal, trading_components["db_connection"])
@@ -269,7 +286,41 @@ def generate_signals(self):
         signals_generated = 0
         
         # 각 종목별로 시그널 생성
-        for ticker in quotes_ingestor.tickers:
+        # 유니버스 동적 적용 (Redis union: core + external + watchlist)
+        dynamic_universe = None
+        try:
+            rurl = os.getenv("REDIS_URL")
+            if rurl:
+                r = redis.from_url(rurl)
+                external = r.smembers("universe:external") or []
+                watch = r.smembers("universe:watchlist") or []
+                core = [t.strip().upper() for t in (os.getenv("TICKERS", "").split(",")) if t.strip()]
+                ext = [x.decode() if isinstance(x, (bytes, bytearray)) else x for x in external]
+                wch = [x.decode() if isinstance(x, (bytes, bytearray)) else x for x in watch]
+                merged = []
+                seen = set()
+                max_n = int(os.getenv("UNIVERSE_MAX", "60"))
+                for arr in [core, ext, wch]:
+                    for s in arr:
+                        if s and s not in seen:
+                            merged.append(s)
+                            seen.add(s)
+                        if len(merged) >= max_n:
+                            break
+                    if len(merged) >= max_n:
+                        break
+                dynamic_universe = merged
+                # 인제스터에 반영 및 워밍업
+                try:
+                    if hasattr(quotes_ingestor, "update_universe_tickers"):
+                        quotes_ingestor.update_universe_tickers(dynamic_universe)
+                except Exception:
+                    pass
+        except Exception:
+            dynamic_universe = None
+
+        tickers_iter = dynamic_universe or list(quotes_ingestor.tickers)
+        for ticker in tickers_iter:
             try:
                 # 1. 시세 데이터 가져오기
                 candles = quotes_ingestor.get_latest_candles(ticker, 50)
@@ -304,7 +355,43 @@ def generate_signals(self):
                     text = f"Volatility spike detected for {ticker} in {regime_result.regime.value} regime"
                     llm_insight = llm_engine.analyze_text(text, f"vol_spike_{ticker}", regime='vol_spike')
                 
-                # 6. 시그널 믹싱
+                # 6. 장외 전용 pre-filter (세션/유동성/스프레드/쿨다운/일일상한)
+                ext_enabled = (os.getenv("EXTENDED_PRICE_SIGNALS", "false").lower() in ("1","true","yes","on"))
+                session_label = _session_label()
+                cutoff_rth = float(os.getenv("SIGNAL_CUTOFF", "0.68"))
+                cutoff_ext = float(os.getenv("EXT_SIGNAL_CUTOFF", "0.78"))
+                dvol5m = float(indicators.get("dollar_vol_5m", 0.0))
+                spread_bp = float(indicators.get("spread_bp", 0.0))
+                suppress_reason = None
+                if session_label == "EXT":
+                    if not ext_enabled:
+                        suppress_reason = "ext_disabled"
+                    if dvol5m < float(os.getenv("EXT_MIN_DOLLAR_VOL_5M", "500000")):
+                        suppress_reason = suppress_reason or "low_dvol"
+                    if spread_bp > float(os.getenv("EXT_MAX_SPREAD_BP", "60")):
+                        suppress_reason = suppress_reason or "wide_spread"
+                    # 쿨다운/일일 상한 체크: Redis 키 사용
+                    try:
+                        if rurl:
+                            r = redis.from_url(rurl)
+                            cool_min = int(os.getenv("EXT_COOLDOWN_MIN", "7"))
+                            daily_cap = 3
+                            now_ts = int(time.time())
+                            cd_key = f"cooldown:{ticker}"
+                            last_ts = int(r.get(cd_key) or 0)
+                            if now_ts - last_ts < cool_min * 60:
+                                suppress_reason = suppress_reason or "cooldown"
+                            day_key = f"dailycap:{datetime.utcnow():%Y%m%d}:{ticker}"
+                            used = int(r.get(day_key) or 0)
+                            if used >= daily_cap:
+                                suppress_reason = suppress_reason or "daily_cap"
+                            if not suppress_reason:
+                                # 통과 시 다음 카운팅을 위해 임시 마킹(실제 Slack 전송 시 최종 증가 권장)
+                                r.setex(cd_key, cool_min*60, now_ts)
+                    except Exception:
+                        pass
+
+                # 7. 시그널 믹싱
                 current_price = candles[-1].close if candles else 0
                 signal = signal_mixer.mix_signals(
                     ticker=ticker,
@@ -316,6 +403,21 @@ def generate_signals(self):
                 )
                 
                 if signal:
+                    # 컷오프 적용 (세션별)
+                    cut = cutoff_rth if session_label == "RTH" else cutoff_ext
+                    if abs(signal.score) < cut or suppress_reason:
+                        # 억제 메트릭 누적
+                        try:
+                            if rurl:
+                                r = redis.from_url(rurl)
+                                hkey = f"metrics:suppressed:{datetime.utcnow():%Y%m%d}"
+                                r.hincrby(hkey, suppress_reason or "below_cutoff", 1)
+                        except Exception:
+                            pass
+                        # 최근 신호 리스트에 suppressed로 기록
+                        _record_recent_signal(redis_url=rurl, signal=signal, session_label=session_label, indicators=indicators, suppressed=suppress_reason or "below_cutoff")
+                        continue
+
                     # 7. Redis 스트림에 발행
                     signal_data = {
                         "ticker": signal.ticker,
@@ -337,6 +439,8 @@ def generate_signals(self):
                     
                     redis_streams.publish_signal(signal_data)
                     signals_generated += 1
+                    # 최근 신호 기록 (+ 세션/스프레드/달러대금)
+                    _record_recent_signal(redis_url=rurl, signal=signal, session_label=session_label, indicators=indicators)
                     
                     logger.info(f"시그널 생성: {ticker} {signal.signal_type.value} (점수: {signal.score:.2f})")
                 
@@ -652,6 +756,47 @@ def get_recent_edgar_filing(ticker: str) -> Optional[Dict]:
     # 여기서는 간단히 None 반환
     return None
 
+def _session_label() -> str:
+    """RTH/EXT 간단 판별: ET 시간으로 09:30-16:00은 RTH, 그 외 04:00-20:00은 EXT, 나머지는 CLOSED"""
+    from datetime import datetime, timedelta, time as dtime, timezone
+    et_tz = timezone(timedelta(hours=-5))
+    now_est = datetime.now(et_tz)
+    # DST 간이 적용
+    dst_start = now_est.replace(month=3, day=8 + (6 - now_est.replace(month=3, day=1).weekday()) % 7, hour=2)
+    dst_end = now_est.replace(month=11, day=1 + (6 - now_est.replace(month=11, day=1).weekday()) % 7, hour=2)
+    if dst_start <= now_est < dst_end:
+        et_tz = timezone(timedelta(hours=-4))
+    now = datetime.now(et_tz).time()
+    if dtime(9,30) <= now <= dtime(16,0):
+        return "RTH"
+    if dtime(4,0) <= now <= dtime(20,0):
+        return "EXT"
+    return "CLOSED"
+
+def _record_recent_signal(redis_url: Optional[str], signal, session_label: str, indicators: Dict, suppressed: Optional[str] = None) -> None:
+    try:
+        if not redis_url:
+            return
+        r = redis.from_url(redis_url)
+        key = "signals:recent"
+        payload = {
+            "ticker": signal.ticker,
+            "signal_type": signal.signal_type.value,
+            "score": signal.score,
+            "confidence": signal.confidence,
+            "regime": signal.regime,
+            "timestamp": signal.timestamp.isoformat(),
+            "session": session_label,
+            "spread_bp": float(indicators.get("spread_bp", 0.0)),
+            "dollar_vol_5m": float(indicators.get("dollar_vol_5m", 0.0)),
+        }
+        if suppressed:
+            payload["suppressed_reason"] = suppressed
+        r.lpush(key, json.dumps(payload))
+        r.ltrim(key, 0, 500)
+    except Exception:
+        pass
+
 def initialize_components(components: Dict):
     """컴포넌트 초기화"""
     global trading_components
@@ -760,6 +905,84 @@ def get_task_status(task_id: str) -> Dict:
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
+
+@celery_app.task(name="app.jobs.scheduler.refresh_universe")
+def refresh_universe():
+    """15분마다 유니버스 병합→인제스터 반영"""
+    try:
+        quotes_ingestor = trading_components.get("quotes_ingestor")
+        rurl = os.getenv("REDIS_URL")
+        if not quotes_ingestor or not rurl:
+            return {"status": "skipped"}
+        r = redis.from_url(rurl)
+        external = r.smembers("universe:external") or []
+        watch = r.smembers("universe:watchlist") or []
+        core = [t.strip().upper() for t in (os.getenv("TICKERS", "").split(",")) if t.strip()]
+        ext = [x.decode() if isinstance(x, (bytes, bytearray)) else x for x in external]
+        wch = [x.decode() if isinstance(x, (bytes, bytearray)) else x for x in watch]
+        merged = []
+        seen = set()
+        max_n = int(os.getenv("UNIVERSE_MAX", "60"))
+        for arr in [core, ext, wch]:
+            for s in arr:
+                if s and s not in seen:
+                    merged.append(s)
+                    seen.add(s)
+                if len(merged) >= max_n:
+                    break
+            if len(merged) >= max_n:
+                break
+        if hasattr(quotes_ingestor, "update_universe_tickers"):
+            quotes_ingestor.update_universe_tickers(merged)
+        return {"status": "ok", "universe_size": len(merged)}
+    except Exception as e:
+        logger.error(f"유니버스 갱신 실패: {e}")
+        return {"status": "error", "error": str(e)}
+
+@celery_app.task(name="app.jobs.scheduler.adaptive_cutoff")
+def adaptive_cutoff():
+    """전일 체결 건수 기반 컷오프 조정: cfg:signal_cutoff:{rth|ext} ±0.02 with bounds"""
+    try:
+        if os.getenv("ADAPTIVE_CUTOFF_ENABLED", "true").lower() not in ("1","true","yes","on"):
+            return {"status": "skipped", "reason": "disabled"}
+        rurl = os.getenv("REDIS_URL")
+        if not rurl:
+            return {"status": "skipped", "reason": "no_redis"}
+        r = redis.from_url(rurl)
+        # 체결 건수: 간이 집계(orders_paper 테이블 없으면 0 처리)
+        fills = 0
+        try:
+            dsn = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+            if dsn:
+                import psycopg2
+                from datetime import date, timedelta
+                conn = psycopg2.connect(dsn)
+                cur = conn.cursor()
+                prev = (datetime.utcnow() - timedelta(days=1)).date()
+                cur.execute("SELECT COUNT(*) FROM orders_paper WHERE DATE(ts)=%s", (prev,))
+                fills = int(cur.fetchone()[0] or 0)
+                cur.close(); conn.close()
+        except Exception:
+            fills = 0
+        # 현재값 읽기
+        def _getf(k, d):
+            v = r.get(k)
+            try:
+                return float(v) if v is not None else d
+            except Exception:
+                return d
+        rth = _getf("cfg:signal_cutoff:rth", float(os.getenv("SIGNAL_CUTOFF", "0.68")))
+        ext = _getf("cfg:signal_cutoff:ext", float(os.getenv("EXT_SIGNAL_CUTOFF", "0.78")))
+        # 조정
+        delta = -0.02 if fills == 0 else (0.02 if fills >= 4 else 0.0)
+        rth_new = min(max(rth + delta, 0.64), 0.74)
+        ext_new = min(max(ext + delta, 0.74), 0.82)
+        r.set("cfg:signal_cutoff:rth", rth_new)
+        r.set("cfg:signal_cutoff:ext", ext_new)
+        return {"status": "ok", "fills": fills, "rth": rth_new, "ext": ext_new}
+    except Exception as e:
+        logger.error(f"적응형 컷오프 실패: {e}")
+        return {"status": "error", "error": str(e)}
 
 if __name__ == "__main__":
     # 개발용 실행

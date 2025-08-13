@@ -177,9 +177,27 @@ class SlackBot:
         score_sign = "+" if signal.score >= 0 else ""
         signal_type_kr = "롱" if signal.signal_type == "long" else "숏"
 
+        # 세션/스프레드/달러대금 요약 (옵셔널 메타에서)
+        sess = (signal.__dict__.get("meta", {}) or {}).get("session", "")
+        sp_bp = (signal.__dict__.get("meta", {}) or {}).get("spread_bp")
+        dvol = (signal.__dict__.get("meta", {}) or {}).get("dollar_vol_5m")
+        sess_tag = f"[{sess}] " if sess else ""
+        qos = []
+        if sp_bp is not None:
+            try:
+                qos.append(f"spr {float(sp_bp):.0f}bp")
+            except Exception:
+                pass
+        if dvol is not None:
+            try:
+                qos.append(f"dvol ${float(dvol)/1_000_000:.1f}M")
+            except Exception:
+                pass
+        qos_line = f" | {' / '.join(qos)}" if qos else ""
+
         text = (
-            f"{signal.ticker} | 레짐 {regime_display}({signal.confidence:.2f}) | "
-            f"점수 {score_sign}{signal.score:.2f} | 제안: 진입 {signal.entry_price:.2f} / "
+            f"{sess_tag}{signal.ticker} | 레짐 {regime_display}({signal.confidence:.2f}) | "
+            f"점수 {score_sign}{signal.score:.2f}{qos_line} | 제안: 진입 {signal.entry_price:.2f} / "
             f"손절 {signal.stop_loss:.2f} / 익절 {signal.take_profit:.2f} | "
             f"이유: {signal.trigger}(<={signal.horizon_minutes}m)"
         )

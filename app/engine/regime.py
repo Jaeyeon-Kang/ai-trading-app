@@ -46,9 +46,9 @@ class RegimeDetector:
                 "price_momentum_min": 0.004  # 0.4% (추가 사용)
             },
             "vol_spike": {
-                "volume_ratio_min": 2.0,  # 거래량 비율 최소값 (2배)
+                "volume_ratio_min": float(os.getenv("VOLSPIKE_RATIO", "1.6")),  # 2.0 → 1.6
                 "price_volatility_min": 0.02,  # 가격 변동성 최소값 (2%)
-                "volatility_percentile": 95  # 변동성 상위 5%
+                "volatility_percentile": int(os.getenv("VOLSPIKE_PCTL", "90"))  # p95 → p90
             },
             "mean_revert": {
                 "rsi_extreme_min": 30,    # 25 → 30 (30/70 기준)
@@ -344,7 +344,11 @@ class RegimeDetector:
         return float(min(score, 1.0))
     
     def _calculate_vol_spike_score(self, candles: List, indicators: Dict) -> float:
-        """Vol-Spike 레짐 점수 계산 (1분 실현변동성 상위 5%)"""
+        """Vol-Spike 레짐 점수 계산
+        - 분포 기준 완화: p95→환경변수 pctl(기본 90)
+        - 거래량 배수 완화: 2.0→환경변수 비율(기본 1.6)
+        - OR: 최근 바 절대수익률(15–30s) ≥ MIN_BAR_RET_ABS(기본 0.006) 이면 스파이크 취급
+        """
         n = len(candles)
         if n < 8:  # 최소 4개(2분) × 과거치 여유
             return 0.0
@@ -352,6 +356,13 @@ class RegimeDetector:
         # 최근 2분(30초봉 4개) 변동성/거래량
         recent = candles[-4:]
         recent_vol = np.mean([(c.h - c.l) / max(c.l, 1e-9) for c in recent])
+        # 최근 1바 절대 수익률(15–30s 기준에서도 과대평가를 막기 위해 last bar 기준)
+        try:
+            last = candles[-1]
+            prev = candles[-2]
+            last_abs_ret = abs((last.c - prev.c) / max(prev.c, 1e-9))
+        except Exception:
+            last_abs_ret = 0.0
         
         # 과거 30분 동안 "2분 블록" 변동성 분포
         hist_blocks = []
@@ -361,7 +372,8 @@ class RegimeDetector:
             hist_blocks.append(vol)
         if not hist_blocks:
             return 0.0
-        p95 = np.percentile(hist_blocks, 95)
+        pctl = self.thresholds["vol_spike"].get("volatility_percentile", 90)
+        hist_thr = np.percentile(hist_blocks, pctl)
         
         # 거래량 비율(최근 2분 합 / 과거 30분 평균 2분합)
         recent_volm = sum(c.v for c in recent)
@@ -374,7 +386,10 @@ class RegimeDetector:
         volume_ratio = recent_volm / max(avg_hist_volm, 1e-9)
         
         score = 0.0
-        if recent_vol > p95:
+        # OR: 최근 절대변동으로 즉시 스파이크 취급
+        if last_abs_ret >= float(os.getenv("MIN_BAR_RET_ABS", "0.006")):
+            return 1.0
+        if recent_vol > hist_thr:
             score += 0.6
         if volume_ratio > self.thresholds["vol_spike"]["volume_ratio_min"]:
             score += 0.4

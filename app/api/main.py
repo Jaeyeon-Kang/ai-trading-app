@@ -109,6 +109,11 @@ class ReportResponse(BaseModel):
     risk_metrics: Optional[Dict] = None
     llm_usage: Optional[Dict] = None
     timestamp: str
+    # 확장 필드
+    signal_cutoff_rth: Optional[float] = None
+    signal_cutoff_ext: Optional[float] = None
+    suppressed_reasons: Optional[Dict[str, int]] = None
+    universe_size: Optional[int] = None
 
 class SystemStatusResponse(BaseModel):
     status: str
@@ -118,10 +123,17 @@ class SystemStatusResponse(BaseModel):
     execution_latency_ms: int
     timestamp: str
 
+# Universe API 모델
+class UniverseTicker(BaseModel):
+    ticker: str
+    mic: Optional[str] = None
+    note: Optional[str] = None
+
 # 전역 변수 (실제로는 의존성 주입 사용)
 trading_bot = None
 slack_bot = None
 redis_streams = None
+redis_client = None
 db_connection = None
 llm_engine = None
 
@@ -186,7 +198,7 @@ def check_llm():
 @app.on_event("startup")
 async def startup_event():
     """앱 시작 시 초기화"""
-    global trading_bot, slack_bot, redis_streams
+    global trading_bot, slack_bot, redis_streams, redis_client
     
     logger.info("Trading Bot API 시작")
     
@@ -200,6 +212,15 @@ async def startup_event():
         logger.error(f"Slack 봇 초기화 실패: {e}")
         slack_bot = None
     
+    # Redis 클라이언트 (직접 접근용)
+    try:
+        redis_url = os.getenv("REDIS_URL")
+        if redis_url:
+            import redis as _redis
+            redis_client = _redis.from_url(redis_url)
+    except Exception:
+        redis_client = None
+
     # 여기서 실제 컴포넌트들을 초기화
     # trading_bot = TradingBot()
     # redis_streams = RedisStreams()
@@ -384,32 +405,36 @@ async def get_signals(limit: int = 10, ticker: Optional[str] = None):
 
 
 @app.get("/signals/recent", response_model=List[Dict])
-async def get_recent_signals(hours: int = 24):
+async def get_recent_signals(hours: int = 24, include_suppressed: int = 0):
     """최근 N시간 시그널 조회 (KST 시간 포함)"""
     try:
         now = datetime.now(timezone.utc)
         kst = timezone(timedelta(hours=9))
-        
-        dummy = [
-            {
-                "ticker": "AAPL",
-                "regime": "trend",
-                "score": 0.72,
-                "reason": "가이던스 상향",
-                "timestamp_kst": (now - timedelta(minutes=30)).astimezone(kst).isoformat()
-            },
-            {
-                "ticker": "TSLA",
-                "regime": "vol_spike",
-                "score": -0.70,
-                "reason": "배터리 화재",
-                "timestamp_kst": (now - timedelta(hours=1)).astimezone(kst).isoformat()
-            }
-        ]
-        
-        cutoff = now - timedelta(hours=hours)
-        signals = [s for s in dummy if datetime.fromisoformat(s["timestamp_kst"]).astimezone(timezone.utc) >= cutoff]
-        return signals
+        results: List[Dict] = []
+        # Redis 최근 신호 조회 (있으면)
+        try:
+            if redis_client:
+                key = "signals:recent"
+                raw = redis_client.lrange(key, 0, 500) or []
+                for b in raw:
+                    try:
+                        s = json.loads(b)
+                        # suppressed 포함 여부
+                        if not include_suppressed and s.get("suppressed_reason"):
+                            continue
+                        ts = s.get("timestamp")
+                        ts_dt = datetime.fromisoformat(ts) if ts else now
+                        if ts_dt.astimezone(timezone.utc) < now - timedelta(hours=hours):
+                            continue
+                        # 표준화 + KST 추가
+                        s["timestamp_kst"] = ts_dt.astimezone(kst).isoformat()
+                        results.append(s)
+                return results[:200]
+        except Exception:
+            pass
+
+        # Fallback 더미
+        return []
     except Exception as e:
         logger.error(f"최근 시그널 조회 실패: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -619,7 +644,11 @@ async def get_daily_report(force: bool = False, post: bool = False):
             "status": "success",
             "date": today.isoformat(),
             "data": report_data,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "signal_cutoff_rth": report_data.get("signal_cutoff_rth"),
+            "signal_cutoff_ext": report_data.get("signal_cutoff_ext"),
+            "suppressed_reasons": report_data.get("suppressed_reasons"),
+            "universe_size": report_data.get("universe_size"),
         }
         
     except Exception as e:
@@ -646,7 +675,7 @@ async def collect_daily_metrics(date: datetime.date) -> Dict:
             "error_count": sum(error_counters.values())
         }
 
-        # Redis에 저장된 LLM 사용량 메트릭 취합
+        # Redis에 저장된 LLM 사용량/억제 사유/컷오프/유니버스 취합
         try:
             import redis as _redis
             redis_url = os.getenv("REDIS_URL")
@@ -660,6 +689,23 @@ async def collect_daily_metrics(date: datetime.date) -> Dict:
                 metrics["llm_cost_krw"] = cost
                 metrics["llm_calls"] = total
                 metrics["llm_calls_by_trigger"] = by_trigger
+
+                # 억제 사유 분포
+                sup_key = f"metrics:suppressed:{datetime.utcnow():%Y%m%d}"
+                sup = r.hgetall(sup_key) or {}
+                metrics["suppressed_reasons"] = {k: int(v) for k, v in sup.items()}
+
+                # 컷오프 현재값
+                cut_rth = r.get("cfg:signal_cutoff:rth")
+                cut_ext = r.get("cfg:signal_cutoff:ext")
+                metrics["signal_cutoff_rth"] = float(cut_rth) if cut_rth else 0.68
+                metrics["signal_cutoff_ext"] = float(cut_ext) if cut_ext else 0.78
+
+                # 유니버스 크기
+                uni_ext = r.scard("universe:external") or 0
+                uni_watch = r.scard("universe:watchlist") or 0
+                static_core = len((os.getenv("TICKERS") or "").split(",")) if os.getenv("TICKERS") else 0
+                metrics["universe_size"] = min(60, static_core + uni_ext + uni_watch)
         except Exception:
             pass
         
@@ -912,6 +958,63 @@ async def get_config():
         
     except Exception as e:
         logger.error(f"설정 조회 실패: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/universe/set")
+async def set_universe(tickers: List[UniverseTicker]):
+    """외부 유니버스 주입: Redis Set universe:external에 저장"""
+    try:
+        if not redis_client:
+            raise HTTPException(status_code=503, detail="redis unavailable")
+        key = "universe:external"
+        pipe = redis_client.pipeline()
+        pipe.delete(key)
+        count = 0
+        for t in tickers:
+            val = (t.ticker or "").strip().upper()
+            if not val:
+                continue
+            pipe.sadd(key, val)
+            count += 1
+        pipe.execute()
+        return {"status": "ok", "inserted": count}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"유니버스 설정 실패: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/universe/get", response_model=List[str])
+async def get_universe():
+    """Static Core(TICKERS) + external + watchlist 병합 후 상한 60개 반환"""
+    try:
+        max_n = int(os.getenv("UNIVERSE_MAX", "60"))
+        core = [t.strip().upper() for t in (os.getenv("TICKERS", "").split(",")) if t.strip()]
+        external = []
+        watch = []
+        if redis_client:
+            try:
+                external = [x.decode() if isinstance(x, (bytes, bytearray)) else x for x in (redis_client.smembers("universe:external") or [])]
+            except Exception:
+                external = []
+            try:
+                watch = [x.decode() if isinstance(x, (bytes, bytearray)) else x for x in (redis_client.smembers("universe:watchlist") or [])]
+            except Exception:
+                watch = []
+        merged = []
+        seen = set()
+        for arr in [core, external, watch]:
+            for s in arr:
+                if s and s not in seen:
+                    merged.append(s)
+                    seen.add(s)
+                if len(merged) >= max_n:
+                    break
+            if len(merged) >= max_n:
+                break
+        return merged
+    except Exception as e:
+        logger.error(f"유니버스 조회 실패: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/config")
