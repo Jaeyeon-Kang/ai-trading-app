@@ -406,17 +406,39 @@ def generate_signals(self):
         start_time = time.time()
         logger.info("시그널 생성 시작")
         
-        # 필수 컴포넌트 확인 (필요 최소만)
-        required_keys = [
-            "quotes_ingestor",
-            "regime_detector",
-            "tech_score_engine",
-            "signal_mixer",
-        ]
-        missing = [k for k in required_keys if not trading_components.get(k)]
-        if missing:
-            logger.warning(f"필수 컴포넌트 미준비: {missing}")
-            return {"status": "skipped", "reason": "components_not_ready", "missing": missing}
+        # 필수 최소 컴포넌트 확인: 스캘프 경로만이라도 돌릴 수 있게 최소 deps만 강제
+        # 1) quotes_ingestor 필수. 없으면 현 자리에서 생성 시도
+        if not trading_components.get("quotes_ingestor"):
+            logger.warning("필수 컴포넌트 미준비: ['quotes_ingestor'] → 로컬 생성 시도")
+            try:
+                from app.io.quotes_delayed import DelayedQuotesIngestor
+                trading_components["quotes_ingestor"] = DelayedQuotesIngestor()
+                try:
+                    trading_components["quotes_ingestor"].warmup_backfill()  # type: ignore
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"quotes_ingestor 생성 실패: {e}")
+        if not trading_components.get("quotes_ingestor"):
+            return {"status": "skipped", "reason": "quotes_ingestor_not_ready"}
+        # 2) signal_mixer 없으면 현 자리에서 기본값으로 생성 (스캘프 경로용)
+        if not trading_components.get("signal_mixer"):
+            try:
+                from app.engine.mixer import SignalMixer
+                thr = float(os.getenv("SIGNAL_CUTOFF", "0.68"))
+                trading_components["signal_mixer"] = SignalMixer(buy_threshold=thr, sell_threshold=-thr)
+                logger.warning("signal_mixer 로컬 생성")
+            except Exception as e:
+                logger.warning(f"signal_mixer 생성 실패: {e}")
+        # 3) redis_streams 없으면 현 자리에서 생성 (발행용)
+        if not trading_components.get("redis_streams"):
+            try:
+                from app.io.streams import RedisStreams
+                rurl = os.getenv("REDIS_URL", "redis://redis:6379/0")
+                host, port, db = _parse_redis_url(rurl)
+                trading_components["redis_streams"] = RedisStreams(host=host, port=port, db=db)
+            except Exception as e:
+                logger.warning(f"redis_streams 생성 실패: {e}")
         
         quotes_ingestor = trading_components["quotes_ingestor"]
         edgar_scanner = trading_components["edgar_scanner"]
@@ -479,11 +501,25 @@ def generate_signals(self):
                 try:
                     scalp_enabled = (os.getenv("SCALP_TICK_SPIKE", "false").lower() in ("1", "true", "yes", "on"))
                     if scalp_enabled and len(candles) >= 2:
+                        # 30s/15s 분할 시 마지막 두 바가 같은 1분에 속함 → 분당 간격으로 비교
+                        try:
+                            bars_per_min = max(1, 60 // max(getattr(quotes_ingestor, "bar_sec", 60), 1))
+                        except Exception:
+                            bars_per_min = 1
                         last = candles[-1]
-                        prev = candles[-2]
+                        prev_idx = -1 - bars_per_min if len(candles) > bars_per_min else -2
+                        prev = candles[prev_idx]
                         last_abs_ret = abs((last.c - prev.c) / max(prev.c, 1e-9))
                         spike_thr = float(os.getenv("SCALP_MIN_RET", "0.008"))  # 기본 0.8%
+                        # 야후 1분봉 분할 시 마지막 두 바가 동일 값인 경우가 많아 고저폭 기준도 허용
+                        last_range = (last.h - last.l) / max(last.c, 1e-9)
+                        range_thr = float(os.getenv("SCALP_MIN_RANGE", "0.003"))  # 기본 0.3%
+                        trig_reason = None
                         if last_abs_ret >= spike_thr:
+                            trig_reason = f"ret>={spike_thr:.3%}"
+                        elif last_range >= range_thr:
+                            trig_reason = f"range>={range_thr:.3%}"
+                        if trig_reason:
                             from app.engine.regime import RegimeType, RegimeResult
                             from app.engine.techscore import TechScoreResult
                             direction = 1.0 if (last.c - prev.c) >= 0 else -1.0
@@ -511,11 +547,14 @@ def generate_signals(self):
                             )
                             if quick_signal:
                                 quick_signal.trigger = "tick_spike"
-                                quick_signal.summary = f"abs_ret={last_abs_ret:.3%}"
-                                # 컷/세션 억제 동일 적용
-                                cut = cutoff_rth if session_label == "RTH" else cutoff_ext
-                                if abs(quick_signal.score) < cut or False:
-                                    _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=session_label, indicators=indicators, suppressed="below_cutoff")
+                                quick_signal.summary = f"{trig_reason}; abs_ret={last_abs_ret:.3%}; range={last_range:.3%}"
+                                # 컷/세션 억제 동일 적용 (로컬 계산)
+                                sess_now = _session_label()
+                                cut_r = float(os.getenv("SIGNAL_CUTOFF", "0.68"))
+                                cut_e = float(os.getenv("EXT_SIGNAL_CUTOFF", "0.78"))
+                                cut = cut_r if sess_now == "RTH" else cut_e
+                                if abs(quick_signal.score) < cut:
+                                    _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators, suppressed="below_cutoff")
                                 else:
                                     redis_streams.publish_signal({
                                         "ticker": quick_signal.ticker,
@@ -535,10 +574,82 @@ def generate_signals(self):
                                         "timestamp": quick_signal.timestamp.isoformat()
                                     })
                                     signals_generated += 1
-                                    _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=session_label, indicators=indicators)
-                                    logger.info(f"스캘프 신호: {ticker} {quick_signal.signal_type.value} (틱스파이크 {last_abs_ret:.2%})")
+                                    _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators)
+                                    logger.info(f"스캘프 신호: {ticker} {quick_signal.signal_type.value} ({trig_reason}, abs_ret {last_abs_ret:.2%}, range {last_range:.2%})")
                                     # 스캘프 모드에선 한 틱만 잡으면 충분 — 다음 종목으로
                                     continue
+                except Exception:
+                    pass
+
+                # 2.6 스캘프 모드(대안): 3분봉 3개 연속 양봉이면 롱 신호
+                try:
+                    if os.getenv("SCALP_3MIN3UP", "false").lower() in ("1", "true", "yes", "on"):
+                        bar_sec = int(os.getenv("BAR_SEC", "30") or 30)
+                        window = max(1, int(180 / max(bar_sec, 1)))  # 3분 창의 바 개수
+                        need = window * 3
+                        if len(candles) >= need:
+                            w1 = candles[-window:]
+                            w2 = candles[-2*window:-window]
+                            w3 = candles[-3*window:-2*window]
+                            def _is_green(ws):
+                                try:
+                                    return (ws[-1].c if ws else 0.0) > (ws[0].o if ws else 0.0)
+                                except Exception:
+                                    return False
+                            if _is_green(w1) and _is_green(w2) and _is_green(w3):
+                                from app.engine.regime import RegimeType, RegimeResult
+                                from app.engine.techscore import TechScoreResult
+                                fake_regime = RegimeResult(
+                                    regime=RegimeType.TREND,
+                                    confidence=0.8,
+                                    features={"3min3up": True},
+                                    timestamp=datetime.now()
+                                )
+                                fake_tech = TechScoreResult(
+                                    score=1.0,
+                                    components={"ema": 0.9, "macd": 0.9, "rsi": 0.8, "vwap": 0.8},
+                                    timestamp=datetime.now()
+                                )
+                                last_px = candles[-1].c
+                                quick_signal = signal_mixer.mix_signals(
+                                    ticker=ticker,
+                                    regime_result=fake_regime,
+                                    tech_score=fake_tech,
+                                    llm_insight=None,
+                                    edgar_filing=None,
+                                    current_price=last_px
+                                )
+                                if quick_signal:
+                                    quick_signal.trigger = "3min_3up"
+                                    quick_signal.summary = "3min green x3"
+                                    sess_now = _session_label()
+                                    cut_r = float(os.getenv("SIGNAL_CUTOFF", "0.68"))
+                                    cut_e = float(os.getenv("EXT_SIGNAL_CUTOFF", "0.78"))
+                                    cut = cut_r if sess_now == "RTH" else cut_e
+                                    if abs(quick_signal.score) < cut:
+                                        _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators, suppressed="below_cutoff")
+                                    else:
+                                        redis_streams.publish_signal({
+                                            "ticker": quick_signal.ticker,
+                                            "signal_type": quick_signal.signal_type.value,
+                                            "score": quick_signal.score,
+                                            "confidence": quick_signal.confidence,
+                                            "regime": quick_signal.regime,
+                                            "tech_score": quick_signal.tech_score,
+                                            "sentiment_score": quick_signal.sentiment_score,
+                                            "edgar_bonus": quick_signal.edgar_bonus,
+                                            "trigger": quick_signal.trigger,
+                                            "summary": quick_signal.summary,
+                                            "entry_price": quick_signal.entry_price,
+                                            "stop_loss": quick_signal.stop_loss,
+                                            "take_profit": quick_signal.take_profit,
+                                            "horizon_minutes": quick_signal.horizon_minutes,
+                                            "timestamp": quick_signal.timestamp.isoformat()
+                                        })
+                                        signals_generated += 1
+                                        _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators)
+                                        logger.info(f"스캘프 신호: {ticker} long (3min_3up)")
+                                        continue
                 except Exception:
                     pass
 
@@ -712,6 +823,18 @@ def update_quotes(self):
         
         # Redis 스트림에 발행
         market_data = quotes_ingestor.get_market_data_summary()
+        # 옵션: 야후 인제스터 요약 로그 (실시간 틱 추적용)
+        try:
+            if os.getenv("QUOTE_LOG_VERBOSE", "false").lower() in ("1", "true", "yes", "on"):
+                for _t, _d in (market_data or {}).items():
+                    _ind = _d.get("indicators", {}) if isinstance(_d, dict) else {}
+                    _px = float(_d.get("current_price", 0.0) or 0.0)
+                    _dv = float(_ind.get("dollar_vol_5m", 0.0) or 0.0)
+                    _sp = float(_ind.get("spread_bp", 0.0) or 0.0)
+                    _ts = _d.get("last_update")
+                    logger.info(f"[YQ] { _t } px={_px:.4f} dollar_vol_5m={_dv:.0f} spread_bp={_sp:.1f} ts={_ts}")
+        except Exception:
+            pass
         for ticker, data in market_data.items():
             if data.get("current_price"):
                 quote_data = {

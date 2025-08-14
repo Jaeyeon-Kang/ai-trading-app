@@ -1,0 +1,39 @@
+version: '3.8'
+services:
+  celery_worker:
+    environment:
+      TZ: America/New_York
+      LOG_LEVEL: DEBUG
+      RTH_ONLY: "false"
+      EXTENDED_PRICE_SIGNALS: "true"
+      SIGNAL_CUTOFF_RTH: "0.0"
+      SIGNAL_CUTOFF_EXT: "0.0"
+      MIN_DOLLAR_VOL_5M: "0"
+      MAX_SPREAD_BP: "100000"
+      COOLDOWN_MIN: "0"
+      EXT_MIN_DOLLAR_VOL_5M: "0"
+      EXT_MAX_SPREAD_BP: "100000"
+      EXT_COOLDOWN_MIN: "0"
+      ALLOW_SMALL_CAPS: "true"
+      MIN_MARKET_CAP_USD: "0"
+      MIN_PRICE: "0"
+  celery_beat:
+    environment:
+      TZ: America/New_York
+      LOG_LEVEL: DEBUG
+      RTH_ONLY: "false"
+      SIGNAL_CUTOFF_RTH: "0.0"
+      SIGNAL_CUTOFF_EXT: "0.0"
+      MIN_DOLLAR_VOL_5M: "0"
+      MAX_SPREAD_BP: "100000"
+      COOLDOWN_MIN: "0"
+      EXT_MIN_DOLLAR_VOL_5M: "0"
+      EXT_MAX_SPREAD_BP: "100000"
+      EXT_COOLDOWN_MIN: "0"
+      ALLOW_SMALL_CAPS: "true"
+      MIN_MARKET_CAP_USD: "0"
+      MIN_PRICE: "0"
+  trading_bot_api:
+    environment:
+      TZ: America/New_York
+      LOG_LEVEL: DEBUG

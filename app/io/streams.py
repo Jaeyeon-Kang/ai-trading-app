@@ -54,15 +54,48 @@ class RedisStreams:
         """
         coerced: Dict[str, Any] = {}
         for key, value in data.items():
-            if isinstance(value, (dict, list)):
+            try:
+                # 기본 허용 타입
+                if isinstance(value, (str, int, float)):
+                    coerced[key] = value
+                    continue
+                # bool은 int로 변환
+                if isinstance(value, bool):
+                    coerced[key] = int(value)
+                    continue
+                # dict/list → JSON 문자열
+                if isinstance(value, (dict, list)):
+                    try:
+                        coerced[key] = json.dumps(value, ensure_ascii=False)
+                    except Exception:
+                        coerced[key] = str(value)
+                    continue
+                # datetime → isoformat
+                from datetime import datetime as _dt
+                if isinstance(value, _dt):
+                    coerced[key] = value.isoformat()
+                    continue
+                # numpy 스칼라 처리 (np.int64, np.float64 등)
+                # hasattr(value, 'item')이면 스칼라로 변환 시도
+                if hasattr(value, "item"):
+                    try:
+                        item_val = value.item()
+                        if isinstance(item_val, (str, int, float)):
+                            coerced[key] = item_val
+                        elif isinstance(item_val, bool):
+                            coerced[key] = int(item_val)
+                        else:
+                            coerced[key] = str(item_val)
+                        continue
+                    except Exception:
+                        pass
+                # 최후 수단: 문자열화
+                coerced[key] = str(value)
+            except Exception:
                 try:
-                    coerced[key] = json.dumps(value, ensure_ascii=False)
-                except Exception:
                     coerced[key] = str(value)
-            elif value is None:
-                coerced[key] = ""
-            else:
-                coerced[key] = value
+                except Exception:
+                    coerced[key] = ""
         return coerced
     
     def publish_quote(self, ticker: str, mic: str, data: Dict):

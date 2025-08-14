@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  celery_worker:
+    environment:
+      VOLSPIKE_PCTL: 10     # 분포 임계 낮춤
+      VOLSPIKE_RATIO: 1.0   # 거래량 배수 완화
+      MIN_BAR_RET_ABS: 0.000# 절대변동 임계 사실상 해제
+      BAR_SEC: 15           # 더 잦은 바
+  celery_beat:
+    environment:
+      VOLSPIKE_PCTL: 10
+      VOLSPIKE_RATIO: 1.0
+      MIN_BAR_RET_ABS: 0.000
+      BAR_SEC: 15

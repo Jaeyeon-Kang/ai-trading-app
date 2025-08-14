@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  trading_bot_api:
+    environment:
+      TZ: America/New_York
+  celery_worker:
+    environment:
+      TZ: America/New_York
+      RTH_ONLY: "false"
+      EXTENDED_PRICE_SIGNALS: "true"
+  celery_beat:
+    environment:
+      TZ: America/New_York
+      RTH_ONLY: "false"
+      EXTENDED_PRICE_SIGNALS: "true"

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -35,14 +36,46 @@ class DelayedQuotesIngestor:
         if self.bar_sec not in (15, 30, 60):
             self.bar_sec = 30
         self.market_data: Dict[str, Dict] = {}
+        self.verbose: bool = (os.getenv("QUOTE_LOG_VERBOSE", "false").lower() in ("1", "true", "yes", "on"))
+        self._logger = logging.getLogger(__name__)
 
     def _fetch_yahoo_1m(self, ticker: str) -> Dict:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1d&interval=1m"
         headers = {"User-Agent": os.getenv("SEC_USER_AGENT", "curl/7")}
         with httpx.Client(headers=headers, timeout=10.0) as client:
             r = client.get(url)
+            if self.verbose:
+                try:
+                    self._logger.info(f"[YAPI] GET {url} -> {r.status_code} bytes={len(r.content)}")
+                except Exception:
+                    pass
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            if self.verbose:
+                try:
+                    chart = data.get("chart", {}) if isinstance(data, dict) else {}
+                    err = chart.get("error")
+                    res = chart.get("result")
+                    if err:
+                        self._logger.warning(f"[YAPI] error={err}")
+                    if res and isinstance(res, list) and res:
+                        rr = res[0]
+                        ts_arr = rr.get("timestamp", []) or []
+                        ind = rr.get("indicators", {}).get("quote", [{}])[0]
+                        lens = {
+                            "ts": len(ts_arr),
+                            "open": len(ind.get("open", []) or []),
+                            "high": len(ind.get("high", []) or []),
+                            "low": len(ind.get("low", []) or []),
+                            "close": len(ind.get("close", []) or []),
+                            "volume": len(ind.get("volume", []) or []),
+                        }
+                        self._logger.info(f"[YAPI] lens={lens}")
+                    else:
+                        self._logger.warning("[YAPI] empty result array")
+                except Exception:
+                    pass
+            return data
 
     def _parse_1m_to_candles(self, ticker: str, data: Dict) -> List[Candle]:
         try:
@@ -55,8 +88,16 @@ class DelayedQuotesIngestor:
             closes = ind.get("close", [])
             vols = ind.get("volume", [])
         except Exception:
+            # Temporary fix for indentation issue
             return []
         candles: List[Candle] = []
+        if getattr(self, "verbose", False):
+            try:
+                self._logger.info(
+                    f"[YAPI.PARSE] {ticker} arrays ts={len(ts_arr)} o={len(opens)} h={len(highs)} l={len(lows)} c={len(closes)} v={len(vols)} bar_sec={self.bar_sec}"
+                )
+            except Exception:
+                pass
         for i, ts in enumerate(ts_arr or []):
             try:
                 cndl = Candle(
@@ -76,6 +117,11 @@ class DelayedQuotesIngestor:
         if self.bar_sec in (30, 15) and candles:
             split: List[Candle] = []
             factor = 2 if self.bar_sec == 30 else 4
+            if getattr(self, "verbose", False):
+                try:
+                    self._logger.info(f"[YAPI.PARSE] {ticker} split 1m into factor={factor}")
+                except Exception:
+                    pass
             for c in candles:
                 vol_per = max(c.v // factor, 0)
                 for _ in range(factor):
@@ -85,7 +131,13 @@ class DelayedQuotesIngestor:
                         o=c.o, h=c.h, l=c.l, c=c.c, v=vol_per, spread_est=c.spread_est
                     ))
             candles = split
-        return candles[-200:]
+        trimmed = candles[-200:]
+        if getattr(self, "verbose", False) and trimmed:
+            try:
+                self._logger.info(f"[YAPI.PARSE] {ticker} parsed {len(trimmed)} candles; last c={trimmed[-1].c:.4f} ts={trimmed[-1].ts.isoformat()}")
+            except Exception:
+                pass
+        return trimmed
 
     def update_all_tickers(self) -> None:
         for t in self.tickers:
@@ -99,6 +151,11 @@ class DelayedQuotesIngestor:
                     "indicators": self._compute_indicators_from_candles(candles),
                     "last_update": datetime.now(timezone.utc),
                 }
+                if getattr(self, "verbose", False):
+                    try:
+                        self._logger.info(f"[YAPI.DONE] {t} last={last_price:.4f} candles={len(candles)}")
+                    except Exception:
+                        pass
             except Exception:
                 continue
 
