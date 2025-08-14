@@ -553,7 +553,7 @@ def generate_signals(self):
                     pass
 
                 # 7. 시그널 믹싱
-                current_price = candles[-1].close if candles else 0
+                current_price = candles[-1].c if candles else 0
                 signal = signal_mixer.mix_signals(
                     ticker=ticker,
                     regime_result=regime_result,
