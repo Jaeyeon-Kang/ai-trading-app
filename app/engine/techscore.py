@@ -13,8 +13,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TechScoreResult:
     """TechScore 계산 결과"""
-    score: float  # 0~1 정규화된 점수
-    components: Dict[str, float]  # 각 지표별 점수
+    score: float  # -1~+1 정규화된 점수 (중립=0)
+    components: Dict[str, float]  # 각 지표별 점수 (-1~+1)
     timestamp: datetime
 
 class TechScoreEngine:
@@ -147,63 +147,79 @@ class TechScoreEngine:
         normalized = (value - min_val) / (max_val - min_val)
         return max(0.0, min(1.0, normalized))
     
+    def normalize_value_symmetric(self, value: float, min_val: float, max_val: float) -> float:
+        """값을 -1~+1 범위로 정규화 (중립=0)"""
+        if max_val == min_val:
+            return 0.0
+        
+        # 중간값(0)을 기준으로 대칭 정규화
+        mid_val = (min_val + max_val) / 2
+        if value >= mid_val:
+            # 0~+1 범위
+            normalized = (value - mid_val) / (max_val - mid_val) if max_val != mid_val else 0.0
+            return max(0.0, min(1.0, normalized))
+        else:
+            # -1~0 범위  
+            normalized = (value - mid_val) / (mid_val - min_val) if mid_val != min_val else 0.0
+            return max(-1.0, min(0.0, normalized))
+    
     def calculate_ema_score(self, prices: List[float]) -> float:
-        """EMA 점수 계산"""
+        """EMA 점수 계산 (-1~+1, 중립=0)"""
         if len(prices) < 20:
-            return 0.5
+            return 0.0
         
         ema_20 = self.calculate_ema(prices, 20)
         ema_50 = self.calculate_ema(prices, 50)
         
         if not ema_20 or not ema_50:
-            return 0.5
+            return 0.0
         
         # EMA 20과 50의 비율
         ema_ratio = (ema_20[-1] - ema_50[-1]) / ema_50[-1] if ema_50[-1] > 0 else 0
         
-        # 정규화
+        # -1~+1 범위로 정규화 (중립=0)
         min_val, max_val = self.normalization_ranges["ema"]
-        score = self.normalize_value(ema_ratio, min_val, max_val)
+        score = self.normalize_value_symmetric(ema_ratio, min_val, max_val)
         
         return score
     
     def calculate_macd_score(self, prices: List[float]) -> float:
-        """MACD 점수 계산"""
+        """MACD 점수 계산 (-1~+1, 중립=0)"""
         if len(prices) < 26:
-            return 0.5
+            return 0.0
         
         macd_data = self.calculate_macd(prices)
         
         # MACD 히스토그램 사용 (신호선 대비 MACD 위치)
         histogram = macd_data["histogram"]
         
-        # 정규화
+        # -1~+1 범위로 정규화 (중립=0)
         min_val, max_val = self.normalization_ranges["macd"]
-        score = self.normalize_value(histogram, min_val, max_val)
+        score = self.normalize_value_symmetric(histogram, min_val, max_val)
         
         return score
     
     def calculate_rsi_score(self, prices: List[float]) -> float:
-        """RSI 점수 계산"""
+        """RSI 점수 계산 (-1~+1, 중립=0)"""
         if len(prices) < 15:
-            return 0.5
+            return 0.0
         
         rsi = self.calculate_rsi(prices, 14)
         
-        # RSI를 0~1로 변환 (50이 중간, 80 이상이 좋음, 20 이하가 나쁨)
+        # RSI를 -1~+1로 변환 (50이 중립=0)
         if rsi >= 50:
-            # 50~100 범위를 0.5~1.0으로 매핑
-            score = 0.5 + (rsi - 50) / 50 * 0.5
+            # 50~100 범위를 0~+1로 매핑
+            score = (rsi - 50) / 50
         else:
-            # 0~50 범위를 0.0~0.5로 매핑
-            score = rsi / 50 * 0.5
+            # 0~50 범위를 -1~0으로 매핑
+            score = (rsi - 50) / 50
         
-        return max(0.0, min(1.0, score))
+        return max(-1.0, min(1.0, score))
     
     def calculate_vwap_score(self, candles: List) -> float:
-        """VWAP 점수 계산"""
+        """VWAP 점수 계산 (-1~+1, 중립=0)"""
         if not candles:
-            return 0.5
+            return 0.0
         
         vwap = self.calculate_vwap(candles)
         current_price = candles[-1].c
@@ -211,26 +227,26 @@ class TechScoreEngine:
         # VWAP 대비 편차
         vwap_deviation = (current_price - vwap) / vwap if vwap > 0 else 0
         
-        # 정규화 (VWAP 위에 있으면 좋음)
+        # -1~+1 범위로 정규화 (중립=0)
         min_val, max_val = self.normalization_ranges["vwap"]
-        score = self.normalize_value(vwap_deviation, min_val, max_val)
+        score = self.normalize_value_symmetric(vwap_deviation, min_val, max_val)
         
         return score
     
     def calculate_tech_score(self, candles: List) -> TechScoreResult:
         """
-        TechScore 계산
+        TechScore 계산 (-1~+1 범위, 중립=0)
         
         Args:
             candles: OHLCV 캔들 리스트 (Bar30s 객체들)
             
         Returns:
-            TechScoreResult: 계산된 TechScore
+            TechScoreResult: 계산된 TechScore (-1~+1 범위)
         """
         if len(candles) < 20:
             return TechScoreResult(
-                score=0.5,
-                components={"ema": 0.5, "macd": 0.5, "rsi": 0.5, "vwap": 0.5},
+                score=0.0,
+                components={"ema": 0.0, "macd": 0.0, "rsi": 0.0, "vwap": 0.0},
                 timestamp=datetime.now()
             )
         

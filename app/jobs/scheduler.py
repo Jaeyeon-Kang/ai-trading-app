@@ -731,14 +731,27 @@ def generate_signals(self):
                     text = f"Volatility spike detected for {ticker} in {regime_result.regime.value} regime"
                     llm_insight = llm_engine.analyze_text(text, f"vol_spike_{ticker}", regime='vol_spike')
                 
-                # 6. 장외 전용 pre-filter (세션/유동성/스프레드/쿨다운/일일상한)
+                # 6. 세션별 pre-filter (RTH: 일일상한, EXT: 유동성/스프레드/쿨다운/일일상한)
                 ext_enabled = (os.getenv("EXTENDED_PRICE_SIGNALS", "false").lower() in ("1","true","yes","on"))
                 session_label = _session_label()
                 cutoff_rth, cutoff_ext = get_signal_cutoffs()
                 dvol5m = float(indicators.get("dollar_vol_5m", 0.0))
                 spread_bp = float(indicators.get("spread_bp", 0.0))
                 suppress_reason = None
-                if session_label == "EXT":
+                
+                # RTH 일일 상한 (5건 목표)
+                if session_label == "RTH":
+                    try:
+                        if rurl:
+                            r = redis.from_url(rurl)
+                            rth_daily_cap = int(os.getenv("RTH_DAILY_CAP", "5"))
+                            day_key = f"dailycap:{datetime.utcnow():%Y%m%d}:RTH:{ticker}"
+                            used = int(r.get(day_key) or 0)
+                            if used >= rth_daily_cap:
+                                suppress_reason = "rth_daily_cap"
+                    except Exception:
+                        pass
+                elif session_label == "EXT":
                     if not ext_enabled:
                         suppress_reason = "ext_disabled"
                     if dvol5m < float(os.getenv("EXT_MIN_DOLLAR_VOL_5M", "50000")):
@@ -843,8 +856,8 @@ def generate_signals(self):
                         
                         # Slack 전송: 강신호만 (원래 기획 - 소수·굵직한 알림)
                         if slack_bot:
-                            # 강신호 기준: abs(score) >= cut + 0.10
-                            strong_signal_threshold = cut + 0.10
+                            # 강신호 기준: abs(score) >= cut + 0.20 (더 까다롭게)
+                            strong_signal_threshold = cut + 0.20
                             is_strong_signal = abs(signal.score) >= strong_signal_threshold
                             
                             if is_strong_signal:
@@ -854,6 +867,20 @@ def generate_signals(self):
                                     result = slack_bot.send_message(slack_message)
                                     if result:
                                         logger.info(f"✅ Slack 전송 성공: {ticker}")
+                                        # 일일 상한 카운터 증가
+                                        try:
+                                            if rurl:
+                                                r = redis.from_url(rurl)
+                                                if session_label == "RTH":
+                                                    day_key = f"dailycap:{datetime.utcnow():%Y%m%d}:RTH:{ticker}"
+                                                    r.incr(day_key)
+                                                    r.expire(day_key, 86400)  # 24시간 만료
+                                                elif session_label == "EXT":
+                                                    day_key = f"dailycap:{datetime.utcnow():%Y%m%d}:EXT:{ticker}"
+                                                    r.incr(day_key)
+                                                    r.expire(day_key, 86400)  # 24시간 만료
+                                        except Exception as e:
+                                            logger.warning(f"일일 상한 카운터 업데이트 실패: {e}")
                                     else:
                                         logger.error(f"❌ Slack 전송 실패: {ticker}")
                                 except Exception as e:

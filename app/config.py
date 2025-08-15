@@ -27,8 +27,8 @@ class Settings:
         self.EXT_MIN_DOLLAR_VOL_5M = float(os.getenv("EXT_MIN_DOLLAR_VOL_5M", "100000"))
         self.EXT_MAX_SPREAD_BP = float(os.getenv("EXT_MAX_SPREAD_BP", "200"))
 
-        # LLM/EDGAR 없을 때 가중치 재정규화 활성화
-        self.RENORM_NO_SENTIMENT = os.getenv("RENORM_NO_SENTIMENT", "true").lower() in ("true", "1", "yes", "on")
+        # LLM/EDGAR 없을 때 가중치 재정규화 비활성화 (레짐 가중치 유지)
+        self.RENORM_NO_SENTIMENT = os.getenv("RENORM_NO_SENTIMENT", "false").lower() in ("true", "1", "yes", "on")
 
         # 레짐별 가중치
         self.REGIME_WEIGHTS = {
