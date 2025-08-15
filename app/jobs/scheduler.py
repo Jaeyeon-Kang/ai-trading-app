@@ -18,6 +18,8 @@ from celery import Celery
 from celery.schedules import crontab
 from celery.signals import beat_init, task_prerun, worker_process_init, worker_ready
 
+from app.config import settings, get_signal_cutoffs, sanitize_cutoffs_in_redis
+
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -165,7 +167,7 @@ def _autoinit_components_if_enabled() -> None:
     except Exception as e:
         logger.warning(f"TechScoreEngine 준비 실패: {e}")
     try:
-        thr = float(os.getenv("SIGNAL_CUTOFF", "0.25"))
+        thr = settings.MIXER_THRESHOLD
         components["signal_mixer"] = SignalMixer(buy_threshold=thr, sell_threshold=-thr)
     except Exception as e:
         logger.warning(f"SignalMixer 준비 실패: {e}")
@@ -195,6 +197,8 @@ def _autoinit_components_if_enabled() -> None:
     try:
         token = os.getenv("SLACK_BOT_TOKEN")
         channel = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "#trading-signals")
+        logger.info(f"🔍 [DEBUG] SlackBot 환경변수: token={'***' if token else None}, channel_id={os.getenv('SLACK_CHANNEL_ID')}, channel_fallback={os.getenv('SLACK_CHANNEL')}")
+        logger.info(f"🔍 [DEBUG] SlackBot 최종 채널: {channel}")
         if token:
             components["slack_bot"] = SlackBot(token=token, channel=channel)
             logger.info(f"Slack 봇 준비: 채널 {channel}")
@@ -222,15 +226,36 @@ def _autoinit_components_if_enabled() -> None:
 @worker_ready.connect
 def _on_worker_ready(sender=None, **kwargs):
     _autoinit_components_if_enabled()
+    # 컷오프 정화 및 로깅
+    result = sanitize_cutoffs_in_redis()
+    if result:
+        logger.info(f"컷오프 로드됨: RTH={result['rth']:.3f}, EXT={result['ext']:.3f}")
+    else:
+        rth, ext = get_signal_cutoffs()
+        logger.info(f"컷오프 로드됨: RTH={rth:.3f}, EXT={ext:.3f}")
 
 @beat_init.connect
 def _on_beat_init(sender=None, **kwargs):
     _autoinit_components_if_enabled()
+    # 컷오프 정화 및 로깅
+    result = sanitize_cutoffs_in_redis()
+    if result:
+        logger.info(f"컷오프 로드됨: RTH={result['rth']:.3f}, EXT={result['ext']:.3f}")
+    else:
+        rth, ext = get_signal_cutoffs()
+        logger.info(f"컷오프 로드됨: RTH={rth:.3f}, EXT={ext:.3f}")
 
 # 각 워커 프로세스(prefork)에서 한 번씩 초기화
 @worker_process_init.connect
 def _on_worker_process_init(sender=None, **kwargs):
     _autoinit_components_if_enabled()
+    # 컷오프 정화 및 로깅
+    result = sanitize_cutoffs_in_redis()
+    if result:
+        logger.info(f"컷오프 로드됨: RTH={result['rth']:.3f}, EXT={result['ext']:.3f}")
+    else:
+        rth, ext = get_signal_cutoffs()
+        logger.info(f"컷오프 로드됨: RTH={rth:.3f}, EXT={ext:.3f}")
 
 # 태스크 직전에도 필수 컴포넌트가 없으면 마지막 시도
 @task_prerun.connect
@@ -317,8 +342,9 @@ def pipeline_e2e(self):
                         signal.meta = {}
                     session_label = _session_label()
                     signal.meta["session"] = session_label
-                    signal.meta["spread_bp"] = spread_bp
-                    signal.meta["dollar_vol_5m"] = dvol5m
+                    # 안전 가드: 미정의 변수 처리
+                    signal.meta.setdefault("spread_bp", 0.0)
+                    signal.meta.setdefault("dollar_vol_5m", 0.0)
                     # 7. DB에 저장
                     if trading_components.get("db_connection"):
                         signal_mixer.save_signal_to_db(signal, trading_components["db_connection"])
@@ -398,8 +424,11 @@ def get_mock_tech_score(ticker: str):
 def format_slack_message(signal) -> Dict:
     """Slack 메시지 포맷"""
     return {
-        "text": f"{signal.ticker} | 레짐 {signal.regime.upper()}({signal.confidence:.2f}) | 점수 {signal.score:+.2f} {'롱' if signal.signal_type.value == 'long' else '숏'}",
-        "channel": "#trading-signals"
+        "channel": "C099CQP8CJ3",  # 🔧 명시적으로 채널 ID 지정 (channel_not_found 오류 해결)
+        "text": (
+            f"{signal.ticker} | 레짐 {signal.regime.upper()}({signal.confidence:.2f}) | "
+            f"점수 {signal.score:+.2f} {'롱' if signal.signal_type.value == 'long' else '숏'}"
+        )
     }
 
 @celery_app.task(bind=True, name="app.jobs.scheduler.generate_signals")
@@ -428,7 +457,7 @@ def generate_signals(self):
         if not trading_components.get("signal_mixer"):
             try:
                 from app.engine.mixer import SignalMixer
-                thr = float(os.getenv("SIGNAL_CUTOFF", "0.25"))
+                thr = settings.MIXER_THRESHOLD
                 trading_components["signal_mixer"] = SignalMixer(buy_threshold=thr, sell_threshold=-thr)
                 logger.warning("signal_mixer 로컬 생성")
             except Exception as e:
@@ -450,6 +479,15 @@ def generate_signals(self):
         llm_engine = trading_components["llm_engine"]
         signal_mixer = trading_components["signal_mixer"]
         redis_streams = trading_components["redis_streams"]
+        slack_bot = trading_components.get("slack_bot")
+        
+        # 🔍 DEBUG: Slack bot 상태 확인
+        logger.info(f"🔍 [DEBUG] slack_bot 존재 여부: {slack_bot is not None}")
+        if slack_bot:
+            logger.info(f"🔍 [DEBUG] slack_bot 타입: {type(slack_bot)}")
+            logger.info(f"🔍 [DEBUG] slack_bot 채널: {getattr(slack_bot, 'default_channel', 'N/A')}")
+        else:
+            logger.warning(f"🔍 [DEBUG] slack_bot이 None임! trading_components 키: {list(trading_components.keys())}")
         
         signals_generated = 0
         
@@ -467,7 +505,7 @@ def generate_signals(self):
                 wch = [x.decode() if isinstance(x, (bytes, bytearray)) else x for x in watch]
                 merged = []
                 seen = set()
-                max_n = int(os.getenv("UNIVERSE_MAX", "60"))
+                max_n = int(os.getenv("UNIVERSE_MAX", "100"))
                 for arr in [core, ext, wch]:
                     for s in arr:
                         if s and s not in seen:
@@ -513,7 +551,7 @@ def generate_signals(self):
                         prev_idx = -1 - bars_per_min if len(candles) > bars_per_min else -2
                         prev = candles[prev_idx]
                         last_abs_ret = abs((last.c - prev.c) / max(prev.c, 1e-9))
-                        spike_thr = float(os.getenv("SCALP_MIN_RET", "0.008"))  # 기본 0.8%
+                        spike_thr = float(os.getenv("SCALP_MIN_RET", "0.003"))  # 기본 0.3%
                         # 야후 1분봉 분할 시 마지막 두 바가 동일 값인 경우가 많아 고저폭 기준도 허용
                         last_range = (last.h - last.l) / max(last.c, 1e-9)
                         range_thr = float(os.getenv("SCALP_MIN_RANGE", "0.003"))  # 기본 0.3%
@@ -553,32 +591,39 @@ def generate_signals(self):
                                 quick_signal.summary = f"{trig_reason}; abs_ret={last_abs_ret:.3%}; range={last_range:.3%}"
                                 # 컷/세션 억제 동일 적용 (로컬 계산)
                                 sess_now = _session_label()
-                                cut_r = float(os.getenv("SIGNAL_CUTOFF", "0.25"))
-                                cut_e = float(os.getenv("EXT_SIGNAL_CUTOFF", "0.35"))
+                                cutoff_rth, cutoff_ext = get_signal_cutoffs()
+                                cut_r = cutoff_rth
+                                cut_e = cutoff_ext
                                 cut = cut_r if sess_now == "RTH" else cut_e
                                 if abs(quick_signal.score) < cut:
+                                    logger.info(f"🔥 [SCALP DEBUG] 스캘프 신호 억제: {ticker} score={quick_signal.score:.3f} < cut={cut:.3f}")
                                     _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators, suppressed="below_cutoff")
                                 else:
-                                    redis_streams.publish_signal({
-                                        "ticker": quick_signal.ticker,
-                                        "signal_type": quick_signal.signal_type.value,
-                                        "score": quick_signal.score,
-                                        "confidence": quick_signal.confidence,
-                                        "regime": quick_signal.regime,
-                                        "tech_score": quick_signal.tech_score,
-                                        "sentiment_score": quick_signal.sentiment_score,
-                                        "edgar_bonus": quick_signal.edgar_bonus,
-                                        "trigger": quick_signal.trigger,
-                                        "summary": quick_signal.summary,
-                                        "entry_price": quick_signal.entry_price,
-                                        "stop_loss": quick_signal.stop_loss,
-                                        "take_profit": quick_signal.take_profit,
-                                        "horizon_minutes": quick_signal.horizon_minutes,
-                                        "timestamp": quick_signal.timestamp.isoformat()
-                                    })
-                                    signals_generated += 1
-                                    _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators)
-                                    logger.info(f"스캘프 신호: {ticker} {quick_signal.signal_type.value} ({trig_reason}, abs_ret {last_abs_ret:.2%}, range {last_range:.2%})")
+                                    logger.info(f"🔥 [SCALP DEBUG] 스캘프 신호 발행: {ticker} {quick_signal.signal_type.value} score={quick_signal.score:.3f}")
+                                    try:
+                                        redis_streams.publish_signal({
+                                            "ticker": quick_signal.ticker,
+                                            "signal_type": quick_signal.signal_type.value,
+                                            "score": quick_signal.score,
+                                            "confidence": quick_signal.confidence,
+                                            "regime": quick_signal.regime,
+                                            "tech_score": quick_signal.tech_score,
+                                            "sentiment_score": quick_signal.sentiment_score,
+                                            "edgar_bonus": quick_signal.edgar_bonus,
+                                            "trigger": quick_signal.trigger,
+                                            "summary": quick_signal.summary,
+                                            "entry_price": quick_signal.entry_price,
+                                            "stop_loss": quick_signal.stop_loss,
+                                            "take_profit": quick_signal.take_profit,
+                                            "horizon_minutes": quick_signal.horizon_minutes,
+                                            "timestamp": quick_signal.timestamp.isoformat()
+                                        })
+                                        logger.info(f"🔥 [SCALP DEBUG] Redis 스트림 발행 성공: {ticker}")
+                                        signals_generated += 1
+                                        _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators)
+                                        logger.info(f"스캘프 신호: {ticker} {quick_signal.signal_type.value} ({trig_reason}, abs_ret {last_abs_ret:.2%}, range {last_range:.2%})")
+                                    except Exception as e:
+                                        logger.error(f"🔥 [SCALP DEBUG] 스캘프 Redis 발행 실패: {ticker} - {e}")
                                     # 스캘프 모드에선 한 틱만 잡으면 충분 — 다음 종목으로
                                     continue
                 except Exception:
@@ -626,32 +671,39 @@ def generate_signals(self):
                                     quick_signal.trigger = "3min_3up"
                                     quick_signal.summary = "3min green x3"
                                     sess_now = _session_label()
-                                    cut_r = float(os.getenv("SIGNAL_CUTOFF", "0.25"))
-                                    cut_e = float(os.getenv("EXT_SIGNAL_CUTOFF", "0.35"))
+                                    cutoff_rth, cutoff_ext = get_signal_cutoffs()
+                                    cut_r = cutoff_rth
+                                    cut_e = cutoff_ext
                                     cut = cut_r if sess_now == "RTH" else cut_e
                                     if abs(quick_signal.score) < cut:
+                                        logger.info(f"🔥 [3MIN DEBUG] 3분3상승 신호 억제: {ticker} score={quick_signal.score:.3f} < cut={cut:.3f}")
                                         _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators, suppressed="below_cutoff")
                                     else:
-                                        redis_streams.publish_signal({
-                                            "ticker": quick_signal.ticker,
-                                            "signal_type": quick_signal.signal_type.value,
-                                            "score": quick_signal.score,
-                                            "confidence": quick_signal.confidence,
-                                            "regime": quick_signal.regime,
-                                            "tech_score": quick_signal.tech_score,
-                                            "sentiment_score": quick_signal.sentiment_score,
-                                            "edgar_bonus": quick_signal.edgar_bonus,
-                                            "trigger": quick_signal.trigger,
-                                            "summary": quick_signal.summary,
-                                            "entry_price": quick_signal.entry_price,
-                                            "stop_loss": quick_signal.stop_loss,
-                                            "take_profit": quick_signal.take_profit,
-                                            "horizon_minutes": quick_signal.horizon_minutes,
-                                            "timestamp": quick_signal.timestamp.isoformat()
-                                        })
-                                        signals_generated += 1
-                                        _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators)
-                                        logger.info(f"스캘프 신호: {ticker} long (3min_3up)")
+                                        logger.info(f"🔥 [3MIN DEBUG] 3분3상승 신호 발행: {ticker} long score={quick_signal.score:.3f}")
+                                        try:
+                                            redis_streams.publish_signal({
+                                                "ticker": quick_signal.ticker,
+                                                "signal_type": quick_signal.signal_type.value,
+                                                "score": quick_signal.score,
+                                                "confidence": quick_signal.confidence,
+                                                "regime": quick_signal.regime,
+                                                "tech_score": quick_signal.tech_score,
+                                                "sentiment_score": quick_signal.sentiment_score,
+                                                "edgar_bonus": quick_signal.edgar_bonus,
+                                                "trigger": quick_signal.trigger,
+                                                "summary": quick_signal.summary,
+                                                "entry_price": quick_signal.entry_price,
+                                                "stop_loss": quick_signal.stop_loss,
+                                                "take_profit": quick_signal.take_profit,
+                                                "horizon_minutes": quick_signal.horizon_minutes,
+                                                "timestamp": quick_signal.timestamp.isoformat()
+                                            })
+                                            logger.info(f"🔥 [3MIN DEBUG] Redis 스트림 발행 성공: {ticker}")
+                                            signals_generated += 1
+                                            _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators)
+                                            logger.info(f"스캘프 신호: {ticker} long (3min_3up)")
+                                        except Exception as e:
+                                            logger.error(f"🔥 [3MIN DEBUG] 3분3상승 Redis 발행 실패: {ticker} - {e}")
                                         continue
                 except Exception:
                     pass
@@ -682,17 +734,16 @@ def generate_signals(self):
                 # 6. 장외 전용 pre-filter (세션/유동성/스프레드/쿨다운/일일상한)
                 ext_enabled = (os.getenv("EXTENDED_PRICE_SIGNALS", "false").lower() in ("1","true","yes","on"))
                 session_label = _session_label()
-                cutoff_rth = float(os.getenv("SIGNAL_CUTOFF", "0.25"))
-                cutoff_ext = float(os.getenv("EXT_SIGNAL_CUTOFF", "0.35"))
+                cutoff_rth, cutoff_ext = get_signal_cutoffs()
                 dvol5m = float(indicators.get("dollar_vol_5m", 0.0))
                 spread_bp = float(indicators.get("spread_bp", 0.0))
                 suppress_reason = None
                 if session_label == "EXT":
                     if not ext_enabled:
                         suppress_reason = "ext_disabled"
-                    if dvol5m < float(os.getenv("EXT_MIN_DOLLAR_VOL_5M", "500000")):
+                    if dvol5m < float(os.getenv("EXT_MIN_DOLLAR_VOL_5M", "50000")):
                         suppress_reason = suppress_reason or "low_dvol"
-                    if spread_bp > float(os.getenv("EXT_MAX_SPREAD_BP", "60")):
+                    if spread_bp > float(os.getenv("EXT_MAX_SPREAD_BP", "300")):
                         suppress_reason = suppress_reason or "wide_spread"
                     # 쿨다운/일일 상한 체크: Redis 키 사용
                     try:
@@ -748,6 +799,10 @@ def generate_signals(self):
                     # 컷오프 적용 (세션별)
                     cut = cutoff_rth if session_label == "RTH" else cutoff_ext
                     if abs(signal.score) < cut or suppress_reason:
+                        # 억제 사유 상세 로그
+                        logger.info(f"억제: reason={suppress_reason or 'below_cutoff'} "
+                                   f"score={signal.score:.3f} cut={cut:.3f} dvol5m={dvol5m:.0f} spread_bp={spread_bp:.1f}")
+                        
                         # 억제 메트릭 누적
                         try:
                             if rurl:
@@ -779,8 +834,35 @@ def generate_signals(self):
                         "timestamp": signal.timestamp.isoformat()
                     }
                     
-                    redis_streams.publish_signal(signal_data)
-                    signals_generated += 1
+                    logger.info(f"🔥 [DEBUG] 시그널 생성됨! ticker={ticker}, type={signal.signal_type.value}, score={signal.score:.3f}, cut={cut:.3f}")
+                    logger.info(f"🔥 [DEBUG] Redis 스트림 발행 시도 중...")
+                    
+                    try:
+                        redis_streams.publish_signal(signal_data)
+                        logger.info(f"🔥 [DEBUG] Redis 스트림 발행 성공: {ticker}")
+                        
+                        # Slack 전송 추가
+                        if slack_bot:
+                            logger.info(f"🔍 [DEBUG] Slack 전송 시도: {ticker}")
+                            try:
+                                slack_message = format_slack_message(signal)
+                                logger.info(f"🔍 [DEBUG] Slack 메시지 생성됨: 채널={slack_message.get('channel')}, 텍스트={slack_message.get('text', '')[:50]}...")
+                                result = slack_bot.send_message(slack_message)
+                                if result:
+                                    logger.info(f"🔥 [DEBUG] Slack 전송 성공: {ticker}")
+                                else:
+                                    logger.error(f"🔥 [DEBUG] Slack 전송 실패: {ticker} - SlackBot.send_message() returned False")
+                            except Exception as e:
+                                logger.error(f"🔥 [DEBUG] Slack 전송 예외: {ticker} - {e}")
+                                import traceback
+                                logger.error(f"🔍 [DEBUG] 스택 트레이스: {traceback.format_exc()}")
+                        else:
+                            logger.warning(f"🔍 [DEBUG] Slack 전송 건너뜀 - slack_bot이 None: {ticker}")
+                        
+                        signals_generated += 1
+                    except Exception as e:
+                        logger.error(f"🔥 [DEBUG] Redis 스트림 발행 실패: {ticker} - {e}")
+                        continue
                     # 최근 신호 기록 (+ 세션/스프레드/달러대금)
                     _record_recent_signal(redis_url=rurl, signal=signal, session_label=session_label, indicators=indicators)
                     
@@ -1332,12 +1414,13 @@ def adaptive_cutoff():
                 return float(v) if v is not None else d
             except Exception:
                 return d
-        rth = _getf("cfg:signal_cutoff:rth", float(os.getenv("SIGNAL_CUTOFF", "0.25")))
-        ext = _getf("cfg:signal_cutoff:ext", float(os.getenv("EXT_SIGNAL_CUTOFF", "0.35")))
-        # 조정
+        rth = _getf("cfg:signal_cutoff:rth", settings.SIGNAL_CUTOFF_RTH)
+        ext = _getf("cfg:signal_cutoff:ext", settings.SIGNAL_CUTOFF_EXT)
+        # 조정 (현실적 경계값으로 수정)
+        rth_base, ext_base = settings.SIGNAL_CUTOFF_RTH, settings.SIGNAL_CUTOFF_EXT
         delta = -0.02 if fills == 0 else (0.02 if fills >= 4 else 0.0)
-        rth_new = min(max(rth + delta, 0.64), 0.74)
-        ext_new = min(max(ext + delta, 0.74), 0.82)
+        rth_new = min(max(rth + delta, max(0.12, rth_base - 0.06)), rth_base + 0.12)
+        ext_new = min(max(ext + delta, max(0.18, ext_base - 0.10)), ext_base + 0.10)
         r.set("cfg:signal_cutoff:rth", rth_new)
         r.set("cfg:signal_cutoff:ext", ext_new)
         return {"status": "ok", "fills": fills, "rth": rth_new, "ext": ext_new}

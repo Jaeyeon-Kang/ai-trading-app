@@ -4,7 +4,7 @@
 가중치: Trend(0.75/0.25), Vol(0.30/0.70), Mean(0.60/0.40)
 최종점수 score = w_tech*tech + w_sent*sentiment
 EDGAR 이벤트면 ±0.1 보너스
-임계: score ≥ 0.68 → LONG, ≤ -0.68 → SHORT
+임계/가중치/보너스/쿨다운은 설정으로 주입
 """
 import logging
 from typing import Dict, Optional, Tuple
@@ -14,6 +14,7 @@ from enum import Enum
 import json
 import os
 
+from app.config import settings
 from .regime import RegimeType, RegimeResult
 from .techscore import TechScoreResult
 from .llm_insight import LLMInsight
@@ -50,28 +51,29 @@ class SignalMixer:
     """시그널 믹서"""
     
     def __init__(self,
-                 buy_threshold: float = 0.68,
-                 sell_threshold: float = -0.68,
-                 edgar_bonus: float = 0.1,
-                 cooldown_seconds: int = 60):
+                 buy_threshold: float = settings.MIXER_THRESHOLD,
+                 sell_threshold: float = -settings.MIXER_THRESHOLD,
+                 edgar_bonus: float = settings.EDGAR_BONUS,
+                 cooldown_seconds: int = settings.COOLDOWN_SECONDS):
         """
         Args:
-            buy_threshold: 매수 임계값 (0.68)
-            sell_threshold: 매도 임계값 (-0.68)
-            edgar_bonus: EDGAR 오버라이드 보너스 (±0.1)
+            buy_threshold: 매수 임계값 (config에서 주입)
+            sell_threshold: 매도 임계값 (config에서 주입)
+            edgar_bonus: EDGAR 오버라이드 보너스 (config에서 주입)
             cooldown_seconds: 쿨다운 시간 (초)
         """
         self.buy_threshold = buy_threshold
         self.sell_threshold = sell_threshold
         self.edgar_bonus = edgar_bonus
         self.cooldown_seconds = cooldown_seconds
+        self.cool_improve_min = settings.COOL_IMPROVE_MIN
         
-        # 레짐별 가중치 (요구사항에 맞게 조정)
+        # 레짐별 가중치 (설정에서 주입)
         self.regime_weights = {
-            RegimeType.TREND: {"tech": 0.75, "sentiment": 0.25},
-            RegimeType.VOL_SPIKE: {"tech": 0.30, "sentiment": 0.70},
-            RegimeType.MEAN_REVERT: {"tech": 0.60, "sentiment": 0.40},
-            RegimeType.SIDEWAYS: {"tech": 0.50, "sentiment": 0.50}
+            RegimeType.TREND: settings.REGIME_WEIGHTS["trend"],
+            RegimeType.VOL_SPIKE: settings.REGIME_WEIGHTS["vol_spike"],
+            RegimeType.MEAN_REVERT: settings.REGIME_WEIGHTS["mean_revert"],
+            RegimeType.SIDEWAYS: settings.REGIME_WEIGHTS["sideways"]
         }
         
         # 쿨다운 캐시: 동일 티커 60초 내 재신호 제한
@@ -125,6 +127,10 @@ class SignalMixer:
         regime = regime_result.regime
         weights = self.regime_weights.get(regime, self.regime_weights[RegimeType.SIDEWAYS])
         
+        # LLM/EDGAR 둘 다 없으면 sentiment=0.0이고, 필요시 재정규화
+        if settings.RENORM_NO_SENTIMENT and (llm_insight is None and not edgar_filing):
+            weights = {"tech": 1.0, "sentiment": 0.0}
+        
         # 최종점수 계산: score = w_tech*tech + w_sent*sentiment
         final_score = (
             tech_score_normalized * weights["tech"] +
@@ -146,7 +152,7 @@ class SignalMixer:
             logger.debug(f"쿨다운 제한: {ticker} (점수 개선 없음)")
             return None
         
-        # 신호 타입 결정 (임계: score ≥ 0.68 → LONG, ≤ -0.68 → SHORT)
+        # 신호 타입 결정 (임계는 설정 주입)
         signal_type = self._determine_signal_type(final_score)
         
         # 신호가 없으면 None 반환
@@ -237,7 +243,7 @@ class SignalMixer:
         # 쿨다운 시간 내에 있으면 점수 개선 확인
         if time_diff < self.cooldown_seconds:
             score_improvement = current_score - last_score
-            if score_improvement < 0.10:  # +0.10 이상 개선이어야 함
+            if score_improvement < self.cool_improve_min:  # 설정값 이상 개선이어야 함
                 return False
         
         return True
@@ -286,10 +292,10 @@ class SignalMixer:
         return False
     
     def _determine_signal_type(self, score: float) -> SignalType:
-        """신호 타입 결정 (임계: score ≥ 0.68 → LONG, ≤ -0.68 → SHORT)"""
-        if score >= self.buy_threshold:  # 0.68
+        """신호 타입 결정 (임계는 설정 주입)"""
+        if score >= self.buy_threshold:
             return SignalType.LONG
-        elif score <= self.sell_threshold:  # -0.68
+        elif score <= self.sell_threshold:
             return SignalType.SHORT
         else:
             return SignalType.HOLD

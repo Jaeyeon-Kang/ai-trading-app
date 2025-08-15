@@ -99,6 +99,7 @@ class SlackBot:
                     "channel": message.channel,
                     "text": message.text
                 }
+                logger.info(f"SlackBot 전송 시도: 채널={message.channel}, 텍스트={message.text[:50]}...")
                 
                 if message.blocks:
                     payload["blocks"] = message.blocks
