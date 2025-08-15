@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  celery_worker:
+    environment:
+      # 프리/애프터장 허용 (기존과 동일)
+      RTH_ONLY: "false"
+      EXTENDED_PRICE_SIGNALS: "true"
+      
+      # 적당히 완화된 필터들
+      # RTH (정규장) 설정
+      SIGNAL_CUTOFF: "0.3"           # 0.5 → 0.3 (조금 완화)
+      MAX_SPREAD_BP: "300"           # 200 → 300bp (3% 스프레드까지 허용)
+      COOLDOWN_MIN: "5"              # 15분 → 5분 (빠른 재신호)
+      
+      # EXT (연장장) 설정 - 더 관대하게
+      EXT_SIGNAL_CUTOFF: "0.2"       # 연장장에서는 더 관대
+      EXT_MIN_DOLLAR_VOL_5M: "20000" # 5000 → 20000 (적당한 유동성)
+      EXT_MAX_SPREAD_BP: "800"       # 5000 → 800bp (8% 스프레드)
+      EXT_COOLDOWN_MIN: "3"          # 연장장에서는 더 빠른 재신호
+      
+      # 스캘핑 모드도 적당히
+      SCALP_TICK_SPIKE: "true"
+      SCALP_MIN_RET: "0.0002"        # 0.00005 → 0.0002 (0.02% 이상 움직임)
+      SCALP_MIN_RANGE: "0.0005"      # 0.0001 → 0.0005 (적당한 변동성)
+      
+      # 우니버스 확장 (테스트보단 적지만 여전히 많이)
+      UNIVERSE_MAX: "80"             # 120 → 80개
+
+  celery_beat:
+    environment:
+      RTH_ONLY: "false"
+      EXTENDED_PRICE_SIGNALS: "true"
+      SIGNAL_CUTOFF: "0.3"
+      EXT_SIGNAL_CUTOFF: "0.2"
+      SCALP_TICK_SPIKE: "true"
+      UNIVERSE_MAX: "80"
