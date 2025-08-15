@@ -86,11 +86,6 @@ celery_app.conf.beat_schedule = {
         "task": "app.jobs.scheduler.ingest_edgar_stream",
         "schedule": 5.0,
     },
-    # 5초마다 신호 소비 → Slack 알림 (테스트 폭주 모드)
-    "consume-signals": {
-        "task": "app.jobs.scheduler.consume_signals",
-        "schedule": 5.0,
-    },
     # 15분마다 유니버스 재적용 (권장 분리)
     "refresh-universe": {
         "task": "app.jobs.scheduler.refresh_universe",
@@ -170,7 +165,7 @@ def _autoinit_components_if_enabled() -> None:
     except Exception as e:
         logger.warning(f"TechScoreEngine 준비 실패: {e}")
     try:
-        thr = float(os.getenv("SIGNAL_CUTOFF", "0.68"))
+        thr = float(os.getenv("SIGNAL_CUTOFF", "0.25"))
         components["signal_mixer"] = SignalMixer(buy_threshold=thr, sell_threshold=-thr)
     except Exception as e:
         logger.warning(f"SignalMixer 준비 실패: {e}")
@@ -320,6 +315,7 @@ def pipeline_e2e(self):
                     # 메타에 세션/품질 지표 심기 → Slack 헤더 라벨용
                     if not signal.meta:
                         signal.meta = {}
+                    session_label = _session_label()
                     signal.meta["session"] = session_label
                     signal.meta["spread_bp"] = spread_bp
                     signal.meta["dollar_vol_5m"] = dvol5m
@@ -432,7 +428,7 @@ def generate_signals(self):
         if not trading_components.get("signal_mixer"):
             try:
                 from app.engine.mixer import SignalMixer
-                thr = float(os.getenv("SIGNAL_CUTOFF", "0.68"))
+                thr = float(os.getenv("SIGNAL_CUTOFF", "0.25"))
                 trading_components["signal_mixer"] = SignalMixer(buy_threshold=thr, sell_threshold=-thr)
                 logger.warning("signal_mixer 로컬 생성")
             except Exception as e:
@@ -557,8 +553,8 @@ def generate_signals(self):
                                 quick_signal.summary = f"{trig_reason}; abs_ret={last_abs_ret:.3%}; range={last_range:.3%}"
                                 # 컷/세션 억제 동일 적용 (로컬 계산)
                                 sess_now = _session_label()
-                                cut_r = float(os.getenv("SIGNAL_CUTOFF", "0.68"))
-                                cut_e = float(os.getenv("EXT_SIGNAL_CUTOFF", "0.78"))
+                                cut_r = float(os.getenv("SIGNAL_CUTOFF", "0.25"))
+                                cut_e = float(os.getenv("EXT_SIGNAL_CUTOFF", "0.35"))
                                 cut = cut_r if sess_now == "RTH" else cut_e
                                 if abs(quick_signal.score) < cut:
                                     _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators, suppressed="below_cutoff")
@@ -630,8 +626,8 @@ def generate_signals(self):
                                     quick_signal.trigger = "3min_3up"
                                     quick_signal.summary = "3min green x3"
                                     sess_now = _session_label()
-                                    cut_r = float(os.getenv("SIGNAL_CUTOFF", "0.68"))
-                                    cut_e = float(os.getenv("EXT_SIGNAL_CUTOFF", "0.78"))
+                                    cut_r = float(os.getenv("SIGNAL_CUTOFF", "0.25"))
+                                    cut_e = float(os.getenv("EXT_SIGNAL_CUTOFF", "0.35"))
                                     cut = cut_r if sess_now == "RTH" else cut_e
                                     if abs(quick_signal.score) < cut:
                                         _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators, suppressed="below_cutoff")
@@ -686,8 +682,8 @@ def generate_signals(self):
                 # 6. 장외 전용 pre-filter (세션/유동성/스프레드/쿨다운/일일상한)
                 ext_enabled = (os.getenv("EXTENDED_PRICE_SIGNALS", "false").lower() in ("1","true","yes","on"))
                 session_label = _session_label()
-                cutoff_rth = float(os.getenv("SIGNAL_CUTOFF", "0.68"))
-                cutoff_ext = float(os.getenv("EXT_SIGNAL_CUTOFF", "0.78"))
+                cutoff_rth = float(os.getenv("SIGNAL_CUTOFF", "0.25"))
+                cutoff_ext = float(os.getenv("EXT_SIGNAL_CUTOFF", "0.35"))
                 dvol5m = float(indicators.get("dollar_vol_5m", 0.0))
                 spread_bp = float(indicators.get("spread_bp", 0.0))
                 suppress_reason = None
@@ -797,59 +793,9 @@ def generate_signals(self):
         execution_time = time.time() - start_time
         logger.info(f"시그널 생성 완료: {signals_generated}개, {execution_time:.2f}초")
         
-        # 🔥 DEBUG: 이 로그가 보이는지 확인
-        logger.info("🔥 신호 소비 코드 진입점 도달")
-        
-        # 🔥 신호 소비 추가 (테스트 폭주 모드) - 간단 버전
-        signals_consumed = 0
-        try:
-            from app.hooks.autoinit import _build_components
-            components = _build_components()
-            redis_streams_local = components.get("redis_streams")
-            slack_bot_local = components.get("slack_bot")
-            
-            if redis_streams_local and slack_bot_local:
-                logger.info("🚀 신호 소비 시작!")
-                consumed_signals = redis_streams_local.consume_signals(count=10, block_ms=100)
-                logger.info(f"📥 소비된 신호 개수: {len(consumed_signals)}")
-                
-                for signal in consumed_signals:
-                    try:
-                        ticker = signal.data.get("ticker", "?")
-                        signal_type = signal.data.get("signal_type", "?")
-                        score = signal.data.get("score", 0)
-                        
-                        # 타입 처리 (numpy, string 등)
-                        try:
-                            if hasattr(score, 'item'):
-                                score = score.item()
-                            score = float(score)
-                        except:
-                            score = 0.0
-                        
-                        # Slack 메시지
-                        emoji = "🚀" if signal_type == "long" else "🔻"
-                        msg = f"{emoji} **{ticker}** {signal_type} (score: {score:.3f})"
-                        
-                        result = slack_bot_local.send_message({"text": msg})
-                        if result:
-                            signals_consumed += 1
-                            logger.info(f"💬 Slack 전송: {ticker} {signal_type}")
-                    except Exception as e:
-                        logger.warning(f"신호 처리 실패: {e}")
-                        continue
-                
-                if signals_consumed > 0:
-                    logger.info(f"🎉 신호 소비 완료: {signals_consumed}개 Slack 전송")
-            else:
-                logger.warning("컴포넌트 없어서 신호 소비 스킵")
-        except Exception as e:
-            logger.warning(f"신호 소비 실패: {e}")
-        
         return {
             "status": "success",
             "signals_generated": signals_generated,
-            "signals_consumed": signals_consumed,
             "execution_time": execution_time,
             "timestamp": datetime.now().isoformat()
         }
@@ -1273,6 +1219,13 @@ def ingest_edgar_stream(self):
                 url = _norm("url") or d.get("url")
                 snippet_text = _norm("snippet_text") or d.get("snippet_text")
                 snippet_hash = _norm("snippet_hash") or d.get("snippet_hash")
+                
+                # form이 None이면 snippet_text에서 추출 시도
+                if form is None and snippet_text:
+                    import re
+                    match = re.search(r'\b(4|8-K|10-K|10-Q|S-1|S-3|DEF 14A)\b', str(snippet_text))
+                    if match:
+                        form = match.group(1)
 
                 cur.execute(
                     """
@@ -1379,8 +1332,8 @@ def adaptive_cutoff():
                 return float(v) if v is not None else d
             except Exception:
                 return d
-        rth = _getf("cfg:signal_cutoff:rth", float(os.getenv("SIGNAL_CUTOFF", "0.68")))
-        ext = _getf("cfg:signal_cutoff:ext", float(os.getenv("EXT_SIGNAL_CUTOFF", "0.78")))
+        rth = _getf("cfg:signal_cutoff:rth", float(os.getenv("SIGNAL_CUTOFF", "0.25")))
+        ext = _getf("cfg:signal_cutoff:ext", float(os.getenv("EXT_SIGNAL_CUTOFF", "0.35")))
         # 조정
         delta = -0.02 if fills == 0 else (0.02 if fills >= 4 else 0.0)
         rth_new = min(max(rth + delta, 0.64), 0.74)
@@ -1392,106 +1345,6 @@ def adaptive_cutoff():
         logger.error(f"적응형 컷오프 실패: {e}")
         return {"status": "error", "error": str(e)}
 
-@celery_app.task(bind=True, name="app.jobs.scheduler.consume_signals")
-def consume_signals(self):
-    """Redis Streams에서 신호를 소비하여 Slack으로 전송 (테스트 폭주 모드)"""
-    try:
-        start_time = time.time()
-        
-        # 컴포넌트 확인/생성
-        redis_streams = trading_components.get("redis_streams")
-        slack_bot = trading_components.get("slack_bot")
-        
-        if not redis_streams:
-            try:
-                from app.io.streams import RedisStreams
-                rurl = os.getenv("REDIS_URL", "redis://redis:6379/0")
-                import urllib.parse as u
-                p = u.urlparse(rurl)
-                host = p.hostname or "redis"
-                port = int(p.port or 6379)
-                db = int((p.path or "/0").lstrip("/") or 0)
-                redis_streams = RedisStreams(host=host, port=port, db=db)
-                trading_components["redis_streams"] = redis_streams
-                logger.info("redis_streams 로컬 생성")
-            except Exception as e:
-                logger.warning(f"redis_streams 생성 실패: {e}")
-                return {"status": "skipped", "reason": "redis_streams_not_ready"}
-        
-        if not slack_bot:
-            try:
-                from app.io.slack_bot import SlackBot
-                token = os.getenv("SLACK_BOT_TOKEN")
-                channel = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL")
-                if token and channel:
-                    slack_bot = SlackBot(token, channel)
-                    trading_components["slack_bot"] = slack_bot
-                    logger.info("slack_bot 로컬 생성")
-                else:
-                    logger.warning("Slack 환경변수 없음")
-                    return {"status": "skipped", "reason": "slack_config_missing"}
-            except Exception as e:
-                logger.warning(f"slack_bot 생성 실패: {e}")
-                return {"status": "skipped", "reason": "slack_bot_not_ready"}
-        
-        signals_processed = 0
-        
-        # 신호 소비 (최대 10개씩, 100ms 대기)
-        signals = redis_streams.consume_signals(count=10, block_ms=100)
-        
-        for signal in signals:
-            try:
-                ticker = signal.data.get("ticker", "UNKNOWN")
-                signal_type = signal.data.get("signal_type", "unknown")
-                score = signal.data.get("score", "0")
-                confidence = signal.data.get("confidence", "0")
-                trigger = signal.data.get("trigger", "")
-                summary = signal.data.get("summary", "")
-                
-                # numpy 타입 처리
-                if hasattr(score, 'item'):
-                    score = score.item()
-                if hasattr(confidence, 'item'):
-                    confidence = confidence.item()
-                
-                # Slack 메시지 생성
-                emoji = "🚀" if signal_type == "long" else "🔻" if signal_type == "short" else "📊"
-                message_text = f"{emoji} **{ticker}** {signal_type} (score: {score:.3f})"
-                
-                if trigger and trigger != "추세 돌파":
-                    message_text += f" | {trigger}"
-                if summary and summary != "추세 지속":
-                    message_text += f" | {summary}"
-                
-                # Slack 전송
-                message_dict = {"text": message_text}
-                result = slack_bot.send_message(message_dict)
-                
-                if result:
-                    signals_processed += 1
-                    logger.info(f"신호 Slack 전송: {ticker} {signal_type} (score: {score:.3f})")
-                else:
-                    logger.warning(f"Slack 전송 실패: {ticker} {signal_type}")
-                
-            except Exception as e:
-                logger.error(f"신호 처리 실패: {e}")
-                continue
-        
-        execution_time = time.time() - start_time
-        
-        if signals_processed > 0:
-            logger.info(f"신호 소비 완료: {signals_processed}개 처리, {execution_time:.2f}초")
-        
-        return {
-            "status": "success",
-            "signals_processed": signals_processed,
-            "execution_time": execution_time,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"신호 소비 실패: {e}")
-        return {"status": "error", "error": str(e)}
 
 if __name__ == "__main__":
     # 개발용 실행

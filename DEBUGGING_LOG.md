@@ -57,6 +57,80 @@ except:
     score = 0.0
 ```
 
+### 7. Shell 명령어 오류들
+**문제**: `zsh: no matches found: perl -0777 -pe s/^version:s*3.8/version:`
+**원인**: zsh에서 특수문자 처리 문제
+**해결**: `sed` 명령어로 대체
+```bash
+sed -i '' 's/^version: *3\.8/version: '\''3.8'\''/' compose.override.*.yml
+```
+
+**문제**: `zsh: no matches found: docker compose exec -T celery_worker sh -lc 'env | egrep -i ^(QUOTE_LOG_VERBOSE|BAR_SEC|SCALP_MIN_RET|SCALP_MIN_RANGE|SCALP_3MIN3UP|RTH_ONLY|EXTENDED_PRICE_SIGNALS|SIGNAL_CUTOFF|EXT_SIGNAL_CUTOFF|UNIVERSE_MAX)= | sort'`
+**원인**: `egrep` 패턴에서 특수문자 처리 문제
+**해결**: 따옴표 수정
+```bash
+docker compose exec -T celery_worker sh -lc 'env | egrep -i "^(QUOTE_LOG_VERBOSE|BAR_SEC|SCALP_MIN_RET|SCALP_MIN_RANGE|SCALP_3MIN3UP|RTH_ONLY|EXTENDED_PRICE_SIGNALS|SIGNAL_CUTOFF|EXT_SIGNAL_CUTOFF|UNIVERSE_MAX)=" | sort'
+```
+
+### 8. Python 스크립트 실행 오류
+**문제**: `Syntax error: "(" unexpected` / `SyntaxError: '(' was never closed`
+**원인**: `sh -lc` 내에서 Python 스크립트 실행 시 따옴표 문제
+**해결**: Python 스크립트를 별도 파일로 분리하거나 올바른 따옴표 사용
+
+### 9. Docker 컨테이너 캐시 문제
+**문제**: 코드 변경 후에도 컨테이너가 이전 코드로 실행됨
+**원인**: Docker 이미지 캐시, 볼륨 마운트 문제
+**해결**: 
+```bash
+docker compose build --no-cache
+docker compose up --force-recreate
+```
+
+### 10. Celery 태스크 호출 오류
+**문제**: `Usage: celery call [OPTIONS] NAME ... Error: No such option: --timeout`
+**원인**: 존재하지 않는 `--timeout` 옵션 사용
+**해결**: `--timeout` 옵션 제거
+
+### 11. YAML 파일 구문 오류
+**문제**: `SCALP_MIN_RANGE:: -c: line 0: unexpected EOF`
+**원인**: `compose.override.scalp.yml`에서 잘못된 YAML 구문
+**해결**: YAML 구문 수정
+```yaml
+# 잘못된 구문
+SCALP_MIN_RANGE:: 0.0001
+
+# 올바른 구문
+SCALP_MIN_RANGE: "0.0001"
+```
+
+### 12. 수동 테스트 시 컴포넌트 접근 오류
+**문제**: `AttributeError: 'StreamConsumer' object has no attribute 'consume_signals'`
+**원인**: 잘못된 클래스에서 메서드 호출
+**해결**: `redis_streams.consume_signals()` 사용
+
+**문제**: `Slack 메시지 전송 실패: 'str' object has no attribute 'channel'`
+**원인**: `SlackBot.send_message()`에 문자열 대신 딕셔너리 전달 필요
+**해결**: `{"text": message_text}` 형태로 전달
+
+### 13. Git 관리 오류
+**문제**: 린트 결과가 자동으로 커밋됨
+**원인**: `git add .`로 모든 변경사항 포함
+**해결**: 선택적 커밋으로 핵심 파일만 포함
+```bash
+git add app/jobs/scheduler.py app/hooks/autoinit.py app/io/streams.py compose.override.moderate.yml
+git restore .
+```
+
+### 14. 환경변수 우선순위 문제
+**문제**: `.env` 파일의 공격적 설정이 오버라이드 파일보다 우선됨
+**원인**: Docker Compose 환경변수 우선순위 규칙
+**해결**: `compose.override.conservative.yml`로 명시적 오버라이드
+
+### 15. Docker 네트워크 정리 오류
+**문제**: `failed to remove network` 에러
+**원인**: 활성 엔드포인트가 있는 네트워크 삭제 시도
+**해결**: 무시 가능한 오류, 컨테이너는 정상 제거됨
+
 ---
 
 ## 성공한 설정들
@@ -65,6 +139,8 @@ except:
 1. **compose.override.workerfix.yml**: 컴포넌트 초기화, solo mode
 2. **compose.override.scalp.yml**: 스캘핑 모드, 틱 스파이크 감지  
 3. **compose.override.rth.yml**: 필터 완화 (cutoff=0, spread=100000bp, cooldown=0)
+4. **compose.override.moderate.yml**: 중간 수준 필터 설정
+5. **compose.override.conservative.yml**: 보수적 필터 설정
 
 ### 핵심 환경변수
 ```bash
@@ -101,9 +177,14 @@ UNIVERSE_MAX=120
 2. **컴포넌트 초기화**: Celery worker에서 trading_components 초기화가 핵심
 3. **태스크 스케줄링**: 복잡한 inter-task 통신보다 단일 태스크 내 처리가 안정적
 4. **볼륨 마운트**: 코드 변경 후 반드시 Docker 이미지 리빌드 필요
+5. **Shell 스크립팅**: zsh에서 특수문자 처리 시 따옴표 주의
+6. **환경변수 우선순위**: `.env` 파일이 오버라이드보다 우선됨
+7. **Git 관리**: 린트 결과와 핵심 변경사항 분리 필요
 
 ---
 
 ## 최종 상태
 - **테스트 폭주 모드**: ✅ 완전 성공
-- **다음 단계**: 오버라이드 제거하고 본판 코드로 복귀
+- **중간 모드**: ✅ 성공 (moderate 설정)
+- **보수적 모드**: ✅ 성공 (conservative 설정)
+- **본판 복귀**: ✅ 완료 (오버라이드 제거, 깨끗한 상태)

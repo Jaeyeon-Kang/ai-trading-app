@@ -3,10 +3,9 @@
 30초봉/1분봉 혼합으로 Trend/Vol/Mean 분류
 """
 import numpy as np
-import pandas as pd
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Literal
+from typing import Dict, List
 from dataclasses import dataclass
 from enum import Enum
 import os
@@ -211,9 +210,9 @@ class RegimeDetector:
         
         # 기본 데이터 추출
         closes = [c.c for c in candles]
-        volumes = [c.v for c in candles]
-        highs = [c.h for c in candles]
-        lows = [c.l for c in candles]
+        [c.v for c in candles]
+        [c.h for c in candles]
+        [c.l for c in candles]
         
         # 기술적 지표 계산 (지표 기간을 가용 바 수에 맞춰 자동 축소)
         n = len(closes)

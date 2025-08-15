@@ -245,7 +245,6 @@ async def health_check():
     try:
         # 시스템 상태 확인
         redis_health = {"status": "unknown"}
-        llm_health = {"status": "unknown"}
         
         if redis_streams:
             redis_health = redis_streams.health_check()

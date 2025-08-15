@@ -14,7 +14,7 @@ import logging
 import hashlib
 import json
 import os
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, time as dtime
 import time
@@ -350,9 +350,9 @@ class LLMInsightEngine:
                 self._disable_llm()
             return False
         
-        # 속도 제한 확인 (분당 1콜)
-        if current_time - self.last_call_time < 60:
-            logger.warning("속도 제한: 분당 1콜 초과")
+        # 속도 제한 확인 (분당 10콜로 완화)
+        if current_time - self.last_call_time < 6:
+            logger.warning("속도 제한: 분당 10콜 초과")
             return False
         
         self.last_call_time = current_time

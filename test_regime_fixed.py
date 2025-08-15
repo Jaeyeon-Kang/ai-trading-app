@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
-from app.engine.regime import RegimeDetector, RegimeType
+from app.engine.regime import RegimeDetector
 
 # 테스트용 Bar30s 클래스
 @dataclass

@@ -3,10 +3,9 @@ TechScore 엔진 - Week 1 라이트봇 A단계
 EMA/MACD/RSI/VWAP 편차 → 0~1 정규화
 """
 import numpy as np
-import pandas as pd
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)

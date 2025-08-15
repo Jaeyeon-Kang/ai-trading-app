@@ -27,12 +27,10 @@ def suggest_position_qty(default_qty: int, var95: float, max_risk_r: float = 1.0
 리스크 관리 엔진
 PnL, VaR95, 셧다운 로직
 """
-import numpy as np
-import pandas as pd
 import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 
 logger = logging.getLogger(__name__)
@@ -288,7 +286,7 @@ class RiskEngine:
         if self.status != RiskStatus.WARNING:
             return None
         
-        metrics = self.calculate_risk_metrics()
+        self.calculate_risk_metrics()
         
         # 가장 큰 포지션 찾기
         largest_position = None

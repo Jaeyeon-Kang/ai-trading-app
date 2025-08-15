@@ -7,9 +7,9 @@ EDGAR 이벤트면 ±0.1 보너스
 임계: score ≥ 0.68 → LONG, ≤ -0.68 → SHORT
 """
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 import json
 import os
@@ -447,7 +447,7 @@ class SignalMixer:
                 ticker, signal_type, score, confidence, regime,
                 tech_score, sentiment_score, edgar_bonus,
                 trigger, summary, entry_price, stop_loss, take_profit,
-                horizon_minutes, timestamp, meta
+                horizon_minutes, ts, meta
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )

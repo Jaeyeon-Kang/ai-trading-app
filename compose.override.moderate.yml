@@ -9,12 +9,12 @@ services:
       
       # 적당히 완화된 필터들
       # RTH (정규장) 설정
-      SIGNAL_CUTOFF: "0.3"           # 0.5 → 0.3 (조금 완화)
-      MAX_SPREAD_BP: "300"           # 200 → 300bp (3% 스프레드까지 허용)
-      COOLDOWN_MIN: "5"              # 15분 → 5분 (빠른 재신호)
+      SIGNAL_CUTOFF: "0.6"           # 0.5 → 0.6 (더 보수적)
+      MAX_SPREAD_BP: "200"           # 기본 200bp 유지
+      COOLDOWN_MIN: "10"             # 15분 → 10분 (적당한 재신호)
       
-      # EXT (연장장) 설정 - 더 관대하게
-      EXT_SIGNAL_CUTOFF: "0.2"       # 연장장에서는 더 관대
+      # EXT (연장장) 설정 - 조금 더 관대
+      EXT_SIGNAL_CUTOFF: "0.5"       # 연장장에서 조금 더 관대
       EXT_MIN_DOLLAR_VOL_5M: "20000" # 5000 → 20000 (적당한 유동성)
       EXT_MAX_SPREAD_BP: "800"       # 5000 → 800bp (8% 스프레드)
       EXT_COOLDOWN_MIN: "3"          # 연장장에서는 더 빠른 재신호

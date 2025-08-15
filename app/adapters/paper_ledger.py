@@ -3,11 +3,9 @@
 실제 거래 없이 가상으로 체결을 시뮬레이션하고 기록
 """
 from dataclasses import dataclass
-from typing import Optional, List, Dict
-from datetime import datetime, timedelta
-import json
+from typing import List, Dict
+from datetime import datetime
 import logging
-from decimal import Decimal, ROUND_HALF_UP
 
 logger = logging.getLogger(__name__)
 

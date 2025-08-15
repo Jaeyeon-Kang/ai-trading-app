@@ -5,7 +5,7 @@ Slack Bot
 import httpx
 import json
 import logging
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List
 from datetime import datetime
 import time
 from dataclasses import dataclass
@@ -175,7 +175,6 @@ class SlackBot:
         # 메시지 포맷: "AAPL | 레짐 TREND(0.80) | 점수 +0.72 | 제안: 진입 224.5 / 손절 221.1 / 익절 231.2 | 이유: 가이던스 상향(<=120m)"
         regime_display = signal.regime.upper().replace("_", "")
         score_sign = "+" if signal.score >= 0 else ""
-        signal_type_kr = "롱" if signal.signal_type == "long" else "숏"
 
         # 세션/스프레드/달러대금 요약 (옵셔널 메타에서)
         sess = (signal.__dict__.get("meta", {}) or {}).get("session", "")
@@ -524,7 +523,7 @@ class SlackBot:
         if success:
             logger.info(f"LLM 상태 변경 알림: {'활성화' if llm_enabled else '비활성화'}")
         else:
-            logger.error(f"LLM 상태 변경 알림 전송 실패")
+            logger.error("LLM 상태 변경 알림 전송 실패")
         
         return success
     

@@ -10,8 +10,7 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 import time
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List
 
 # 테스트용 모의 컴포넌트들
@@ -272,7 +271,7 @@ def main():
         print(f"✅ p99 지연: {performance['p99_latency_ms']}ms")
         
         # 최신 시그널 3건 출력
-        print(f"\n📝 최신 signals 3건:")
+        print("\n📝 최신 signals 3건:")
         latest_signals = db.get_latest_signals(3)
         for i, signal in enumerate(latest_signals, 1):
             print(f"  {i}. {signal['ticker']} {signal['signal_type']} (점수: {signal['score']:.2f})")

@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import os
 import time
-import json
 from typing import Dict, List, Optional
 
 import httpx
@@ -88,7 +87,7 @@ class EDGARScanner:
             return []
 
         filings: List[Dict] = []
-        now_epoch = int(time.time())
+        int(time.time())
         # consider filings within ~24h
         try:
             for ticker in self.tickers:
