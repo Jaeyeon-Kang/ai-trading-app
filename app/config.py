@@ -18,11 +18,11 @@ class Settings:
         self.SIGNAL_CUTOFF_EXT = float(os.getenv("SIGNAL_CUTOFF_EXT", "0.28"))
 
         # 믹서 최소 임계(노이즈 컷). 스케줄러 컷과 역할 다름
-        self.MIXER_THRESHOLD = float(os.getenv("MIXER_THRESHOLD", "0.10"))  # 0.08~0.12 권장
+        self.MIXER_THRESHOLD = float(os.getenv("MIXER_THRESHOLD", "0.15"))  # 원래 기획 톤으로 복원
 
         self.EDGAR_BONUS = float(os.getenv("EDGAR_BONUS", "0.10"))
-        self.COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
-        self.COOL_IMPROVE_MIN = float(os.getenv("COOL_IMPROVE_MIN", "0.05"))  # 기존 0.10은 너무 빡셌음
+        self.COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "180"))  # 원래 기획: 3분
+        self.COOL_IMPROVE_MIN = float(os.getenv("COOL_IMPROVE_MIN", "0.10"))  # 원래 기획 톤으로 복원
 
         self.EXT_MIN_DOLLAR_VOL_5M = float(os.getenv("EXT_MIN_DOLLAR_VOL_5M", "100000"))
         self.EXT_MAX_SPREAD_BP = float(os.getenv("EXT_MAX_SPREAD_BP", "200"))

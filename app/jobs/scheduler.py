@@ -841,23 +841,27 @@ def generate_signals(self):
                         redis_streams.publish_signal(signal_data)
                         logger.info(f"🔥 [DEBUG] Redis 스트림 발행 성공: {ticker}")
                         
-                        # Slack 전송 추가
+                        # Slack 전송: 강신호만 (원래 기획 - 소수·굵직한 알림)
                         if slack_bot:
-                            logger.info(f"🔍 [DEBUG] Slack 전송 시도: {ticker}")
-                            try:
-                                slack_message = format_slack_message(signal)
-                                logger.info(f"🔍 [DEBUG] Slack 메시지 생성됨: 채널={slack_message.get('channel')}, 텍스트={slack_message.get('text', '')[:50]}...")
-                                result = slack_bot.send_message(slack_message)
-                                if result:
-                                    logger.info(f"🔥 [DEBUG] Slack 전송 성공: {ticker}")
-                                else:
-                                    logger.error(f"🔥 [DEBUG] Slack 전송 실패: {ticker} - SlackBot.send_message() returned False")
-                            except Exception as e:
-                                logger.error(f"🔥 [DEBUG] Slack 전송 예외: {ticker} - {e}")
-                                import traceback
-                                logger.error(f"🔍 [DEBUG] 스택 트레이스: {traceback.format_exc()}")
+                            # 강신호 기준: abs(score) >= cut + 0.10
+                            strong_signal_threshold = cut + 0.10
+                            is_strong_signal = abs(signal.score) >= strong_signal_threshold
+                            
+                            if is_strong_signal:
+                                logger.info(f"📢 Slack 전송 (강신호): {ticker} score={signal.score:.3f} >= {strong_signal_threshold:.3f}")
+                                try:
+                                    slack_message = format_slack_message(signal)
+                                    result = slack_bot.send_message(slack_message)
+                                    if result:
+                                        logger.info(f"✅ Slack 전송 성공: {ticker}")
+                                    else:
+                                        logger.error(f"❌ Slack 전송 실패: {ticker}")
+                                except Exception as e:
+                                    logger.error(f"❌ Slack 전송 예외: {ticker} - {e}")
+                            else:
+                                logger.info(f"🔇 Slack 전송 억제 (약신호): {ticker} score={signal.score:.3f} < {strong_signal_threshold:.3f}")
                         else:
-                            logger.warning(f"🔍 [DEBUG] Slack 전송 건너뜀 - slack_bot이 None: {ticker}")
+                            logger.warning(f"🔍 Slack 전송 건너뜀 - slack_bot이 None: {ticker}")
                         
                         signals_generated += 1
                     except Exception as e:
