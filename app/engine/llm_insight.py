@@ -93,20 +93,26 @@ class LLMInsightEngine:
         """슬랙 봇 설정 (상태 변경 알림용)"""
         self.slack_bot = slack_bot
     
-    def should_call_llm(self, edgar_event: bool = False, regime: str = None) -> bool:
+    def should_call_llm(self, edgar_event: bool = False, regime: str = None, signal_strength: float = 0.0) -> bool:
         """
-        LLM 호출 조건 확인
+        LLM 호출 조건 확인 (Phase 1.5: 강신호 지원 추가)
         
         Args:
             edgar_event: EDGAR 이벤트 여부
             regime: 현재 레짐 ('trend', 'vol_spike', 'mean_revert', 'sideways')
+            signal_strength: 신호 강도 (절댓값, 0.70+ 강신호)
             
         Returns:
             bool: LLM 호출 여부
         """
-        # 조건 1: edgar_event == True OR regime == 'vol_spike'
+        # 조건 1: 강신호 무조건 LLM 분석 (Phase 1.5 핵심 개선!)
+        if abs(signal_strength) >= 0.70:
+            logger.info(f"🎯 강신호 LLM 호출: signal_strength={signal_strength:.3f}")
+            return True
+        
+        # 조건 2: edgar_event == True OR regime == 'vol_spike' (기존 조건 유지)
         if not edgar_event and regime != 'vol_spike':
-            logger.debug(f"LLM 호출 조건 불충족: edgar_event={edgar_event}, regime={regime}")
+            logger.debug(f"LLM 호출 조건 불충족: edgar_event={edgar_event}, regime={regime}, signal_strength={signal_strength:.3f}")
             return False
         
         # 조건 2: RTH(정규장) 시간대만 허용 (09:30-16:00 ET) — RTH_ONLY=true일 때만 적용
@@ -142,21 +148,22 @@ class LLMInsightEngine:
         logger.debug(f"RTH 체크: {et_time.strftime('%Y-%m-%d %H:%M:%S %Z')} = {is_rth}")
         return is_rth
     
-    def analyze_text(self, text: str, source: str = "", edgar_event: bool = False, regime: str = None) -> Optional[LLMInsight]:
+    def analyze_text(self, text: str, source: str = "", edgar_event: bool = False, regime: str = None, signal_strength: float = 0.0) -> Optional[LLMInsight]:
         """
-        텍스트 분석 (호출 조건 제한 적용)
+        텍스트 분석 (호출 조건 제한 적용, Phase 1.5: 강신호 지원)
         
         Args:
             text: 분석할 텍스트 (≤1000자)
             source: 소스 URL (캐시 키용)
             edgar_event: EDGAR 이벤트 여부
             regime: 현재 레짐
+            signal_strength: 신호 강도 (0.70+ 강신호)
             
         Returns:
             LLMInsight: 분석 결과 (None if 실패 또는 조건 불충족)
         """
-        # LLM 호출 조건 확인
-        if not self.should_call_llm(edgar_event, regime):
+        # LLM 호출 조건 확인 (강신호 지원 추가)
+        if not self.should_call_llm(edgar_event, regime, signal_strength):
             logger.debug(f"LLM 호출 스킵: edgar_event={edgar_event}, regime={regime}")
             return None
         

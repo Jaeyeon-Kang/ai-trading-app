@@ -98,6 +98,53 @@ celery_app.conf.beat_schedule = {
         "task": "app.jobs.scheduler.adaptive_cutoff",
         "schedule": crontab(hour=20, minute=55),  # 05:55 KST = 20:55 UTC 전날
     },
+    
+    # =============================================================================
+    # Phase 1.5: 일일 브리핑 시스템 (답답함 해소!)
+    # =============================================================================
+    
+    # 아침 브리핑 (09:00 KST = 00:00 UTC)
+    "morning-briefing": {
+        "task": "app.jobs.daily_briefing.send_scheduled_briefing",
+        "schedule": crontab(hour=0, minute=0),  # 09:00 KST
+        "args": ["morning"],
+    },
+    
+    # 점심 브리핑 (12:30 KST = 03:30 UTC)  
+    "midday-briefing": {
+        "task": "app.jobs.daily_briefing.send_scheduled_briefing",
+        "schedule": crontab(hour=3, minute=30),  # 12:30 KST
+        "args": ["midday"],
+    },
+    
+    # 저녁 브리핑 (18:00 KST = 09:00 UTC)
+    "evening-briefing": {
+        "task": "app.jobs.daily_briefing.send_scheduled_briefing",
+        "schedule": crontab(hour=9, minute=0),  # 18:00 KST
+        "args": ["evening"],
+    },
+    
+    # 조용한 시장 체크 (1시간마다, 9-18시 KST만)
+    "quiet-market-check": {
+        "task": "app.jobs.daily_briefing.check_and_send_quiet_message",
+        "schedule": crontab(minute=0),  # 매 정시마다
+    },
+    
+    # =============================================================================
+    # Phase 1.5: 스마트 페이퍼 트레이딩 시스템
+    # =============================================================================
+    
+    # 스톱로스/익절 주문 체크 (5분마다)
+    "check-stop-orders": {
+        "task": "app.jobs.paper_trading_manager.check_stop_orders",
+        "schedule": crontab(minute="*/5"),  # 5분마다
+    },
+    
+    # 일일 성과 리포트 (저녁 19:00 KST = 10:00 UTC)
+    "daily-paper-report": {
+        "task": "app.jobs.paper_trading_manager.send_daily_report", 
+        "schedule": crontab(hour=10, minute=0),  # 19:00 KST
+    },
 }
 
 # 전역 변수 (실제로는 의존성 주입 사용)
@@ -317,7 +364,7 @@ def pipeline_e2e(self):
                 
                 # 3. 시세 데이터 가져오기 (간단한 모의 데이터)
                 candles = get_mock_candles(ticker)
-                indicators = get_mock_indicators(ticker)
+                get_mock_indicators(ticker)
                 
                 # 4. 레짐 감지
                 regime_result = regime_detector.detect_regime(candles)
@@ -504,6 +551,98 @@ def format_slack_message(signal) -> Dict:
         "blocks": blocks
     }
 
+def format_enhanced_slack_message(signal, llm_insight) -> Dict:
+    """LLM 분석이 포함된 향상된 슬랙 메시지 포맷 (Phase 1.5)"""
+    import os
+    import json
+    
+    # 기본 정보
+    signal.regime.upper().replace("_", "")
+    action_ko = "롱" if signal.signal_type.value == "long" else "숏"
+    
+    # 신뢰도 이모지
+    confidence_emoji = {5: "🎯", 4: "👍", 3: "🤔", 2: "⚠️", 1: "😅"}
+    confidence_level = min(5, max(1, round(signal.confidence * 5)))
+    
+    # LLM 향상된 메인 메시지
+    main_text = f"""💭 **{signal.ticker} 새로운 기회 발견!**
+
+{confidence_emoji[confidence_level]} **AI 판단**: {action_ko} 추천 ({signal.score:+.2f}점)
+🎯 **AI 분석**: {llm_insight.summary}"""
+
+    # 상세 정보 (더 친근하게)
+    detail_text = f"""💡 **트레이딩 제안**:
+• 진입가: ${signal.entry_price:.2f}
+• 손절선: ${signal.stop_loss:.2f} (리스크 관리)
+• 목표가: ${signal.take_profit:.2f} (수익 기대)
+
+🧠 **AI가 본 이유**: {llm_insight.trigger}
+⏰ **예상 지속시간**: {signal.horizon_minutes}분
+
+어떻게 하시겠어요?"""
+
+    # 블록 구성
+    blocks = [
+        {
+            "type": "section", 
+            "text": {"type": "mrkdwn", "text": main_text}
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": detail_text}
+        }
+    ]
+    
+    # 버튼 추가 (기존 로직 재사용)
+    show_buttons = (
+        os.getenv("SEMI_AUTO_BUTTONS", "0").lower() in ("1", "true", "yes", "on") or
+        os.getenv("AUTO_MODE", "0").lower() in ("1", "true", "yes", "on")
+    )
+    
+    if show_buttons:
+        button_text = "매수" if signal.signal_type.value == "long" else "매도"
+        order_payload = json.dumps({
+            "ticker": signal.ticker,
+            "action": signal.signal_type.value,
+            "entry_price": signal.entry_price,
+            "stop_loss": signal.stop_loss,
+            "take_profit": signal.take_profit,
+            "signal_score": signal.score,
+            "llm_analysis": {
+                "sentiment": llm_insight.sentiment,
+                "trigger": llm_insight.trigger,
+                "summary": llm_insight.summary
+            }
+        })
+        
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": f"✅ {button_text}"},
+                    "style": "primary",
+                    "value": order_payload,
+                    "action_id": "execute_trade"
+                },
+                {
+                    "type": "button", 
+                    "text": {"type": "plain_text", "text": "❌ 건너뛰기"},
+                    "value": "skip",
+                    "action_id": "skip_trade"
+                }
+            ]
+        })
+    
+    # 채널 설정
+    channel = os.getenv("SLACK_CHANNEL_ID", "#trading-signals")
+    
+    return {
+        "channel": channel,
+        "text": f"🤖 AI 추천: {signal.ticker} {action_ko} {signal.score:+.2f}점",
+        "blocks": blocks
+    }
+
 @celery_app.task(bind=True, name="app.jobs.scheduler.generate_signals")
 def generate_signals(self):
     """시그널 생성 작업"""
@@ -546,7 +685,7 @@ def generate_signals(self):
                 logger.warning(f"redis_streams 생성 실패: {e}")
         
         quotes_ingestor = trading_components["quotes_ingestor"]
-        edgar_scanner = trading_components["edgar_scanner"]
+        trading_components["edgar_scanner"]
         regime_detector = trading_components["regime_detector"]
         tech_score_engine = trading_components["tech_score_engine"]
         llm_engine = trading_components["llm_engine"]
@@ -892,13 +1031,12 @@ def generate_signals(self):
                     from app.engine.risk import rolling_var95
                     # 샘플은 별도 곳에서 채워진다고 가정; 없으면 스킵
                     rurl = os.getenv("REDIS_URL")
-                    var_guard = False
                     if rurl:
                         r = redis.from_url(rurl)
                         key = f"risk:rets:{ticker}:{regime_result.regime.value}"
                         samples = [float(x) for x in (r.lrange(key, 0, 9999) or [])]
                         if samples:
-                            var95 = rolling_var95(samples)
+                            rolling_var95(samples)
                             # 간이 기준: 예상 손실R>VaR이면 억제
                             # 여기서는 신호 생성 후 컷오프 단계에서 suppress
                             pass
@@ -957,7 +1095,7 @@ def generate_signals(self):
                     }
                     
                     logger.info(f"🔥 [DEBUG] 시그널 생성됨! ticker={ticker}, type={signal.signal_type.value}, score={signal.score:.3f}, cut={cut:.3f}")
-                    logger.info(f"🔥 [DEBUG] Redis 스트림 발행 시도 중...")
+                    logger.info("🔥 [DEBUG] Redis 스트림 발행 시도 중...")
                     
                     try:
                         redis_streams.publish_signal(signal_data)
@@ -970,12 +1108,82 @@ def generate_signals(self):
                             is_strong_signal = abs(signal.score) >= strong_signal_threshold
                             
                             if is_strong_signal:
-                                logger.info(f"📢 Slack 전송 (강신호): {ticker} score={signal.score:.3f} >= {strong_signal_threshold:.3f}")
+                                logger.info(f"📢 강신호 감지: {ticker} score={signal.score:.3f} >= {strong_signal_threshold:.3f}")
+                                
+                                # Phase 1.5: 강신호 시 LLM 분석 추가!
+                                enhanced_llm_insight = None
+                                if llm_engine:
+                                    try:
+                                        # 강신호를 위한 LLM 분석 프롬프트
+                                        strong_signal_text = f"""
+강신호 감지: {ticker}
+점수: {signal.score:.3f} ({signal.signal_type.value})
+레짐: {signal.regime}
+기술점수: {signal.tech_score:.3f}
+트리거: {signal.trigger}
+
+이 강신호에 대한 상세 분석과 친근한 설명을 제공해주세요.
+                                        """.strip()
+                                        
+                                        enhanced_llm_insight = llm_engine.analyze_text(
+                                            text=strong_signal_text,
+                                            source=f"strong_signal_{ticker}",
+                                            edgar_event=False,
+                                            regime=signal.regime,
+                                            signal_strength=abs(signal.score)  # 강신호 strength 전달!
+                                        )
+                                        
+                                        if enhanced_llm_insight:
+                                            logger.info(f"🤖 강신호 LLM 분석 완료: {ticker}")
+                                            logger.info(f"  - 감성: {enhanced_llm_insight.sentiment:.2f}")
+                                            logger.info(f"  - 트리거: {enhanced_llm_insight.trigger}")
+                                            logger.info(f"  - 요약: {enhanced_llm_insight.summary}")
+                                        
+                                    except Exception as llm_e:
+                                        logger.warning(f"강신호 LLM 분석 실패: {ticker} - {llm_e}")
+                                
                                 try:
-                                    slack_message = format_slack_message(signal)
+                                    # 기존 메시지나 LLM 향상된 메시지 사용
+                                    if enhanced_llm_insight:
+                                        # LLM 분석이 있으면 더 친근한 메시지로 포맷
+                                        # Phase 1.5: 신호 검증 시스템 적용!
+                                        validated_signal = signal
+                                        try:
+                                            from app.jobs.signal_validation import SignalValidationEngine
+                                            validation_engine = SignalValidationEngine()
+                                            validation_result = validation_engine.validate_signal(signal)
+                                            
+                                            if validation_result:
+                                                validated_signal = validation_engine.apply_validation_result(signal, validation_result)
+                                                logger.info(f"🔍 신호 검증 완료: {ticker} - {'✅통과' if validation_result.should_proceed else '🛑거부'}")
+                                                
+                                                # 검증 거부된 신호는 전송하지 않음
+                                                if not validation_result.should_proceed:
+                                                    logger.info(f"suppressed=validation_rejected ticker={ticker} reason={validation_result.validation_reason}")
+                                                    continue
+                                        except Exception as val_e:
+                                            logger.warning(f"신호 검증 실패: {ticker} - {val_e}")
+                                        
+                                        slack_message = format_enhanced_slack_message(validated_signal, enhanced_llm_insight)
+                                    else:
+                                        # 기존 메시지 사용
+                                        slack_message = format_slack_message(signal)
                                     result = slack_bot.send_message(slack_message)
                                     if result:
                                         logger.info(f"✅ Slack 전송 성공: {ticker} (카운터는 이미 전치 체크에서 증가됨)")
+                                        
+                                        # Phase 1.5: 페이퍼 트레이딩 자동 실행!
+                                        try:
+                                            from app.jobs.paper_trading_manager import get_paper_trading_manager
+                                            paper_manager = get_paper_trading_manager()
+                                            
+                                            execution_result = paper_manager.execute_signal(validated_signal)
+                                            if execution_result:
+                                                logger.info(f"📊 페이퍼 트레이딩 실행: {ticker}")
+                                            else:
+                                                logger.info(f"📊 페이퍼 트레이딩 스킵: {ticker}")
+                                        except Exception as paper_e:
+                                            logger.warning(f"페이퍼 트레이딩 실행 실패: {ticker} - {paper_e}")
                                     else:
                                         # Slack 전송 실패 시 카운터 롤백 (전치 체크에서 이미 증가했으므로)
                                         try:
@@ -1172,6 +1380,7 @@ def scan_edgar(self):
             published += 1
             
             # 중요 공시 LLM 처리
+            llm_engine = trading_components.get("llm_engine")
             if filing.get("impact_score", 0) > 0.7 and llm_engine:
                 llm_insight = llm_engine.analyze_edgar_filing(filing)
                 if llm_insight:
@@ -1577,13 +1786,14 @@ def adaptive_cutoff():
             dsn = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
             if dsn:
                 import psycopg2
-                from datetime import date, timedelta
+                from datetime import timedelta
                 conn = psycopg2.connect(dsn)
                 cur = conn.cursor()
                 prev = (datetime.utcnow() - timedelta(days=1)).date()
                 cur.execute("SELECT COUNT(*) FROM orders_paper WHERE DATE(ts)=%s", (prev,))
                 fills = int(cur.fetchone()[0] or 0)
-                cur.close(); conn.close()
+                cur.close()
+                conn.close()
         except Exception:
             fills = 0
         # 현재값 읽기
