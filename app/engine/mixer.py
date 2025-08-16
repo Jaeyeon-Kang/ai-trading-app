@@ -149,7 +149,7 @@ class SignalMixer:
         
         # 쿨다운 체크: 동일 티커 60초 내 재신호는 점수 개선 시에만
         if not self._check_cooldown(ticker, final_score):
-            logger.debug(f"쿨다운 제한: {ticker} (점수 개선 없음)")
+            logger.info(f"suppressed=mixer_cooldown ticker={ticker} score={final_score:.3f}")
             return None
         
         # 신호 타입 결정 (임계는 설정 주입)
@@ -233,17 +233,19 @@ class SignalMixer:
         return False
     
     def _check_cooldown(self, ticker: str, current_score: float) -> bool:
-        """쿨다운 체크: 점수 개선 시에만 통과"""
+        """쿨다운 체크: 절대개선폭 + 시간쿨다운 동시 만족"""
         if ticker not in self.last_signal_by_ticker:
             return True
         
         last_time, last_score = self.last_signal_by_ticker[ticker]
         time_diff = (datetime.now() - last_time).total_seconds()
         
-        # 쿨다운 시간 내에 있으면 점수 개선 확인
+        # 쿨다운 시간 내에 있으면 절대개선폭 확인
         if time_diff < self.cooldown_seconds:
-            score_improvement = current_score - last_score
-            if score_improvement < self.cool_improve_min:  # 설정값 이상 개선이어야 함
+            # 절대개선폭 = abs(현재점수) - abs(이전점수)
+            abs_improvement = abs(current_score) - abs(last_score)
+            if abs_improvement < self.cool_improve_min:
+                logger.debug(f"쿨다운 제한: {ticker} 절대개선폭 {abs_improvement:.3f} < {self.cool_improve_min:.3f} 또는 시간 {time_diff:.1f}s < {self.cooldown_seconds}s")
                 return False
         
         return True

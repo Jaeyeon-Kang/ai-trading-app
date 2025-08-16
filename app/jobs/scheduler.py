@@ -2,7 +2,7 @@
 Celery beat 스케줄러
 15-30초 주기로 시그널 생성 및 거래 실행
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -422,13 +422,86 @@ def get_mock_tech_score(ticker: str):
     )
 
 def format_slack_message(signal) -> Dict:
-    """Slack 메시지 포맷"""
+    """슬랙 메시지 포맷 (가격/버튼/상태정보 포함)"""
+    import os
+    import json
+    
+    # 기본 메시지 텍스트
+    regime_display = signal.regime.upper().replace("_", "")
+    score_sign = "+" if signal.score >= 0 else ""
+    action = "long" if signal.signal_type.value == "long" else "short"
+    action_ko = "롱" if action == "long" else "숏"
+    
+    # 메인 메시지
+    main_text = (
+        f"{signal.ticker} | 레짐 {regime_display}({signal.confidence:.2f}) | "
+        f"점수 {score_sign}{signal.score:.2f} {action_ko}"
+    )
+    
+    # 디테일 라인
+    detail_text = (
+        f"제안: 진입 {signal.entry_price:.2f} / "
+        f"손절 {signal.stop_loss:.2f} / 익절 {signal.take_profit:.2f}\n"
+        f"이유: {signal.trigger} (<={signal.horizon_minutes}m)"
+    )
+    
+    # 버튼 생성 여부 확인 (반자동 모드)
+    show_buttons = (
+        os.getenv("SEMI_AUTO_BUTTONS", "0").lower() in ("1", "true", "yes", "on") or
+        os.getenv("AUTO_MODE", "0").lower() in ("1", "true", "yes", "on")
+    )
+    
+    # 블록 구성
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{main_text}*"}
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": detail_text}
+        }
+    ]
+    
+    # 버튼 추가 (반자동 모드일 때)
+    if show_buttons:
+        button_text = "매수" if action == "long" else "매도"
+        order_payload = json.dumps({
+            "ticker": signal.ticker,
+            "side": "buy" if action == "long" else "sell",
+            "entry": signal.entry_price,
+            "sl": signal.stop_loss,
+            "tp": signal.take_profit,
+            "qty": int(os.getenv("DEFAULT_QTY", "1"))
+        })
+        
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": f"✅ {button_text}", "emoji": True},
+                    "style": "primary",
+                    "value": order_payload,
+                    "action_id": "approve_trade"
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "❌ 패스", "emoji": True},
+                    "style": "danger",
+                    "value": f"reject_{signal.ticker}_{signal.signal_type.value}_{signal.timestamp.timestamp()}",
+                    "action_id": "reject_trade"
+                }
+            ]
+        })
+    
+    # 첫 번째 채널 우선, 두 번째는 폴백 (channel_not_found 오류 해결)
+    channel = os.getenv("SLACK_CHANNEL_ID") or "C099CQP8CJ3"
+    
     return {
-        "channel": "C099CQP8CJ3",  # 🔧 명시적으로 채널 ID 지정 (channel_not_found 오류 해결)
-        "text": (
-            f"{signal.ticker} | 레짐 {signal.regime.upper()}({signal.confidence:.2f}) | "
-            f"점수 {signal.score:+.2f} {'롱' if signal.signal_type.value == 'long' else '숏'}"
-        )
+        "channel": channel,
+        "text": main_text,
+        "blocks": blocks
     }
 
 @celery_app.task(bind=True, name="app.jobs.scheduler.generate_signals")
@@ -739,44 +812,79 @@ def generate_signals(self):
                 spread_bp = float(indicators.get("spread_bp", 0.0))
                 suppress_reason = None
                 
-                # RTH 일일 상한 (5건 목표)
+                # RTH 일일 상한 (5건 목표) - 원자적 전치 체크
                 if session_label == "RTH":
                     try:
                         if rurl:
                             r = redis.from_url(rurl)
                             rth_daily_cap = int(os.getenv("RTH_DAILY_CAP", "5"))
-                            day_key = f"dailycap:{datetime.utcnow():%Y%m%d}:RTH:{ticker}"
-                            used = int(r.get(day_key) or 0)
-                            if used >= rth_daily_cap:
+                            # ET 기준 날짜 키 (UTC-5, DST 간이 적용)
+                            et_tz = timezone(timedelta(hours=-5))
+                            now_et = datetime.now(et_tz)
+                            # DST 간이 적용 (3월-11월)
+                            if 3 <= now_et.month <= 11:
+                                et_tz = timezone(timedelta(hours=-4))
+                                now_et = datetime.now(et_tz)
+                            day_key = f"dailycap:{now_et:%Y%m%d}:RTH:{ticker}"
+                            # 원자적 체크-증가: INCR 후 결과로 판단
+                            current_count = r.incr(day_key)
+                            r.expire(day_key, 86400)  # ET EOD 만료 (24시간)
+                            if current_count > rth_daily_cap:
+                                # 상한 초과 시 카운터 롤백하고 억제
+                                r.decr(day_key)
                                 suppress_reason = "rth_daily_cap"
-                    except Exception:
+                                logger.info(f"RTH 일일상한 초과: {ticker} ({current_count-1}/{rth_daily_cap})")
+                    except Exception as e:
+                        logger.warning(f"RTH 일일상한 체크 실패: {e}")
                         pass
-                elif session_label == "EXT":
+                elif session_label in ["EXT", "CLOSED"]:  # CLOSED도 EXT 로직 적용
+                    # EXT 세션 판별 및 억제 이유 로그 수집
+                    logger.info(f"EXT 세션 체크: {ticker} ext_enabled={ext_enabled} dvol5m={dvol5m:.0f} spread_bp={spread_bp:.1f}")
+                    
                     if not ext_enabled:
                         suppress_reason = "ext_disabled"
-                    if dvol5m < float(os.getenv("EXT_MIN_DOLLAR_VOL_5M", "50000")):
-                        suppress_reason = suppress_reason or "low_dvol"
-                    if spread_bp > float(os.getenv("EXT_MAX_SPREAD_BP", "300")):
-                        suppress_reason = suppress_reason or "wide_spread"
-                    # 쿨다운/일일 상한 체크: Redis 키 사용
+                        logger.info(f"suppressed=ext_disabled ticker={ticker} session=EXT")
+                    elif dvol5m < float(os.getenv("EXT_MIN_DOLLAR_VOL_5M", "50000")):
+                        suppress_reason = "low_dvol"
+                        logger.info(f"suppressed=low_dvol ticker={ticker} session=EXT dvol5m={dvol5m:.0f} min={os.getenv('EXT_MIN_DOLLAR_VOL_5M', '50000')}")
+                    elif spread_bp > float(os.getenv("EXT_MAX_SPREAD_BP", "300")):
+                        suppress_reason = "wide_spread"
+                        logger.info(f"suppressed=wide_spread ticker={ticker} session=EXT spread_bp={spread_bp:.1f} max={os.getenv('EXT_MAX_SPREAD_BP', '300')}")
+                    # 쿨다운/일일 상한 체크: Redis 키 사용 (원자적 처리)
                     try:
-                        if rurl:
+                        if rurl and not suppress_reason:  # 이미 억제 사유가 있으면 스킵
                             r = redis.from_url(rurl)
                             cool_min = int(os.getenv("EXT_COOLDOWN_MIN", "7"))
-                            daily_cap = 3
+                            daily_cap = int(os.getenv("EXT_DAILY_CAP", "3"))
                             now_ts = int(time.time())
                             cd_key = f"cooldown:{ticker}"
+                            
+                            # 쿨다운 체크
                             last_ts = int(r.get(cd_key) or 0)
                             if now_ts - last_ts < cool_min * 60:
-                                suppress_reason = suppress_reason or "cooldown"
-                            day_key = f"dailycap:{datetime.utcnow():%Y%m%d}:{ticker}"
-                            used = int(r.get(day_key) or 0)
-                            if used >= daily_cap:
-                                suppress_reason = suppress_reason or "daily_cap"
-                            if not suppress_reason:
-                                # 통과 시 다음 카운팅을 위해 임시 마킹(실제 Slack 전송 시 최종 증가 권장)
-                                r.setex(cd_key, cool_min*60, now_ts)
-                    except Exception:
+                                suppress_reason = "cooldown"
+                                logger.info(f"EXT 쿨다운: {ticker} ({now_ts - last_ts}s < {cool_min*60}s)")
+                            else:
+                                # ET 기준 날짜 키
+                                et_tz = timezone(timedelta(hours=-5))
+                                now_et = datetime.now(et_tz)
+                                if 3 <= now_et.month <= 11:
+                                    et_tz = timezone(timedelta(hours=-4))
+                                    now_et = datetime.now(et_tz)
+                                day_key = f"dailycap:{now_et:%Y%m%d}:EXT:{ticker}"
+                                
+                                # 원자적 체크-증가
+                                current_count = r.incr(day_key)
+                                r.expire(day_key, 86400)
+                                if current_count > daily_cap:
+                                    r.decr(day_key)  # 롤백
+                                    suppress_reason = "ext_daily_cap"
+                                    logger.info(f"EXT 일일상한 초과: {ticker} ({current_count-1}/{daily_cap})")
+                                else:
+                                    # 통과 시 쿨다운 마킹
+                                    r.setex(cd_key, cool_min*60, now_ts)
+                    except Exception as e:
+                        logger.warning(f"EXT 쿨다운/상한 체크 실패: {e}")
                         pass
 
                 # VaR95 경량 가드: 최근 리턴 샘플 기반(옵션)
@@ -812,8 +920,9 @@ def generate_signals(self):
                     # 컷오프 적용 (세션별)
                     cut = cutoff_rth if session_label == "RTH" else cutoff_ext
                     if abs(signal.score) < cut or suppress_reason:
-                        # 억제 사유 상세 로그
-                        logger.info(f"억제: reason={suppress_reason or 'below_cutoff'} "
+                        # 억제 사유 통일 형식 로그
+                        actual_reason = suppress_reason or "below_cutoff"
+                        logger.info(f"suppressed={actual_reason} ticker={ticker} session={session_label} "
                                    f"score={signal.score:.3f} cut={cut:.3f} dvol5m={dvol5m:.0f} spread_bp={spread_bp:.1f}")
                         
                         # 억제 메트릭 누적
@@ -821,7 +930,7 @@ def generate_signals(self):
                             if rurl:
                                 r = redis.from_url(rurl)
                                 hkey = f"metrics:suppressed:{datetime.utcnow():%Y%m%d}"
-                                r.hincrby(hkey, suppress_reason or "below_cutoff", 1)
+                                r.hincrby(hkey, actual_reason, 1)
                         except Exception:
                             pass
                         # 최근 신호 리스트에 suppressed로 기록
@@ -866,24 +975,56 @@ def generate_signals(self):
                                     slack_message = format_slack_message(signal)
                                     result = slack_bot.send_message(slack_message)
                                     if result:
-                                        logger.info(f"✅ Slack 전송 성공: {ticker}")
-                                        # 일일 상한 카운터 증가
+                                        logger.info(f"✅ Slack 전송 성공: {ticker} (카운터는 이미 전치 체크에서 증가됨)")
+                                    else:
+                                        # Slack 전송 실패 시 카운터 롤백 (전치 체크에서 이미 증가했으므로)
                                         try:
                                             if rurl:
                                                 r = redis.from_url(rurl)
                                                 if session_label == "RTH":
-                                                    day_key = f"dailycap:{datetime.utcnow():%Y%m%d}:RTH:{ticker}"
-                                                    r.incr(day_key)
-                                                    r.expire(day_key, 86400)  # 24시간 만료
+                                                    et_tz = timezone(timedelta(hours=-5))
+                                                    now_et = datetime.now(et_tz)
+                                                    if 3 <= now_et.month <= 11:
+                                                        et_tz = timezone(timedelta(hours=-4))
+                                                        now_et = datetime.now(et_tz)
+                                                    day_key = f"dailycap:{now_et:%Y%m%d}:RTH:{ticker}"
+                                                    r.decr(day_key)
                                                 elif session_label == "EXT":
-                                                    day_key = f"dailycap:{datetime.utcnow():%Y%m%d}:EXT:{ticker}"
-                                                    r.incr(day_key)
-                                                    r.expire(day_key, 86400)  # 24시간 만료
+                                                    et_tz = timezone(timedelta(hours=-5))
+                                                    now_et = datetime.now(et_tz)
+                                                    if 3 <= now_et.month <= 11:
+                                                        et_tz = timezone(timedelta(hours=-4))
+                                                        now_et = datetime.now(et_tz)
+                                                    day_key = f"dailycap:{now_et:%Y%m%d}:EXT:{ticker}"
+                                                    r.decr(day_key)
+                                                logger.info(f"Slack 전송 실패로 카운터 롤백: {ticker}")
                                         except Exception as e:
-                                            logger.warning(f"일일 상한 카운터 업데이트 실패: {e}")
-                                    else:
+                                            logger.warning(f"카운터 롤백 실패: {e}")
                                         logger.error(f"❌ Slack 전송 실패: {ticker}")
                                 except Exception as e:
+                                    # 예외 발생 시에도 카운터 롤백
+                                    try:
+                                        if rurl:
+                                            r = redis.from_url(rurl)
+                                            if session_label == "RTH":
+                                                et_tz = timezone(timedelta(hours=-5))
+                                                now_et = datetime.now(et_tz)
+                                                if 3 <= now_et.month <= 11:
+                                                    et_tz = timezone(timedelta(hours=-4))
+                                                    now_et = datetime.now(et_tz)
+                                                day_key = f"dailycap:{now_et:%Y%m%d}:RTH:{ticker}"
+                                                r.decr(day_key)
+                                            elif session_label == "EXT":
+                                                et_tz = timezone(timedelta(hours=-5))
+                                                now_et = datetime.now(et_tz)
+                                                if 3 <= now_et.month <= 11:
+                                                    et_tz = timezone(timedelta(hours=-4))
+                                                    now_et = datetime.now(et_tz)
+                                                day_key = f"dailycap:{now_et:%Y%m%d}:EXT:{ticker}"
+                                                r.decr(day_key)
+                                            logger.info(f"Slack 전송 예외로 카운터 롤백: {ticker}")
+                                    except Exception as rollback_e:
+                                        logger.warning(f"카운터 롤백 실패: {rollback_e}")
                                     logger.error(f"❌ Slack 전송 예외: {ticker} - {e}")
                             else:
                                 logger.info(f"🔇 Slack 전송 억제 (약신호): {ticker} score={signal.score:.3f} < {strong_signal_threshold:.3f}")
@@ -1233,12 +1374,19 @@ def _session_label() -> str:
     dst_end = now_est.replace(month=11, day=1 + (6 - now_est.replace(month=11, day=1).weekday()) % 7, hour=2)
     if dst_start <= now_est < dst_end:
         et_tz = timezone(timedelta(hours=-4))
+        
     now = datetime.now(et_tz).time()
+    session = None
     if dtime(9,30) <= now <= dtime(16,0):
-        return "RTH"
-    if dtime(4,0) <= now <= dtime(20,0):
-        return "EXT"
-    return "CLOSED"
+        session = "RTH"
+    elif dtime(4,0) <= now <= dtime(20,0):
+        session = "EXT"
+    else:
+        session = "CLOSED"
+    
+    # 세션 판별 로그 (디버그 목적)
+    logger.debug(f"session={session} et_time={now} dst_active={dst_start <= now_est < dst_end}")
+    return session
 
 def _record_recent_signal(redis_url: Optional[str], signal, session_label: str, indicators: Dict, suppressed: Optional[str] = None) -> None:
     try:

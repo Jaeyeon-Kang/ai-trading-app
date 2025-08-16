@@ -183,8 +183,83 @@ UNIVERSE_MAX=120
 
 ---
 
+## 16. MSFT 중복 메시지 스팸 문제 (2025-08-16)
+**문제**: Docker 재빌드 후에도 MSFT 동일 메시지가 계속 Slack으로 반복 전송됨
+```
+MSFT | 레짐 VOLSPIKE(0.61) | 점수 -0.59 숏
+제안: 진입 417.13 / 손절 425.39 / 익절 409.29
+이유: 변동성 급등(<=60m)
+```
+
+**근본 원인 분석**:
+1. **현재 세션**: CLOSED (장외시간 - ET 22:14)
+2. **EXT 일일상한**: MSFT가 이미 23회 전송 (상한 3회 초과)
+3. **핵심 버그**: CLOSED 세션에서 EXT 일일상한 체크가 실행되지 않음
+
+**상세 조사 과정**:
+1. **Redis 상태 확인**:
+   - `dailycap:20250815:EXT:MSFT = 23` (상한 초과)
+   - 쿨다운 키들은 정상 존재
+   - 문제는 일일상한 로직 미실행
+
+2. **로그 분석**:
+   - Mixer 레벨에서만 `suppressed=mixer_cooldown` 발생
+   - EXT 세션 체크 로그가 전혀 없음
+   - 세션이 "CLOSED"로 인식됨
+
+3. **코드 분석 (`app/jobs/scheduler.py:815-888`)**: 
+   ```python
+   if session_label == "RTH":
+       # RTH 일일상한 체크
+   elif session_label == "EXT":
+       # EXT 일일상한 체크 
+   # CLOSED 세션은 처리되지 않음!
+   ```
+
+**해결 과정**:
+
+**1단계**: 디버그 로그 추가
+```python
+logger.info(f"🔍 [DEBUG] 세션별 체크 시작: {ticker} session={session_label} ext_enabled={ext_enabled}")
+logger.info(f"🔍 [DEBUG] 믹싱 전 상태: {ticker} suppress_reason={suppress_reason}")
+logger.info(f"🔍 [DEBUG] 컷오프 체크: {ticker} score={signal.score:.3f} cut={cut:.3f} suppress_reason={suppress_reason}")
+```
+
+**2단계**: 세션 조건 수정
+```python
+# 기존
+elif session_label == "EXT":
+
+# 수정 후  
+elif session_label in ["EXT", "CLOSED"]:  # CLOSED도 EXT 로직 적용
+```
+
+**3단계**: timezone import 오류 해결
+```python
+# 오류: name 'timezone' is not defined
+from datetime import datetime, timedelta, timezone  # timezone 추가
+```
+
+**최종 결과**:
+- ✅ MSFT 메시지 중단: `suppress_reason=ext_daily_cap`
+- ✅ EXT 일일상한 정상 작동: 로그에서 확인됨
+- ✅ CLOSED 세션도 EXT 로직 적용
+- ✅ Slack 스팸 완전 차단
+
+**수정된 파일들**:
+- `app/jobs/scheduler.py`: 세션 조건 및 timezone import
+
+**교훈**:
+- CLOSED 세션도 장외시간이므로 EXT 로직을 적용해야 함
+- 세션별 일일상한 체크가 핵심 스팸 방지 메커니즘
+- Mixer 쿨다운은 2차 방어선이지만 근본 해결책은 아님
+- import 오류로 인한 예외 처리가 중요함
+
+---
+
 ## 최종 상태
 - **테스트 폭주 모드**: ✅ 완전 성공
 - **중간 모드**: ✅ 성공 (moderate 설정)
 - **보수적 모드**: ✅ 성공 (conservative 설정)
 - **본판 복귀**: ✅ 완료 (오버라이드 제거, 깨끗한 상태)
+- **MSFT 스팸 문제**: ✅ 완전 해결 (2025-08-16)
