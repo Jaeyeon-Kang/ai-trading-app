@@ -904,9 +904,7 @@ def generate_signals(self):
                                         except Exception as e:
                                             logger.error(f"🔥 [SCALP DEBUG] 스캘프 Redis 발행 실패: {ticker} - {e}")
                                     except Exception as e:
-                                        logger.error(f"🔥 [SCALP DEBUG] 스캘프 Redis 발행 실패: {ticker} - {e}")
-                                    # 스캘프 모드에선 한 틱만 잡으면 충분 — 다음 종목으로
-                                    continue
+                                            logger.error(f"🔥 [SCALP DEBUG] 스캘프 Redis 발행 실패: {ticker} - {e}")
                 except Exception:
                     pass
 
