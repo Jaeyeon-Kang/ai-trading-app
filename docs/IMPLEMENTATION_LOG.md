@@ -17,3 +17,16 @@
 4.  **Commit**: Committed the code and documentation changes to the repository.
 5.  **Rebuild & Restart**: Performed a no-cache build (`docker compose build --no-cache`) and restarted all services (`docker compose up -d`).
 6.  **Verification**: Confirmed all containers are in a stable `running` state.
+
+### Issue: Celery Worker/Beat Containers in Restart Loop (Second Attempt)
+
+- **Symptom**: After the initial fix, `celery_beat` and `celery_worker` services were still restarting.
+- **Diagnosis**: Checked container logs again using `docker compose logs celery_worker` and `docker compose logs celery_beat`.
+- **Root Cause**: The previous fix was not correctly applied due to an issue with the `replace` tool. A `SyntaxError: invalid syntax` was still present in `app/jobs/scheduler.py` due to a misplaced `except` block.
+- **Resolution**: Correctly removed the misplaced `except` block by overwriting the file with the corrected content using the `write_file` tool.
+
+### Action: System Recovery (Second Attempt)
+
+1.  **Code Fix**: Applied the fix to `app/jobs/scheduler.py` using `write_file`.
+2.  **Rebuild & Restart**: Performed a no-cache build (`docker compose build --no-cache`) and restarted all services (`docker compose up -d`).
+3.  **Verification**: Confirmed all containers are in a stable `running` state using `docker compose ps`.

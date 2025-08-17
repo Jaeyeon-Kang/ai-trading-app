@@ -550,7 +550,7 @@ def format_slack_message(signal) -> Dict:
     detail_text = (
         f"제안: 진입 {signal.entry_price:.2f} / "
         f"손절 {signal.stop_loss:.2f} / 익절 {signal.take_profit:.2f}\n"
-        f"이유: {signal.trigger} (<={signal.horizon_minutes}m)"
+        f"이유: {signal.trigger} (<= {signal.horizon_minutes}m)"
     )
     
     # 버튼 생성 여부 확인 (반자동 모드)
@@ -626,13 +626,15 @@ def format_enhanced_slack_message(signal, llm_insight) -> Dict:
     confidence_level = min(5, max(1, round(signal.confidence * 5)))
     
     # LLM 향상된 메인 메시지
-    main_text = f"""💭 **{signal.ticker} 새로운 기회 발견!**
+    main_text = f"""
+💭 **{signal.ticker} 새로운 기회 발견!**
 
 {confidence_emoji[confidence_level]} **AI 판단**: {action_ko} 추천 ({signal.score:+.2f}점)
 🎯 **AI 분석**: {llm_insight.summary}"""
 
     # 상세 정보 (더 친근하게)
-    detail_text = f"""💡 **트레이딩 제안**:
+    detail_text = f"""
+💡 **트레이딩 제안**:
 • 진입가: ${signal.entry_price:.2f}
 • 손절선: ${signal.stop_loss:.2f} (리스크 관리)
 • 목표가: ${signal.take_profit:.2f} (수익 기대)
@@ -897,13 +899,11 @@ def generate_signals(self):
                                             "horizon_minutes": quick_signal.horizon_minutes,
                                             "timestamp": quick_signal.timestamp.isoformat()
                                         })
-                                        logger.info(f"🔥 [SCALP DEBUG] Redis 스트림 발행 성공: {ticker}")
-                                        signals_generated += 1
-                                        _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators)
-                                        logger.info(f"스캘프 신호: {ticker} {quick_signal.signal_type.value} ({trig_reason}, abs_ret {last_abs_ret:.2%}, range {last_range:.2%})")
+                                            logger.info(f"🔥 [SCALP DEBUG] Redis 스트림 발행 성공: {ticker}")
+                                            signals_generated += 1
+                                            _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators)
+                                            logger.info(f"스캘프 신호: {ticker} {quick_signal.signal_type.value} ({trig_reason}, abs_ret {last_abs_ret:.2%}, range {last_range:.2%})")
                                         except Exception as e:
-                                            logger.error(f"🔥 [SCALP DEBUG] 스캘프 Redis 발행 실패: {ticker} - {e}")
-                                    except Exception as e:
                                             logger.error(f"🔥 [SCALP DEBUG] 스캘프 Redis 발행 실패: {ticker} - {e}")
                 except Exception:
                     pass
@@ -982,13 +982,13 @@ def generate_signals(self):
                                                 "horizon_minutes": quick_signal.horizon_minutes,
                                                 "timestamp": quick_signal.timestamp.isoformat()
                                             })
-                                            logger.info(f"🔥 [3MIN DEBUG] Redis 스트림 발행 성공: {ticker}")
-                                            signals_generated += 1
-                                            _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators)
-                                            logger.info(f"스캘프 신호: {ticker} long (3min_3up)")
-                                        except Exception as e:
-                                            logger.error(f"🔥 [3MIN DEBUG] 3분3상승 Redis 발행 실패: {ticker} - {e}")
-                                        continue
+                                                logger.info(f"🔥 [3MIN DEBUG] Redis 스트림 발행 성공: {ticker}")
+                                                signals_generated += 1
+                                                _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators)
+                                                logger.info(f"스캘프 신호: {ticker} long (3min_3up)")
+                                            except Exception as e:
+                                                logger.error(f"🔥 [3MIN DEBUG] 3분3상승 Redis 발행 실패: {ticker} - {e}")
+                                            continue
                 except Exception:
                     pass
 
@@ -1203,7 +1203,7 @@ def generate_signals(self):
 트리거: {signal.trigger}
 
 이 강신호에 대한 상세 분석과 친근한 설명을 제공해주세요.
-                                        """.strip()
+                                        """
                                         
                                         enhanced_llm_insight = llm_engine.analyze_text(
                                             text=strong_signal_text,
@@ -1372,7 +1372,7 @@ def update_quotes(self):
         try:
             if os.getenv("QUOTE_LOG_VERBOSE", "false").lower() in ("1", "true", "yes", "on"):
                 for _t, _d in (market_data or {}).items():
-                    _ind = _d.get("indicators", {}) if isinstance(_d, dict) else {}
+                    _ind = _d.get("indicators", {})
                     _px = float(_d.get("current_price", 0.0) or 0.0)
                     _dv = float(_ind.get("dollar_vol_5m", 0.0) or 0.0)
                     _sp = float(_ind.get("spread_bp", 0.0) or 0.0)
