@@ -71,12 +71,28 @@ class AlpacaPaperTrading:
         logger.info(f"알파카 페이퍼 계정 연결: 잔고 ${float(self.account.cash):,.2f}")
     
     def is_market_open(self) -> bool:
-        """시장이 열려있는지 확인"""
+        """시장이 열려있는지 확인 (추가 안전장치 포함)"""
         try:
+            # 1. 알파카 시계 확인
             clock = self.trading_client.get_clock()
+            logger.info(f"🕐 알파카 시계: {clock.timestamp}, 시장 상태: {'열림' if clock.is_open else '닫힘'}")
+            logger.info(f"🌅 다음 개장: {clock.next_open}, 다음 폐장: {clock.next_close}")
+            
+            # 2. 추가 안전장치: 주말 체크 (미국 동부시간 기준)
+            from datetime import datetime
+            us_time = clock.timestamp
+            weekday = us_time.weekday()  # 0=월요일, 6=일요일
+            
+            if weekday in [5, 6]:  # 토요일, 일요일
+                logger.warning(f"⚠️  주말 감지 (요일: {weekday}), 시장 강제 닫힘 처리")
+                return False
+            
+            # 3. 알파카 API 결과 반환
             return clock.is_open
+            
         except Exception as e:
-            logger.error(f"시장 상태 확인 실패: {e}")
+            logger.error(f"❌ 시장 상태 확인 실패: {e}")
+            # 안전을 위해 알 수 없으면 시장이 닫혀있다고 가정
             return False
 
     def submit_market_order(self, ticker: str, side: str, quantity: int, 
@@ -96,7 +112,12 @@ class AlpacaPaperTrading:
         """
         try:
             # 주문 전 시장 상태 확인
-            if not self.is_market_open():
+            logger.info(f"🔍 {ticker} {side} 주문 전 시장 상태 확인...")
+            market_open = self.is_market_open()
+            logger.info(f"📊 시장 상태 확인 결과: {'열림' if market_open else '닫힘'}")
+            
+            if not market_open:
+                logger.warning(f"❌ {ticker} {side} 주문 차단: 시장이 닫혀있음")
                 raise Exception("Market is closed")
 
             # 주문 요청 생성

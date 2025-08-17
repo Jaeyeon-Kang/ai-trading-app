@@ -1,0 +1,304 @@
+# 🔧 GPT-5 전략 구현 로그
+
+> **시작일**: 2025년 8월 17일  
+> **목표**: GPT-5 권장사항 완전 구현  
+> **전략**: 위험% 기반 동시 비교 트레이딩  
+
+---
+
+## 📅 구현 타임라인
+
+### Day 1 (2025-08-17): 전략 수립 및 설계 ✅
+
+#### 완료사항
+- [x] GPT-5 깊은 추론 분석 완료
+- [x] 켈리 기준 및 몬테카를로 시뮬레이션 결과 확인
+- [x] 최종 전략 문서화 (`FINAL_TRADING_STRATEGY.md`)
+- [x] 구현 로드맵 수립
+- [x] `RiskManager` 클래스 기본 구조 완성
+
+#### 핵심 인사이트
+```
+🎯 GPT-5 핵심 발견:
+1. 손절 1.5% 구조가 만드는 숨겨진 안전마진
+2. 켈리 기준: 34.3% vs 실제 제약 1.5%
+3. 현재 제안들 모두 켈리의 1/100 수준으로 과도하게 보수적
+4. 0.5% 위험/트레이드도 파산확률 ≈0%
+
+📊 최적 전략:
+- 동시 비교 (A계좌 30만원 vs B계좌 70만원)
+- 0.5% 위험/트레이드 시작점
+- 동시위험 2% 캡
+- 최소 50-75건 데이터 수집
+```
+
+#### 다음 작업
+- [ ] `RiskManager` 완전 구현
+- [ ] 기존 시스템과 연동
+- [ ] 테스트 및 검증
+
+---
+
+### Day 2 (2025-08-18): 리스크 관리 시스템 구현
+
+#### 목표
+- [ ] `risk_manager.py` 완성
+- [ ] 포지션 사이징 공식 적용: `size = (0.5% * equity) / 1.5%`
+- [ ] 동시위험 모니터링 (2% 캡)
+- [ ] 일일 손실 한도 (2%)
+- [ ] 기존 거래 로직 연동
+
+#### 구현 상세
+
+##### 1. RiskManager 클래스 ✅
+```python
+파일: app/engine/risk_manager.py
+기능:
+- calculate_position_size(): 위험% 기반 사이징
+- check_concurrent_risk(): 동시위험 2% 캡
+- check_daily_loss_limit(): 일일 2% 한도
+- should_allow_trade(): 종합 리스크 체크
+```
+
+##### 2. 다음 구현 항목
+```python
+[ ] AlpacaAdapter에 리스크 체크 연동
+[ ] TradingSignal에 position_size 필드 추가  
+[ ] Slack 알림에 리스크 정보 포함
+[ ] 포트폴리오 API에 리스크 지표 추가
+```
+
+#### 테스트 계획
+```python
+테스트 시나리오:
+1. 정상 포지션 사이징 계산
+2. 동시위험 한도 초과시 거부
+3. 일일 손실 한도 도달시 중지
+4. 여러 포지션 동시 관리
+```
+
+---
+
+### Day 3-4: 시스템 연동 및 테스트
+
+#### 목표
+- [ ] 리스크 관리자를 모든 거래 경로에 연동
+- [ ] A/B 계좌 분리 로직 구현
+- [ ] 실시간 위험 모니터링 대시보드
+- [ ] 첫 번째 통합 테스트
+
+#### 연동 포인트
+```python
+1. app/adapters/trading_adapter.py
+   - submit_market_order() 전에 리스크 체크
+
+2. app/io/slack_bot.py  
+   - 버튼 클릭시 리스크 정보 표시
+
+3. app/api/portfolio.py
+   - 실시간 위험 지표 API 추가
+
+4. app/jobs/scheduler.py
+   - 신호 생성시 리스크 pre-check
+```
+
+---
+
+### Week 1 (8/19-8/23): 실전 테스트 시작
+
+#### Phase 1.1: 시스템 검증 (Day 1-2)
+```
+목표: 페이퍼 트레이딩으로 시스템 안정성 확인
+설정:
+- BROKER=alpaca_paper 유지  
+- A계좌: $225, 0.3% 위험
+- B계좌: $525, 0.5% 위험
+- 목표: 10-15건 거래로 기본 검증
+```
+
+#### Phase 1.2: 실거래 전환 (Day 3-5)  
+```
+목표: 실제 자금으로 전환
+조건: 페이퍼 테스트 성공시
+설정:
+- BROKER=alpaca 전환
+- 실제 자금 투입
+- 목표: 20-30건 추가 거래
+```
+
+#### 주간 목표
+- [ ] 총 30-50건 거래 데이터 수집
+- [ ] 리스크 시스템 실전 검증
+- [ ] 슬리피지 실제 측정
+- [ ] LLM 게이트 기본 구현
+
+---
+
+### Week 2 (8/26-8/30): 최적화 및 데이터 수집
+
+#### 목표
+- [ ] 총 50-75건 거래 달성
+- [ ] 통계적 유의성 확보
+- [ ] A vs B 계좌 성과 비교
+- [ ] Phase 2 전략 결정
+
+#### 고도화 기능
+```python
+1. LLM 게이트 고도화:
+   - 키워드 기반 위험 조정
+   - 호라이즌 매핑 자동화
+
+2. 동적 사이징:
+   - 성과 기반 위험% 조정
+   - 베이지안 업데이트
+
+3. 고급 리포트:
+   - 레짐별 성과 분석
+   - 시간대별 패턴 분석
+```
+
+---
+
+## 🛠️ 기술 구현 상세
+
+### 핵심 공식
+```python
+# 1. 포지션 사이징 (GPT-5 권장)
+position_size = (risk_per_trade * equity) / stop_loss_distance
+# 예: (0.5% * $10,000) / 1.5% = 3,333주가치 ÷ 주가 = 실제주수
+
+# 2. 동시위험 한도
+total_risk = sum(position.risk_pct for position in positions)
+allow_trade = total_risk + new_risk <= 0.02  # 2%
+
+# 3. 일일 손실 한도  
+daily_loss_pct = (start_equity - current_equity) / start_equity
+allow_trade = daily_loss_pct <= 0.02  # 2%
+```
+
+### 데이터 스키마 확장
+```sql
+-- 리스크 지표 테이블
+CREATE TABLE risk_metrics (
+    id SERIAL PRIMARY KEY,
+    date DATE NOT NULL,
+    account_type VARCHAR(20), -- 'conservative' or 'recommended'
+    equity DECIMAL(15,2),
+    daily_pnl DECIMAL(15,2),
+    daily_pnl_pct DECIMAL(8,4),
+    max_concurrent_risk DECIMAL(8,4),
+    trades_count INTEGER,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- 포지션 리스크 테이블
+CREATE TABLE position_risks (
+    id SERIAL PRIMARY KEY,
+    trade_id VARCHAR(50),
+    ticker VARCHAR(10),
+    entry_price DECIMAL(10,4),
+    stop_loss DECIMAL(10,4),
+    position_size INTEGER,
+    risk_amount DECIMAL(15,2),
+    risk_pct DECIMAL(8,4),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+---
+
+## 📊 성과 추적
+
+### 일일 체크리스트
+```
+[ ] 아침: 전일 성과 리뷰
+[ ] 시장 개장전: 리스크 한도 확인
+[ ] 거래중: 실시간 위험 모니터링
+[ ] 장마감후: 일일 리포트 생성
+[ ] 저녁: 다음날 전략 검토
+```
+
+### 주간 리뷰 항목
+```
+📈 성과 지표:
+- A vs B 계좌 위험조정 수익률
+- 승률 + 95% 신뢰구간
+- Profit Factor
+- 최대 드로다운
+- 평균 보유시간
+
+🔍 시스템 지표:
+- 리스크 시스템 작동률
+- 슬리피지 평균값
+- LLM 호출 정확도
+- 오류 발생률
+
+🎯 학습 지표:
+- 레짐별 성과 차이
+- 시간대별 패턴
+- LLM vs 비LLM 기여도
+- 개선 포인트 도출
+```
+
+---
+
+## 🚨 리스크 모니터링
+
+### 자동 알림 조건
+```python
+⚠️ 경고 레벨:
+- 동시위험 > 1.6% (80% 수준)
+- 일일 손실 > 1.6%
+- 연속 손실 > 3거래
+
+🚨 중지 레벨:
+- 동시위험 > 2.0%
+- 일일 손실 > 2.0%  
+- 연속 손실 > 5거래
+- 시스템 오류 > 10%
+```
+
+### 수동 개입 기준
+```
+📞 즉시 연락:
+- 주간 손실 > 6%
+- 알 수 없는 시스템 오류
+- 알파카 API 장애
+- 예상치 못한 큰 슬리피지
+
+🛑 전면 중단:
+- 월간 손실 > 15%
+- 시스템 해킹 의심
+- 규제 변경
+- 심각한 버그 발견
+```
+
+---
+
+## 📝 개발 노트
+
+### 코드 품질 기준
+```python
+1. 모든 리스크 관련 함수는 단위 테스트 필수
+2. 로깅: INFO 레벨로 모든 리스크 결정 기록
+3. 예외 처리: 안전한 기본값으로 fallback
+4. 문서화: 수학적 공식과 근거 명시
+```
+
+### 성능 요구사항
+```python
+1. 리스크 체크: < 100ms
+2. 포지션 사이징 계산: < 50ms  
+3. 일일 손실 체크: < 10ms
+4. 메모리 사용량: < 100MB 추가
+```
+
+---
+
+**다음 업데이트**: Day 2 (2025-08-18) 저녁 예정  
+**담당자**: Claude + 인간 파트너  
+**검토자**: GPT-5 권장사항 기준  
+
+---
+
+*이 로그는 실시간으로 업데이트되며, 모든 구현 과정과 의사결정 근거를 기록합니다.*
