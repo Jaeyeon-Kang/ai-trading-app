@@ -31,6 +31,9 @@ python-dateutil==2.8.2
 # LLM
 openai==1.99.6
 
+# Alpaca Trading API
+alpaca-py==0.42.0
+
 # 코드 품질 도구
 ruff==0.8.5  # Python linter + formatter (매우 빠름)
 black==24.10.0  # 코드 포매터 (백업용)

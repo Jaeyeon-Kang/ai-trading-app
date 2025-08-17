@@ -613,25 +613,43 @@ class SlackBot:
             except Exception:
                 order_json = None
             if order_json and approved:
-                # 서버로 직접 페이퍼 주문 호출 시도 (내부 API)
-                api_url = os.getenv("API_BASE_URL") or "http://localhost:8000"
+                # 알파카 페이퍼 트레이딩 실행
                 try:
-                    with httpx.Client(timeout=5) as client:
-                        resp = client.post(
-                            f"{api_url}/orders/paper",
-                            json={
-                                "ticker": order_json.get("ticker"),
-                                "side": order_json.get("side"),
-                                "qty": int(order_json.get("qty", 1)),
-                                "entry": float(order_json.get("entry", 0.0)),
-                                "sl": float(order_json.get("sl", 0.0)),
-                                "tp": float(order_json.get("tp", 0.0))
-                            }
-                        )
-                        if resp.status_code >= 400:
-                            logger.error(f"내부 주문 API 실패: {resp.text}")
+                    from app.adapters.trading_adapter import get_trading_adapter
+                    
+                    trading_adapter = get_trading_adapter()
+                    
+                    # 거래 실행
+                    trade = trading_adapter.submit_market_order(
+                        ticker=order_json.get("ticker"),
+                        side=order_json.get("side"),
+                        quantity=int(order_json.get("qty", 1)),
+                        signal_id=order_json.get("signal_id"),
+                        meta={
+                            "source": "slack_button",
+                            "entry_price": float(order_json.get("entry", 0.0)),
+                            "stop_loss": float(order_json.get("sl", 0.0)),
+                            "take_profit": float(order_json.get("tp", 0.0))
+                        }
+                    )
+                    
+                    logger.info(f"알파카 거래 성공: {trade.ticker} {trade.side} {trade.quantity}주 @ ${trade.price:.2f}")
+                    
+                    # 성공 메시지 전송
+                    success_msg = f"✅ **거래 체결 완료**\n\n"
+                    success_msg += f"📊 **{trade.ticker}** {trade.side.upper()} {trade.quantity}주\n"
+                    success_msg += f"💰 **체결가**: ${trade.price:.2f}\n"
+                    success_msg += f"🕐 **체결시간**: {trade.timestamp.strftime('%H:%M:%S')}\n"
+                    success_msg += f"🆔 **거래ID**: {trade.trade_id}"
+                    
+                    self.send_message({"text": success_msg})
+                    
                 except Exception as e:
-                    logger.error(f"내부 주문 API 호출 오류: {e}")
+                    logger.error(f"알파카 거래 실행 실패: {e}")
+                    error_msg = f"❌ **거래 실행 실패**\n\n"
+                    error_msg += f"📊 **{order_json.get('ticker')}** {order_json.get('side').upper()}\n"
+                    error_msg += f"❌ **오류**: {str(e)}"
+                    self.send_message({"text": error_msg})
             
             # 이후 기존 콜백/확인 메시지 로직
             parts = value.split("_")

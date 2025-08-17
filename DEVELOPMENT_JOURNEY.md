@@ -112,6 +112,7 @@ SCALP_MIN_RANGE: "0.0001"
 **원인**: `SlackBot.send_message()`에 문자열 대신 딕셔너리 전달 필요
 **해결**: `{"text": message_text}` 형태로 전달
 
+
 ### 13. Git 관리 오류
 **문제**: 린트 결과가 자동으로 커밋됨
 **원인**: `git add .`로 모든 변경사항 포함
@@ -120,6 +121,7 @@ SCALP_MIN_RANGE: "0.0001"
 git add app/jobs/scheduler.py app/hooks/autoinit.py app/io/streams.py compose.override.moderate.yml
 git restore .
 ```
+
 
 ### 14. 환경변수 우선순위 문제
 **문제**: `.env` 파일의 공격적 설정이 오버라이드 파일보다 우선됨
@@ -183,6 +185,7 @@ UNIVERSE_MAX=120
 
 ---
 
+
 ## 16. MSFT 중복 메시지 스팸 문제 (2025-08-16)
 **문제**: Docker 재빌드 후에도 MSFT 동일 메시지가 계속 Slack으로 반복 전송됨
 ```
@@ -207,7 +210,7 @@ MSFT | 레짐 VOLSPIKE(0.61) | 점수 -0.59 숏
    - EXT 세션 체크 로그가 전혀 없음
    - 세션이 "CLOSED"로 인식됨
 
-3. **코드 분석 (`app/jobs/scheduler.py:815-888`)**: 
+3. **코드 분석 (`app/jobs/scheduler.py:815-888`)**:
    ```python
    if session_label == "RTH":
        # RTH 일일상한 체크
@@ -263,3 +266,43 @@ from datetime import datetime, timedelta, timezone  # timezone 추가
 - **보수적 모드**: ✅ 성공 (conservative 설정)
 - **본판 복귀**: ✅ 완료 (오버라이드 제거, 깨끗한 상태)
 - **MSFT 스팸 문제**: ✅ 완전 해결 (2025-08-16)
+
+---
+
+## 17. 알파카 연동 및 주문 타임아웃 디버깅 (2025-08-17)
+**문제**: 알파카 페이퍼 트레이딩 연동 후, 테스트 주문(`POST /portfolio/order`) 시 API가 응답하지 않고 `500 Internal Server Error`와 함께 `주문 체결 타임아웃` 오류 발생
+
+**근본 원인 분석**:
+1. **시장 상태 미확인**: 코드가 주문을 제출하기 전에 실제 주식 시장의 개장 여부를 확인하지 않음.
+2. **잘못된 대기 로직**: `_wait_for_fill` 함수는 주문 상태가 `filled`(체결)가 될 때까지 무조건 대기함.
+3. **주말 상황**: 일요일에 테스트를 진행하여 시장이 닫혀 있었기 때문에, 시장가 주문은 `accepted`(접수) 상태로만 남고 `filled` 상태가 될 수 없어 항상 타임아웃 발생.
+
+**상세 조사 과정**:
+1. **로그 확인**: `docker compose logs trading_bot_api`를 통해 `주문 ... 체결 타임아웃` 경고 및 `알파카 주문 실패` 오류 확인.
+2. **코드 분석**: `app/adapters/alpaca_paper_trading.py`의 `submit_market_order`와 `_wait_for_fill` 함수를 분석하여 위 원인 확정.
+3. **Docker 동기화 문제**: `replace`로 코드를 수정하고 `docker compose restart`만으로는 변경사항이 컨테이너에 반영되지 않는 문제 발견. 이는 Docker의 볼륨 마운트나 캐시 문제로 추정됨.
+
+**해결 과정**:
+
+**1단계**: 시장 개장 여부 확인 로직 추가
+- `alpaca_paper_trading.py`에 `is_market_open` 함수를 추가하여 알파카 API의 `get_clock()`을 통해 시장 상태를 확인하도록 함.
+
+**2단계**: 주문 전 시장 상태 체크
+- `submit_market_order` 함수 맨 앞에 `if not self.is_market_open(): raise Exception("Market is closed")` 구문을 추가하여, 시장이 닫혔을 경우 주문을 시도하지 않고 즉시 명확한 오류를 발생시키도록 수정.
+
+**3단계**: Docker 이미지 강제 재빌드
+- 코드 변경사항을 확실히 적용하기 위해 아래 명령어를 순차적으로 실행:
+  ```bash
+  docker compose down
+  docker compose build --no-cache
+  docker compose up -d
+  ```
+
+**최종 결과**:
+- ✅ API 호출 시 `{"detail":"Market is closed"}` 라는 명확한 JSON 응답을 즉시 반환함.
+- ✅ 서버 로그에 `ERROR:app.adapters.alpaca_paper_trading:알파카 주문 실패 AAPL buy: Market is closed` 와 같이 타임아웃 대신 정확한 원인이 기록됨.
+- ✅ 주말에도 안정적으로 오류를 처리하여 시스템 안정성 향상.
+
+**교훈**:
+- 외부 API와 연동할 때는 API의 상태(e.g., 시장 개장 여부)를 먼저 확인하는 방어 코드가 필수적임.
+- Docker 컨테이너에 코드 변경이 반영되지 않을 때는 `restart` 대신 `down` -> `build --no-cache` -> `up`으로 확실하게 재빌드해야 함.

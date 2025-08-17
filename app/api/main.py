@@ -52,6 +52,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 포트폴리오 API 라우터 등록
+from app.api.portfolio import router as portfolio_router
+app.include_router(portfolio_router)
+
 # Pydantic 모델들
 class HealthResponse(BaseModel):
     status: str

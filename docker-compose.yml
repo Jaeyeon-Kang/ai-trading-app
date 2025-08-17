@@ -48,7 +48,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://trading_bot_user:${POSTGRES_PASSWORD:-trading_bot_password}@postgres:5432/trading_bot
       - REDIS_URL=redis://redis:6379/0
-      - BROKER=${BROKER:-kis}
+      - BROKER=${BROKER:-alpaca_paper}
       - AUTO_MODE=${AUTO_MODE:-0}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - LLM_MONTHLY_CAP_KRW=${LLM_MONTHLY_CAP_KRW:-80000}
@@ -86,7 +86,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://trading_bot_user:${POSTGRES_PASSWORD:-trading_bot_password}@postgres:5432/trading_bot
       - REDIS_URL=redis://redis:6379/0
-      - BROKER=${BROKER:-kis}
+      - BROKER=${BROKER:-alpaca_paper}
       - AUTO_MODE=${AUTO_MODE:-0}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - LLM_MONTHLY_CAP_KRW=${LLM_MONTHLY_CAP_KRW:-80000}
@@ -115,7 +115,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://trading_bot_user:${POSTGRES_PASSWORD:-trading_bot_password}@postgres:5432/trading_bot
       - REDIS_URL=redis://redis:6379/0
-      - BROKER=${BROKER:-kis}
+      - BROKER=${BROKER:-alpaca_paper}
       - AUTO_MODE=${AUTO_MODE:-0}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - LLM_MONTHLY_CAP_KRW=${LLM_MONTHLY_CAP_KRW:-80000}
