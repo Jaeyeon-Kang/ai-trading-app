@@ -901,6 +901,8 @@ def generate_signals(self):
                                         signals_generated += 1
                                         _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators)
                                         logger.info(f"스캘프 신호: {ticker} {quick_signal.signal_type.value} ({trig_reason}, abs_ret {last_abs_ret:.2%}, range {last_range:.2%})")
+                                        except Exception as e:
+                                            logger.error(f"🔥 [SCALP DEBUG] 스캘프 Redis 발행 실패: {ticker} - {e}")
                                     except Exception as e:
                                         logger.error(f"🔥 [SCALP DEBUG] 스캘프 Redis 발행 실패: {ticker} - {e}")
                                     # 스캘프 모드에선 한 틱만 잡으면 충분 — 다음 종목으로
