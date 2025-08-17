@@ -1,0 +1,30 @@
+# Git
+.git
+.gitignore
+
+# Python
+venv/
+*.pyc
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# Docker
+Dockerfile
+docker-compose.yml
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Logs and secrets
+logs/
+*.log
+.env
+*.env.*
+!env.example
+!.env.example
+
+# Node
+node_modules/
