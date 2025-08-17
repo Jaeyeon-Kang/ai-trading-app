@@ -619,28 +619,43 @@ class SlackBot:
                     
                     trading_adapter = get_trading_adapter()
                     
-                    # 거래 실행
+                    # 리스크 기반 거래 실행 (GPT-5 권장사항)
                     trade = trading_adapter.submit_market_order(
                         ticker=order_json.get("ticker"),
                         side=order_json.get("side"),
-                        quantity=int(order_json.get("qty", 1)),
+                        quantity=None,  # 리스크 기반 자동 계산
                         signal_id=order_json.get("signal_id"),
                         meta={
                             "source": "slack_button",
-                            "entry_price": float(order_json.get("entry", 0.0)),
-                            "stop_loss": float(order_json.get("sl", 0.0)),
-                            "take_profit": float(order_json.get("tp", 0.0))
-                        }
+                            "user_approved": True
+                        },
+                        entry_price=float(order_json.get("entry", 0.0)),
+                        stop_loss=float(order_json.get("sl", 0.0)),
+                        confidence=float(order_json.get("confidence", 1.0))
                     )
                     
                     logger.info(f"알파카 거래 성공: {trade.ticker} {trade.side} {trade.quantity}주 @ ${trade.price:.2f}")
                     
-                    # 성공 메시지 전송
+                    # 리스크 정보 포함 성공 메시지 전송
                     success_msg = f"✅ **거래 체결 완료**\n\n"
                     success_msg += f"📊 **{trade.ticker}** {trade.side.upper()} {trade.quantity}주\n"
                     success_msg += f"💰 **체결가**: ${trade.price:.2f}\n"
+                    success_msg += f"💵 **거래금액**: ${trade.quantity * trade.price:,.0f}\n"
                     success_msg += f"🕐 **체결시간**: {trade.timestamp.strftime('%H:%M:%S')}\n"
-                    success_msg += f"🆔 **거래ID**: {trade.trade_id}"
+                    
+                    # 리스크 정보 추가 (GPT-5 권장)
+                    if trade.meta and trade.meta.get('risk_based_sizing'):
+                        risk_pct = trade.meta.get('risk_pct', 0)
+                        concurrent_risk = trade.meta.get('concurrent_risk', 0)
+                        confidence = trade.meta.get('confidence', 1.0)
+                        
+                        success_msg += f"\n🛡️ **리스크 정보**:\n"
+                        success_msg += f"• 포지션 위험: {risk_pct:.2%}\n"
+                        success_msg += f"• 총 동시위험: {concurrent_risk:.2%}/2.0%\n"
+                        success_msg += f"• 신호 신뢰도: {confidence:.1%}\n"
+                        success_msg += f"• 사이징: GPT-5 권장 공식 적용"
+                    
+                    success_msg += f"\n🆔 **거래ID**: {trade.trade_id}"
                     
                     self.send_message({"text": success_msg})
                     

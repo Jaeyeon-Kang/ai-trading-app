@@ -18,11 +18,72 @@ from celery import Celery
 from celery.schedules import crontab
 from celery.signals import beat_init, task_prerun, worker_process_init, worker_ready
 
+# GPT-5 리스크 관리 통합
+try:
+    from app.engine.risk_manager import get_risk_manager
+    from app.adapters.trading_adapter import get_trading_adapter
+    RISK_MANAGER_AVAILABLE = True
+except ImportError:
+    RISK_MANAGER_AVAILABLE = False
+    logger.warning("⚠️ 리스크 관리자 import 실패 - 기본 모드로 동작")
+
 from app.config import settings, get_signal_cutoffs, sanitize_cutoffs_in_redis
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def check_signal_risk_feasibility(signal, session_label):
+    """
+    신호 발행 전 리스크 체크 (GPT-5 권장)
+    동시위험 한도를 초과할 가능성이 있는 신호는 사전 필터링
+    
+    Returns:
+        Tuple[bool, str]: (허용 여부, 사유)
+    """
+    if not RISK_MANAGER_AVAILABLE:
+        return True, "리스크 관리자 비활성화"
+    
+    try:
+        # 현재 포트폴리오 상태 확인
+        trading_adapter = get_trading_adapter()
+        portfolio = trading_adapter.get_portfolio_summary()
+        positions = trading_adapter.get_positions()
+        
+        # 현재 총 위험 계산
+        equity = portfolio.get('equity', 0)
+        if equity <= 0:
+            return False, "계좌 자산 확인 불가"
+        
+        current_risk = 0
+        for pos in positions:
+            # 각 포지션 위험 (1.5% 손절 가정)
+            stop_distance = pos.avg_price * 0.015
+            pos_risk = abs(pos.quantity * stop_distance) / equity
+            current_risk += pos_risk
+        
+        # 신규 신호의 예상 위험 (0.5% 기본값)
+        risk_manager = get_risk_manager()
+        expected_new_risk = risk_manager.config.risk_per_trade
+        
+        # 동시위험 한도 체크 (2%)
+        total_risk = current_risk + expected_new_risk
+        max_risk = risk_manager.config.max_concurrent_risk
+        
+        if total_risk > max_risk:
+            return False, f"동시위험 한도 초과 예상: {total_risk:.2%} > {max_risk:.2%}"
+        
+        # 포지션 수 체크
+        if len(positions) >= risk_manager.config.max_positions:
+            return False, f"최대 포지션 수 도달: {len(positions)}/{risk_manager.config.max_positions}"
+        
+        logger.info(f"✅ {signal.ticker} 리스크 pre-check 통과: 현재 {current_risk:.2%} + 예상 {expected_new_risk:.2%} = {total_risk:.2%}")
+        return True, f"리스크 허용: {total_risk:.2%}/{max_risk:.2%}"
+        
+    except Exception as e:
+        logger.error(f"❌ 리스크 pre-check 실패: {e}")
+        # 안전을 위해 체크 실패시에도 허용 (기존 동작 유지)
+        return True, f"리스크 체크 오류로 기본 허용"
 
 # Celery 앱 생성
 celery_app = Celery(
@@ -811,9 +872,15 @@ def generate_signals(self):
                                     logger.info(f"🔥 [SCALP DEBUG] 스캘프 신호 억제: {ticker} score={quick_signal.score:.3f} < cut={cut:.3f}")
                                     _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators, suppressed="below_cutoff")
                                 else:
-                                    logger.info(f"🔥 [SCALP DEBUG] 스캘프 신호 발행: {ticker} {quick_signal.signal_type.value} score={quick_signal.score:.3f}")
-                                    try:
-                                        redis_streams.publish_signal({
+                                    # GPT-5 리스크 pre-check 추가
+                                    risk_ok, risk_reason = check_signal_risk_feasibility(quick_signal, sess_now)
+                                    if not risk_ok:
+                                        logger.warning(f"🛡️ [RISK] 스캘프 신호 리스크 차단: {ticker} - {risk_reason}")
+                                        _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators, suppressed=f"risk_check: {risk_reason}")
+                                    else:
+                                        logger.info(f"🔥 [SCALP DEBUG] 스캘프 신호 발행: {ticker} {quick_signal.signal_type.value} score={quick_signal.score:.3f} | 리스크: {risk_reason}")
+                                        try:
+                                            redis_streams.publish_signal({
                                             "ticker": quick_signal.ticker,
                                             "signal_type": quick_signal.signal_type.value,
                                             "score": quick_signal.score,
@@ -891,9 +958,14 @@ def generate_signals(self):
                                         logger.info(f"🔥 [3MIN DEBUG] 3분3상승 신호 억제: {ticker} score={quick_signal.score:.3f} < cut={cut:.3f}")
                                         _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators, suppressed="below_cutoff")
                                     else:
-                                        logger.info(f"🔥 [3MIN DEBUG] 3분3상승 신호 발행: {ticker} long score={quick_signal.score:.3f}")
-                                        try:
-                                            redis_streams.publish_signal({
+                                        # 리스크 사전 체크 (GPT-5 권장사항)
+                                        if not check_signal_risk_feasibility(quick_signal):
+                                            logger.warning(f"🛡️ {ticker} 3분3상승 신호 리스크 차단: 2% 동시위험 한도 초과")
+                                            _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators, suppressed="risk_limit")
+                                        else:
+                                            logger.info(f"🔥 [3MIN DEBUG] 3분3상승 신호 발행: {ticker} long score={quick_signal.score:.3f}")
+                                            try:
+                                                redis_streams.publish_signal({
                                                 "ticker": quick_signal.ticker,
                                                 "signal_type": quick_signal.signal_type.value,
                                                 "score": quick_signal.score,
@@ -1095,7 +1167,15 @@ def generate_signals(self):
                     }
                     
                     logger.info(f"🔥 [DEBUG] 시그널 생성됨! ticker={ticker}, type={signal.signal_type.value}, score={signal.score:.3f}, cut={cut:.3f}")
-                    logger.info("🔥 [DEBUG] Redis 스트림 발행 시도 중...")
+                    
+                    # GPT-5 리스크 pre-check 추가
+                    risk_ok, risk_reason = check_signal_risk_feasibility(signal, session_label)
+                    if not risk_ok:
+                        logger.warning(f"🛡️ [RISK] 신호 리스크 차단: {ticker} - {risk_reason}")
+                        _record_recent_signal(redis_url=redis_url, signal=signal, session_label=session_label, indicators=indicators, suppressed=f"risk_check: {risk_reason}")
+                        continue  # 이 신호는 건너뛰고 다음으로
+                    
+                    logger.info(f"🔥 [DEBUG] 리스크 체크 통과 - Redis 스트림 발행 시도: {ticker} | {risk_reason}")
                     
                     try:
                         redis_streams.publish_signal(signal_data)

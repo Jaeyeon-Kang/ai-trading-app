@@ -1,14 +1,18 @@
-# 미국 주식 자동매매 봇
+# 🤖 GPT-5 AI 알고리즘 트레이딩 시스템
 
-시드 100만원, 월 LLM 비용 8만원 이하로 운영 가능한 미국 주식 라이트/반자동 트레이딩봇입니다.
+> **GPT-5 Deep Reasoning 기반 완전 자동화 AI 트레이딩 플랫폼**  
+> **수학적으로 검증된 0.5% 거래당 위험, 2% 동시위험 한도**
 
-## 🎯 주요 특징
+**Kelly Criterion 분석과 몬테카를로 시뮬레이션을 바탕으로 설계된 차세대 AI 트레이딩 시스템입니다.**
 
-- **저비용 운영**: 월 8만원 이하 LLM 비용, 무료 데이터 소스 활용
-- **레짐 기반 전략**: Trend/Vol-Spike/Mean-Revert 상황별 동적 가중치
-- **EDGAR 오버라이드**: SEC 공시 기반 우선순위 시그널
-- **리스크 관리**: VaR95, 일일 손실 한도, 포지션 제한
-- **단계별 운영**: 라이트봇 → 반자동 → 완전자동
+## 🎯 GPT-5 핵심 특징
+
+- **🧮 수학적 정확성**: Kelly Criterion 34.3% 대비 68.6배 보수적 안전 마진
+- **🛡️ 리스크 관리**: 0.5% 거래당 위험, 2% 동시위험 한도 (GPT-5 권장)
+- **🤖 완전 자동화**: 신호 생성 → 리스크 체크 → 자동 거래 → 실시간 모니터링
+- **📊 실시간 AI 분석**: 30초봉 기반 Claude LLM + 기술적 분석 융합
+- **⚡ 마이크로서비스**: Docker 기반 확장 가능한 아키텍처
+- **🔄 프리/애프터마켓**: 24시간 거래 지원 (04:00-20:00 ET)
 
 ## 🏗️ 아키텍처
 
@@ -39,30 +43,48 @@
 - OpenAI API 키
 - Slack Bot Token
 
+## 📚 문서 (docs/ 폴더)
+
+| 문서 | 설명 | 용도 |
+|------|------|------|
+| **[시스템 아키텍처](docs/SYSTEM_ARCHITECTURE.md)** | 전체 시스템 동작 원리 | 시스템 이해 |
+| **[GPT-5 전략](docs/FINAL_TRADING_STRATEGY.md)** | GPT-5 수학적 분석 결과 | 전략 이해 |
+| **[구현 로그](docs/IMPLEMENTATION_LOG.md)** | 개발 과정 상세 기록 | 개발 참고 |
+| **[월요일 준비](docs/MONDAY_PREP.md)** | 실전 테스트 가이드 | 운영 가이드 |
+
 ## 🚀 빠른 시작
 
-### 1. 저장소 클론
+### 1. 저장소 클론 및 초기화
 ```bash
 git clone <repository-url>
 cd ai-trading-app
+
+# 월요일 실전 테스트 전 초기화 (권장)
+# docs/MONDAY_PREP.md 가이드 참조
 ```
 
-### 2. 환경변수 설정
+### 2. 환경변수 설정 (AUTO_MODE=1 권장)
 ```bash
 cp .env.example .env
-# .env 파일을 편집하여 실제 값 입력
+# 완전 자동화: AUTO_MODE=1
+# 알파카 페이퍼: BROKER=alpaca_paper (첫 테스트)
 ```
 
-### 3. Docker로 실행
+### 3. GPT-5 리스크 시스템 가동
 ```bash
-docker-compose up -d
+docker compose down
+docker compose build --no-cache
+docker compose up -d
 ```
 
-### 4. 서비스 확인
-- API: http://localhost:8000
-- Grafana: http://localhost:3000 (admin/admin)
-- pgAdmin: http://localhost:8080
-- Redis Commander: http://localhost:8081
+### 4. 실시간 모니터링
+```bash
+# 포트폴리오 리스크 확인
+curl http://localhost:8000/portfolio/summary | jq .data.risk_metrics
+
+# 실시간 로그 모니터링
+docker logs -f trading_bot_scheduler | grep "신호\|거래\|위험"
+```
 
 ## ⚙️ 설정
 

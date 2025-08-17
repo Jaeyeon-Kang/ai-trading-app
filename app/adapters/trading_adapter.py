@@ -1,6 +1,7 @@
 """
 트레이딩 어댑터 팩토리
 BROKER 설정에 따라 알파카 또는 기존 PaperLedger 선택
+GPT-5 권장 리스크 관리 시스템 통합
 """
 
 import os
@@ -8,6 +9,8 @@ import logging
 from typing import Protocol, Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from datetime import datetime
+
+from app.engine.risk_manager import get_risk_manager
 
 logger = logging.getLogger(__name__)
 
@@ -76,26 +79,113 @@ class TradingAdapterFactory:
             raise ValueError(f"지원하지 않는 브로커: {broker}")
 
 class AlpacaAdapter:
-    """알파카 어댑터 (통합 인터페이스)"""
+    """알파카 어댑터 (통합 인터페이스) - GPT-5 리스크 관리 통합"""
     
     def __init__(self, alpaca_client):
         self.client = alpaca_client
+        self.risk_manager = get_risk_manager()
     
-    def submit_market_order(self, ticker: str, side: str, quantity: int, 
-                           signal_id: str = None, meta: dict = None) -> UnifiedTrade:
-        """시장가 주문 제출"""
-        alpaca_trade = self.client.submit_market_order(ticker, side, quantity, signal_id, meta)
+    def submit_market_order(self, ticker: str, side: str, quantity: int = None, 
+                           signal_id: str = None, meta: dict = None,
+                           entry_price: float = None, stop_loss: float = None,
+                           confidence: float = 1.0) -> UnifiedTrade:
+        """
+        리스크 관리 기반 시장가 주문 제출
         
-        return UnifiedTrade(
-            trade_id=alpaca_trade.order_id,
-            ticker=alpaca_trade.ticker,
-            side=alpaca_trade.side,
-            quantity=alpaca_trade.quantity,
-            price=alpaca_trade.filled_price,
-            timestamp=alpaca_trade.filled_at,
-            signal_id=alpaca_trade.signal_id,
-            meta=alpaca_trade.meta
-        )
+        Args:
+            quantity: 지정시 기존 로직, None시 리스크 기반 계산
+            entry_price: 리스크 계산용 진입가 (None시 현재가 사용)
+            stop_loss: 손절가 (리스크 계산 필수)
+            confidence: 신호 신뢰도 (0-1)
+        """
+        try:
+            # 1. 현재 포트폴리오 정보 가져오기
+            portfolio = self.get_portfolio_summary()
+            current_positions = self.get_positions()
+            
+            # 2. 진입가 결정 (제공되지 않으면 현재가 사용)
+            if entry_price is None:
+                entry_price = self.client.get_current_price(ticker)
+                if entry_price is None:
+                    raise ValueError(f"현재가를 가져올 수 없음: {ticker}")
+            
+            # 3. 손절가 기본값 설정 (1.5% 손절)
+            if stop_loss is None:
+                if side.lower() == 'buy':
+                    stop_loss = entry_price * (1 - 0.015)  # 롱 포지션
+                else:
+                    stop_loss = entry_price * (1 + 0.015)  # 숏 포지션
+            
+            # 4. 수량이 지정되지 않으면 리스크 기반 계산
+            if quantity is None:
+                logger.info(f"🎯 {ticker} 리스크 기반 포지션 사이징 시작")
+                
+                # 신호 데이터 구성
+                signal_data = {
+                    'ticker': ticker,
+                    'entry_price': entry_price,
+                    'stop_loss': stop_loss,
+                    'confidence': confidence,
+                    'side': side
+                }
+                
+                # 현재 포트폴리오 데이터 구성
+                portfolio_data = {
+                    'equity': portfolio.get('equity', 0),
+                    'positions': [
+                        {
+                            'ticker': pos.ticker,
+                            'quantity': pos.quantity,
+                            'avg_price': pos.avg_price,
+                            'stop_loss': stop_loss,  # 기존 포지션도 동일 손절 가정
+                        }
+                        for pos in current_positions
+                    ],
+                    'initial_equity_today': portfolio.get('equity', 0)  # 임시값
+                }
+                
+                # 리스크 체크 및 포지션 크기 계산
+                allowed, risk_result = self.risk_manager.should_allow_trade(signal_data, portfolio_data)
+                
+                if not allowed:
+                    error_msg = risk_result.get('error', '알 수 없는 리스크 오류')
+                    logger.warning(f"❌ {ticker} 거래 차단: {error_msg}")
+                    raise ValueError(f"리스크 관리 차단: {error_msg}")
+                
+                # 계산된 포지션 크기 사용
+                quantity = risk_result.get('position_size', 1)
+                logger.info(f"📊 {ticker} 리스크 기반 포지션: {quantity}주 (위험 {risk_result.get('risk_info', {}).get('risk_pct', 0):.2%})")
+            
+            else:
+                logger.info(f"📌 {ticker} 고정 포지션 사용: {quantity}주")
+            
+            # 5. 실제 주문 실행
+            alpaca_trade = self.client.submit_market_order(ticker, side, quantity, signal_id, meta)
+            
+            # 6. 리스크 정보를 메타데이터에 추가
+            enhanced_meta = (meta or {}).copy()
+            if quantity is not None and 'risk_info' in locals() and 'risk_result' in locals():
+                enhanced_meta.update({
+                    'risk_based_sizing': True,
+                    'risk_pct': risk_result.get('risk_info', {}).get('risk_pct', 0),
+                    'concurrent_risk': risk_result.get('concurrent_risk', 0),
+                    'confidence': confidence
+                })
+            
+            return UnifiedTrade(
+                trade_id=alpaca_trade.order_id,
+                ticker=alpaca_trade.ticker,
+                side=alpaca_trade.side,
+                quantity=alpaca_trade.quantity,
+                price=alpaca_trade.filled_price,
+                timestamp=alpaca_trade.filled_at,
+                signal_id=alpaca_trade.signal_id,
+                meta=enhanced_meta
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ {ticker} 리스크 기반 거래 실행 실패: {e}")
+            raise
     
     def get_positions(self) -> List[UnifiedPosition]:
         """현재 포지션 조회"""
