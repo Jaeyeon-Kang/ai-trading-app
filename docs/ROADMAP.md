@@ -21,8 +21,6 @@
 - Roadmapped “quiet market” messaging and stronger Slack UX.
 - Risk caps: 0.5% per trade, 2% concurrent; 80% exposure cap, min 3 slots.
 
-## References (Detailed)
-- Evolution plan: see archive/EVO_ROADMAP (full rationale).
-- Mixed universe implementation: `docs/MIXED_UNIVERSE_IMPLEMENTATION.md`.
-- Expansion plan: `docs/UNIVERSE_EXPANSION_PLAN.md`.
-
+## References
+- Planning history: `docs/archive/EVOLUTION_ROADMAP.md`.
+- Implementation details and changes: `docs/IMPLEMENTATION_LOG.md`.
