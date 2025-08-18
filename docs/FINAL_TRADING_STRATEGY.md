@@ -103,7 +103,7 @@ C. 권장안 (75건, 0.5% 위험):
 
 #### 1.3 일일/주간 손실 한도
 ```python
-일일 한도: 2% 도달시 당일 거래 중지
+일일 한도: 기본 3% (권장 2%) — 도달 시 당일 거래 중지
 주간 한도: 8% 도달시 리셋/축소
 
 구현 위치: risk_manager.py → check_daily_loss_limit()
@@ -153,7 +153,7 @@ LLM 출력: "1-2시간 영향" → 호라이즌 120분
 ```python
 RISK_PER_TRADE = 0.005          # 0.5%
 MAX_CONCURRENT_RISK = 0.02      # 2%
-DAILY_LOSS_LIMIT = 0.02         # 2%
+DAILY_LOSS_LIMIT = 0.03         # 기본 3% (권장 2%)
 WEEKLY_LOSS_LIMIT = 0.08        # 8%
 MAX_POSITIONS = 4               # 최대 동시 포지션
 ```

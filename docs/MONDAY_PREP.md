@@ -124,10 +124,12 @@ docker logs trading_bot_worker --tail 10
 ### 환경 변수 점검
 ```bash
 # .env 파일 확인
-BROKER=alpaca_paper  # 페이퍼로 시작
-AUTO_MODE=1          # 완전 자동 모드 🤖
-SEMI_AUTO_BUTTONS=1  # 버튼 활성화 (알림용)
-LLM_ENABLED=1        # LLM 분석 활성화
+BROKER=alpaca_paper      # 또는 kis, paper(내장 시뮬레이터)
+AUTO_MODE=1              # 완전 자동 모드 🤖
+SEMI_AUTO_BUTTONS=1      # 반자동 버튼 활성화(선택)
+LLM_GATING_ENABLED=true  # LLM 게이트 활성화
+LLM_MIN_SIGNAL_SCORE=0.6 # 테스트 가속 시 임시 완화(기본 0.7)
+RTH_DAILY_CAP=100        # 테스트 가속용 상향(기본 5)
 ```
 
 ### 리스크 설정 확인
@@ -187,14 +189,14 @@ print('✅ 최대 포지션:', rm.config.max_positions)
 ```
 🔄 자동 처리 흐름:
 1. 신호 생성 (GPT-5 리스크 체크 통과)
-2. 자동 알파카 주문 전송 (버튼 클릭 없음)
+2. 자동 주문 실행 (Paper/Alpaca/KIS 설정에 따라)
 3. 리스크 기반 수량 자동 계산
 4. Slack 알림 (결과 보고용)
 
 🛡️ 안전장치:
 - 0.5% 거래당 위험 자동 적용
 - 2% 동시위험 한도 자동 차단
-- 일일 손실 2% 도달시 자동 중지
+- 일일 손실 3% 기본값(권장 2%) 도달 시 자동 중지
 - 모든 거래 사전 리스크 검증
 ```
 
