@@ -18,6 +18,10 @@ from celery import Celery
 from celery.schedules import crontab
 from celery.signals import beat_init, task_prerun, worker_process_init, worker_ready
 
+# 로깅 설정 (다른 import보다 먼저)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # GPT-5 리스크 관리 통합
 try:
     from app.engine.risk_manager import get_risk_manager
@@ -28,10 +32,6 @@ except ImportError:
     logger.warning("⚠️ 리스크 관리자 import 실패 - 기본 모드로 동작")
 
 from app.config import settings, get_signal_cutoffs, sanitize_cutoffs_in_redis
-
-# 로깅 설정
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 def check_signal_risk_feasibility(signal, session_label):
     """
@@ -83,7 +83,7 @@ def check_signal_risk_feasibility(signal, session_label):
     except Exception as e:
         logger.error(f"❌ 리스크 pre-check 실패: {e}")
         # 안전을 위해 체크 실패시에도 허용 (기존 동작 유지)
-        return True, f"리스크 체크 오류로 기본 허용"
+        return True, "리스크 체크 오류로 기본 허용"
 
 # Celery 앱 생성
 celery_app = Celery(
@@ -959,8 +959,9 @@ def generate_signals(self):
                                         _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators, suppressed="below_cutoff")
                                     else:
                                         # 리스크 사전 체크 (GPT-5 권장사항)
-                                        if not check_signal_risk_feasibility(quick_signal):
-                                            logger.warning(f"🛡️ {ticker} 3분3상승 신호 리스크 차단: 2% 동시위험 한도 초과")
+                                        risk_ok, risk_reason = check_signal_risk_feasibility(quick_signal, sess_now)
+                                        if not risk_ok:
+                                            logger.warning(f"🛡️ {ticker} 3분3상승 신호 리스크 차단: {risk_reason}")
                                             _record_recent_signal(redis_url=rurl, signal=quick_signal, session_label=sess_now, indicators=indicators, suppressed="risk_limit")
                                         else:
                                             logger.info(f"🔥 [3MIN DEBUG] 3분3상승 신호 발행: {ticker} long score={quick_signal.score:.3f}")
@@ -1172,7 +1173,7 @@ def generate_signals(self):
                     risk_ok, risk_reason = check_signal_risk_feasibility(signal, session_label)
                     if not risk_ok:
                         logger.warning(f"🛡️ [RISK] 신호 리스크 차단: {ticker} - {risk_reason}")
-                        _record_recent_signal(redis_url=redis_url, signal=signal, session_label=session_label, indicators=indicators, suppressed=f"risk_check: {risk_reason}")
+                        _record_recent_signal(redis_url=rurl, signal=signal, session_label=session_label, indicators=indicators, suppressed=f"risk_check: {risk_reason}")
                         continue  # 이 신호는 건너뛰고 다음으로
                     
                     logger.info(f"🔥 [DEBUG] 리스크 체크 통과 - Redis 스트림 발행 시도: {ticker} | {risk_reason}")
