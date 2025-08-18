@@ -295,6 +295,26 @@ The system now operates with GPT-5 recommended efficiency while expanding capabi
   docker logs --since 2m trading_bot_worker | rg -i 'suppressed=below_cutoff|mixer_cooldown'
   ```
 
+### 2025-08-18 — Live Monitoring Snapshot (Market Open)
+
+- Snapshot (last 2m):
+  - `signals_generated_total=0`, `signals_processed_total=0`
+  - `suppressed`: `rth_daily_cap=0` (expected, after fix), `below_cutoff=1`, `mixer_cooldown=44`
+- Interpretation:
+  - RTH daily-cap suppression no longer fires; majority suppression is mixer cooldown or cutoff.
+  - No strong signals yet; still accumulating conditions post-open.
+- Notable logs:
+  - `daily_briefing.check_and_send_quiet_message`: "Never call result.get() within a task!" (non-critical, separate from trading pipeline)
+  - Slack quiet-market send failed once (non-blocking)
+- Commands for on-call monitoring:
+  ```bash
+  docker logs -f trading_bot_worker | egrep -i "시그널 생성됨|suppressed=|order|filled|스톱|익절"
+  docker logs -f trading_bot_scheduler | egrep -i "generate-signals|pipeline-e2e|check-stop-orders"
+  ```
+- Next actions if signals remain low:
+  - Consider temporarily lowering session cutoff by 0.02–0.05 for testing only.
+  - Keep Option C in place; review first strong-signal occurrence and execution path.
+
 ### 2025-08-18 — Fix: Celery unregistered task (paper_trading_manager.check_stop_orders)
 
 - Symptom: Worker logs showed “Received unregistered task of type 'app.jobs.paper_trading_manager.check_stop_orders'” and KeyError.
