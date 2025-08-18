@@ -6,15 +6,15 @@
 import logging
 import os
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
+from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
-from alpaca.trading.models import Position, Order, TradeAccount
+from alpaca.trading.models import Order
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,6 @@ class AlpacaPaperTrading:
             logger.info(f"🌅 다음 개장: {clock.next_open}, 다음 폐장: {clock.next_close}")
             
             # 2. 추가 안전장치: 주말 체크 (미국 동부시간 기준)
-            from datetime import datetime
             us_time = clock.timestamp
             weekday = us_time.weekday()  # 0=월요일, 6=일요일
             

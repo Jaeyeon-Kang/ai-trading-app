@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Union
 import urllib.parse as _urlparse
 
 import psycopg2
@@ -32,6 +32,7 @@ except ImportError:
     logger.warning("⚠️ 리스크 관리자 import 실패 - 기본 모드로 동작")
 
 from app.config import settings, get_signal_cutoffs, sanitize_cutoffs_in_redis
+from app.utils.rate_limiter import get_rate_limiter, TokenTier
 
 def check_signal_risk_feasibility(signal, session_label):
     """
@@ -381,6 +382,332 @@ def _ensure_components_before_task(task=None, **kwargs):
             _autoinit_components_if_enabled()
     except Exception as e:
         logger.warning(f"prerun 자동 초기화 실패: {e}")
+
+# =============================================================================
+# Tier System Functions (Universe Expansion)
+# =============================================================================
+
+def get_ticker_tier(ticker: str) -> Optional[TokenTier]:
+    """
+    종목이 속한 Tier 반환
+    
+    Args:
+        ticker: 종목 코드
+        
+    Returns:
+        Optional[TokenTier]: Tier 타입 (None이면 벤치)
+    """
+    ticker = ticker.upper().strip()
+    
+    tier_a_tickers = [t.strip().upper() for t in settings.TIER_A_TICKERS]
+    tier_b_tickers = [t.strip().upper() for t in settings.TIER_B_TICKERS]
+    
+    if ticker in tier_a_tickers:
+        return TokenTier.TIER_A
+    elif ticker in tier_b_tickers:
+        return TokenTier.TIER_B
+    else:
+        return None  # 벤치 (이벤트 기반)
+
+def should_process_ticker_now(ticker: str, current_time: Optional[Union[datetime, int]] = None) -> Tuple[bool, str]:
+    """
+    현재 시간에 해당 종목을 분석해야 하는지 판단
+    
+    Args:
+        ticker: 종목 코드
+        current_time: 현재 시간 (None이면 datetime.now())
+        
+    Returns:
+        Tuple[bool, str]: (처리 여부, 사유)
+    """
+    if current_time is None:
+        current_time = datetime.now()
+    
+    tier = get_ticker_tier(ticker)
+    
+    # 벤치 종목은 이벤트 기반만 처리 (현재는 스킵)
+    if tier is None:
+        return False, "bench_event_only"
+    
+    # 현재 분의 초 (timestamp에서 datetime 객체로 변환)
+    if isinstance(current_time, int):
+        from datetime import datetime
+        current_time = datetime.fromtimestamp(current_time)
+    current_second = current_time.second
+    
+    if tier == TokenTier.TIER_A:
+        # Tier A: 30초마다 (0초, 30초)
+        return current_second % 30 == 0, "tier_a_schedule"
+    elif tier == TokenTier.TIER_B:
+        # Tier B: 60초마다 (0초만)
+        return current_second == 0, "tier_b_schedule"
+    
+    return False, "unknown_tier"
+
+def can_consume_api_token_for_ticker(ticker: str) -> Tuple[bool, str]:
+    """
+    해당 종목 분석을 위한 API 토큰 소비 가능 여부 확인
+    
+    Args:
+        ticker: 종목 코드
+        
+    Returns:
+        Tuple[bool, str]: (소비 가능 여부, 사유)
+    """
+    try:
+        rate_limiter = get_rate_limiter()
+        tier = get_ticker_tier(ticker)
+        
+        if tier is None:
+            # 벤치 종목은 예약 토큰 사용
+            tier = TokenTier.RESERVE
+        
+        can_consume = rate_limiter.can_consume_token(tier)
+        if can_consume:
+            return True, f"token_available_{tier.value}"
+        else:
+            return False, f"token_exhausted_{tier.value}"
+            
+    except Exception as e:
+        logger.error(f"토큰 확인 실패: {e}")
+        return False, f"token_check_error: {e}"
+
+def consume_api_token_for_ticker(ticker: str) -> Tuple[bool, str]:
+    """
+    해당 종목 분석을 위한 API 토큰 실제 소비
+    
+    Args:
+        ticker: 종목 코드
+        
+    Returns:
+        Tuple[bool, str]: (소비 성공 여부, 사유)
+    """
+    try:
+        rate_limiter = get_rate_limiter()
+        tier = get_ticker_tier(ticker)
+        
+        if tier is None:
+            # 벤치 종목은 예약 토큰 사용 (Fallback도 시도)
+            success, used_tier = rate_limiter.try_consume_with_fallback(
+                TokenTier.RESERVE, 
+                TokenTier.TIER_B  # Reserve 부족시 Tier B 사용
+            )
+            return success, f"consumed_{used_tier.value}_for_bench"
+        else:
+            # Tier A/B는 해당 토큰 사용 (Fallback도 시도)
+            fallback_tier = TokenTier.RESERVE if tier == TokenTier.TIER_A else None
+            success, used_tier = rate_limiter.try_consume_with_fallback(tier, fallback_tier)
+            return success, f"consumed_{used_tier.value}"
+            
+    except Exception as e:
+        logger.error(f"토큰 소비 실패: {e}")
+        return False, f"token_consume_error: {e}"
+
+def get_universe_with_tiers() -> Dict[str, List[str]]:
+    """
+    Tier별 종목 리스트 반환
+    
+    Returns:
+        Dict[str, List[str]]: Tier별 종목 딕셔너리
+    """
+    try:
+        # 동적 유니버스 조회 (기존 로직 재사용)
+        dynamic_universe = None
+        try:
+            rurl = os.getenv("REDIS_URL")
+            if rurl:
+                r = redis.from_url(rurl)
+                external = r.smembers("universe:external") or []
+                watch = r.smembers("universe:watchlist") or []
+                core = [t.strip().upper() for t in (os.getenv("TICKERS", "").split(",")) if t.strip()]
+                ext = [x.decode() if isinstance(x, (bytes, bytearray)) else x for x in external]
+                wch = [x.decode() if isinstance(x, (bytes, bytearray)) else x for x in watch]
+                merged = []
+                seen = set()
+                max_n = int(os.getenv("UNIVERSE_MAX", "100"))
+                for arr in [core, ext, wch]:
+                    for s in arr:
+                        if s and s not in seen:
+                            merged.append(s)
+                            seen.add(s)
+                        if len(merged) >= max_n:
+                            break
+                    if len(merged) >= max_n:
+                        break
+                dynamic_universe = merged
+        except Exception:
+            dynamic_universe = None
+        
+        # Fallback: 설정에서 직접 가져오기
+        all_tickers = dynamic_universe or []
+        if not all_tickers:
+            all_tickers = (
+                settings.TIER_A_TICKERS + 
+                settings.TIER_B_TICKERS + 
+                settings.BENCH_TICKERS
+            )
+        
+        # Tier별 분류
+        tier_a = [t for t in all_tickers if get_ticker_tier(t) == TokenTier.TIER_A]
+        tier_b = [t for t in all_tickers if get_ticker_tier(t) == TokenTier.TIER_B] 
+        bench = [t for t in all_tickers if get_ticker_tier(t) is None]
+        
+        return {
+            "tier_a": tier_a,
+            "tier_b": tier_b,
+            "bench": bench
+        }
+        
+    except Exception as e:
+        logger.error(f"유니버스 Tier 분류 실패: {e}")
+        return {
+            "tier_a": settings.TIER_A_TICKERS,
+            "tier_b": settings.TIER_B_TICKERS,
+            "bench": settings.BENCH_TICKERS
+        }
+
+def should_call_llm_for_event(ticker: str, event_type: str, signal_score: float = None, 
+                              edgar_filing: Dict = None) -> Tuple[bool, str]:
+    """
+    LLM 호출 게이팅 시스템 - 엄격한 이벤트 기반 트리거링
+    
+    Args:
+        ticker: 종목 코드
+        event_type: 이벤트 타입 ('edgar', 'vol_spike')
+        signal_score: 신호 점수 (vol_spike용)
+        edgar_filing: EDGAR 공시 정보
+        
+    Returns:
+        Tuple[bool, str]: (호출 허용 여부, 사유)
+    """
+    try:
+        # LLM 게이팅 비활성화시 무조건 허용
+        if not settings.LLM_GATING_ENABLED:
+            return True, "gating_disabled"
+        
+        # 1. 일일 호출 한도 체크
+        rurl = os.getenv("REDIS_URL")
+        if rurl:
+            r = redis.from_url(rurl)
+            
+            # ET 기준 날짜 키
+            et_tz = timezone(timedelta(hours=-5))
+            now_et = datetime.now(et_tz)
+            if 3 <= now_et.month <= 11:  # DST 간이 적용
+                et_tz = timezone(timedelta(hours=-4))
+                now_et = datetime.now(et_tz)
+            
+            daily_key = f"llm_calls:{now_et:%Y%m%d}"
+            current_calls = int(r.get(daily_key) or 0)
+            
+            if current_calls >= settings.LLM_DAILY_CALL_LIMIT:
+                return False, f"daily_limit_exceeded ({current_calls}/{settings.LLM_DAILY_CALL_LIMIT})"
+        
+        # 2. 이벤트별 조건 검증
+        if event_type == "edgar":
+            # EDGAR 이벤트는 항상 허용 (중요도 높음)
+            cache_key = f"llm_cache:edgar:{ticker}:{edgar_filing.get('form_type', 'unknown')}"
+            
+        elif event_type == "vol_spike":
+            # vol_spike는 신호 점수 조건 필요
+            if signal_score is None or abs(signal_score) < settings.LLM_MIN_SIGNAL_SCORE:
+                return False, f"signal_score_too_low (|{signal_score}| < {settings.LLM_MIN_SIGNAL_SCORE})"
+            
+            cache_key = f"llm_cache:vol_spike:{ticker}"
+            
+        else:
+            return False, f"unknown_event_type: {event_type}"
+        
+        # 3. 중복 방지 캐시 체크 (30분)
+        if rurl:
+            cached = r.get(cache_key)
+            if cached:
+                return False, f"cached_within_{settings.LLM_CACHE_DURATION_MIN}min"
+        
+        return True, f"allowed_{event_type}"
+        
+    except Exception as e:
+        logger.error(f"LLM 게이팅 체크 실패: {e}")
+        # 안전을 위해 에러시 차단
+        return False, f"gating_error: {e}"
+
+def consume_llm_call_quota(ticker: str, event_type: str, edgar_filing: Dict = None) -> bool:
+    """
+    LLM 호출 쿼터 실제 소비 및 캐시 마킹
+    
+    Args:
+        ticker: 종목 코드
+        event_type: 이벤트 타입
+        edgar_filing: EDGAR 공시 정보
+        
+    Returns:
+        bool: 소비 성공 여부
+    """
+    try:
+        rurl = os.getenv("REDIS_URL")
+        if not rurl:
+            return True
+        
+        r = redis.from_url(rurl)
+        
+        # 일일 카운터 증가
+        et_tz = timezone(timedelta(hours=-5))
+        now_et = datetime.now(et_tz)
+        if 3 <= now_et.month <= 11:
+            et_tz = timezone(timedelta(hours=-4))
+            now_et = datetime.now(et_tz)
+        
+        daily_key = f"llm_calls:{now_et:%Y%m%d}"
+        r.incr(daily_key)
+        r.expire(daily_key, 86400)  # 24시간 TTL
+        
+        # 캐시 마킹
+        if event_type == "edgar":
+            cache_key = f"llm_cache:edgar:{ticker}:{edgar_filing.get('form_type', 'unknown')}"
+        else:
+            cache_key = f"llm_cache:vol_spike:{ticker}"
+        
+        r.setex(cache_key, settings.LLM_CACHE_DURATION_MIN * 60, 1)
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"LLM 쿼터 소비 실패: {e}")
+        return False
+
+def get_llm_usage_stats() -> Dict[str, int]:
+    """
+    LLM 사용량 통계 조회
+    
+    Returns:
+        Dict: 사용량 통계
+    """
+    try:
+        rurl = os.getenv("REDIS_URL")
+        if not rurl:
+            return {"daily_used": 0, "daily_limit": settings.LLM_DAILY_CALL_LIMIT}
+        
+        r = redis.from_url(rurl)
+        
+        et_tz = timezone(timedelta(hours=-5))
+        now_et = datetime.now(et_tz)
+        if 3 <= now_et.month <= 11:
+            et_tz = timezone(timedelta(hours=-4))
+            now_et = datetime.now(et_tz)
+        
+        daily_key = f"llm_calls:{now_et:%Y%m%d}"
+        daily_used = int(r.get(daily_key) or 0)
+        
+        return {
+            "daily_used": daily_used,
+            "daily_limit": settings.LLM_DAILY_CALL_LIMIT,
+            "remaining": max(0, settings.LLM_DAILY_CALL_LIMIT - daily_used),
+            "usage_pct": (daily_used / settings.LLM_DAILY_CALL_LIMIT) * 100 if settings.LLM_DAILY_CALL_LIMIT > 0 else 0
+        }
+        
+    except Exception as e:
+        logger.error(f"LLM 사용량 조회 실패: {e}")
+        return {"daily_used": 0, "daily_limit": settings.LLM_DAILY_CALL_LIMIT, "error": str(e)}
 
 @celery_app.task(bind=True, name="app.jobs.scheduler.pipeline_e2e")
 def pipeline_e2e(self):
@@ -800,9 +1127,53 @@ def generate_signals(self):
         except Exception:
             dynamic_universe = None
 
-        tickers_iter = dynamic_universe or list(quotes_ingestor.tickers)
-        for ticker in tickers_iter:
+        # Tier 기반 종목 처리 (Universe Expansion)
+        universe_tiers = get_universe_with_tiers()
+        logger.info(f"🎯 Tier 유니버스: A={len(universe_tiers['tier_a'])}, B={len(universe_tiers['tier_b'])}, 벤치={len(universe_tiers['bench'])}")
+        
+        # Tier별 스케줄링 적용
+        current_time = datetime.now()
+        processing_tickers = []
+        
+        # Tier A 종목 체크 (30초마다)
+        for ticker in universe_tiers['tier_a']:
+            should_process, reason = should_process_ticker_now(ticker, current_time)
+            if should_process:
+                processing_tickers.append((ticker, TokenTier.TIER_A, reason))
+        
+        # Tier B 종목 체크 (60초마다) 
+        for ticker in universe_tiers['tier_b']:
+            should_process, reason = should_process_ticker_now(ticker, current_time)
+            if should_process:
+                processing_tickers.append((ticker, TokenTier.TIER_B, reason))
+        
+        # 벤치 종목은 현재 이벤트 기반만 (추후 확장)
+        
+        logger.info(f"🎯 처리 대상: {len(processing_tickers)}개 종목 {[f'{t}({tier.value})' for t, tier, _ in processing_tickers]}")
+        
+        # Fallback: Tier 시스템 비활성화시 기존 방식 사용
+        if not processing_tickers:
+            logger.info("🎯 Tier 처리 대상 없음, 기존 방식으로 Fallback")
+            tickers_iter = dynamic_universe or list(quotes_ingestor.tickers)
+            processing_tickers = [(ticker, None, "fallback") for ticker in tickers_iter]
+        
+        for ticker, tier, schedule_reason in processing_tickers:
             try:
+                # API 토큰 체크 및 소비 (Tier 시스템)
+                if tier is not None:  # Tier 시스템 활성화된 경우
+                    can_consume, token_reason = can_consume_api_token_for_ticker(ticker)
+                    if not can_consume:
+                        logger.info(f"🚫 토큰 부족으로 스킵: {ticker} ({tier.value}) - {token_reason}")
+                        continue
+                    
+                    # 토큰 실제 소비
+                    consumed, consume_reason = consume_api_token_for_ticker(ticker)
+                    if not consumed:
+                        logger.warning(f"🚫 토큰 소비 실패: {ticker} ({tier.value}) - {consume_reason}")
+                        continue
+                    
+                    logger.debug(f"✅ 토큰 소비: {ticker} ({tier.value}) - {consume_reason}")
+                
                 # 1. 시세 데이터 가져오기
                 candles = quotes_ingestor.get_latest_candles(ticker, 50)
                 if len(candles) < 20:
@@ -1007,14 +1378,36 @@ def generate_signals(self):
                 recent_edgar = get_recent_edgar_filing(ticker)
                 if recent_edgar:
                     edgar_filing = recent_edgar
-                    # LLM 분석 (EDGAR 이벤트이므로 조건 충족)
-                    llm_insight = llm_engine.analyze_edgar_filing(edgar_filing)
+                    # LLM 게이팅 적용 (EDGAR 이벤트)
+                    should_call, call_reason = should_call_llm_for_event(
+                        ticker, "edgar", edgar_filing=edgar_filing
+                    )
+                    if should_call:
+                        # 쿼터 소비 및 LLM 분석
+                        if consume_llm_call_quota(ticker, "edgar", edgar_filing):
+                            llm_insight = llm_engine.analyze_edgar_filing(edgar_filing)
+                            logger.info(f"🤖 LLM EDGAR 분석: {ticker} - {call_reason}")
+                        else:
+                            logger.warning(f"🤖 LLM 쿼터 소비 실패: {ticker} (EDGAR)")
+                    else:
+                        logger.info(f"🚫 LLM EDGAR 차단: {ticker} - {call_reason}")
                 
-                # 6. 레짐이 vol_spike인 경우 추가 LLM 분석
+                # 6. 레짐이 vol_spike인 경우 추가 LLM 분석 (신호 점수 조건부)
                 if regime_result.regime.value == 'vol_spike' and llm_engine and not llm_insight:
-                    # vol_spike 레짐에서 LLM 분석 (조건 충족)
-                    text = f"Volatility spike detected for {ticker} in {regime_result.regime.value} regime"
-                    llm_insight = llm_engine.analyze_text(text, f"vol_spike_{ticker}", regime='vol_spike')
+                    # tech_score를 이용해 신호 점수 체크 (vol_spike 게이팅)
+                    should_call, call_reason = should_call_llm_for_event(
+                        ticker, "vol_spike", signal_score=tech_score.score
+                    )
+                    if should_call:
+                        # 쿼터 소비 및 LLM 분석
+                        if consume_llm_call_quota(ticker, "vol_spike"):
+                            text = f"Volatility spike detected for {ticker} in {regime_result.regime.value} regime"
+                            llm_insight = llm_engine.analyze_text(text, f"vol_spike_{ticker}", regime='vol_spike')
+                            logger.info(f"🤖 LLM vol_spike 분석: {ticker} - {call_reason}")
+                        else:
+                            logger.warning(f"🤖 LLM 쿼터 소비 실패: {ticker} (vol_spike)")
+                    else:
+                        logger.info(f"🚫 LLM vol_spike 차단: {ticker} - {call_reason}")
                 
                 # 6. 세션별 pre-filter (RTH: 일일상한, EXT: 유동성/스프레드/쿨다운/일일상한)
                 ext_enabled = (os.getenv("EXTENDED_PRICE_SIGNALS", "false").lower() in ("1","true","yes","on"))
@@ -1327,13 +1720,35 @@ def generate_signals(self):
                     # 최근 신호 기록 (+ 세션/스프레드/달러대금)
                     _record_recent_signal(redis_url=rurl, signal=signal, session_label=session_label, indicators=indicators)
                     
-                    logger.info(f"시그널 생성: {ticker} {signal.signal_type.value} (점수: {signal.score:.2f})")
+                    tier_info = f" [Tier:{tier.value}]" if tier else ""
+                    logger.info(f"시그널 생성: {ticker} {signal.signal_type.value} (점수: {signal.score:.2f}){tier_info}")
                 
             except Exception as e:
                 logger.error(f"시그널 생성 실패 ({ticker}): {e}")
                 continue
         
         execution_time = time.time() - start_time
+        
+        # 토큰 사용량 로그 (Tier 시스템)
+        try:
+            rate_limiter = get_rate_limiter()
+            token_status = rate_limiter.get_token_status()
+            api_usage = rate_limiter.get_total_api_usage()
+            logger.info(f"📊 토큰 상태: A={token_status['tier_a']['current_tokens']}/{token_status['tier_a']['max_tokens']}, "
+                       f"B={token_status['tier_b']['current_tokens']}/{token_status['tier_b']['max_tokens']}, "
+                       f"예약={token_status['reserve']['current_tokens']}/{token_status['reserve']['max_tokens']} "
+                       f"(사용률: {api_usage['usage_pct']:.1f}%)")
+        except Exception as e:
+            logger.warning(f"토큰 상태 조회 실패: {e}")
+        
+        # LLM 사용량 로그 (게이팅 시스템)
+        try:
+            llm_stats = get_llm_usage_stats()
+            logger.info(f"🤖 LLM 사용량: {llm_stats['daily_used']}/{llm_stats['daily_limit']} "
+                       f"(남은 호출: {llm_stats['remaining']}, 사용률: {llm_stats['usage_pct']:.1f}%)")
+        except Exception as e:
+            logger.warning(f"LLM 사용량 조회 실패: {e}")
+        
         logger.info(f"시그널 생성 완료: {signals_generated}개, {execution_time:.2f}초")
         
         return {

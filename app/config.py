@@ -38,6 +38,37 @@ class Settings:
             "sideways": {"tech": 0.50, "sentiment": 0.50},
         }
 
+        # --- Universe Expansion & Tier System ---
+        self.TIER_A_TICKERS = os.getenv("TIER_A_TICKERS", "NVDA,TSLA,AAPL").split(",")
+        self.TIER_B_TICKERS = os.getenv("TIER_B_TICKERS", "MSFT,AMZN,META").split(",")
+        self.BENCH_TICKERS = os.getenv("BENCH_TICKERS", "GOOGL,AMD,AVGO").split(",")
+        
+        self.TIER_A_INTERVAL_SEC = int(os.getenv("TIER_A_INTERVAL_SEC", "30"))
+        self.TIER_B_INTERVAL_SEC = int(os.getenv("TIER_B_INTERVAL_SEC", "60"))
+
+        # --- API Rate Limiting ---
+        self.API_CALLS_PER_MINUTE = int(os.getenv("API_CALLS_PER_MINUTE", "10"))
+        self.API_TIER_A_ALLOCATION = int(os.getenv("API_TIER_A_ALLOCATION", "6"))
+        self.API_TIER_B_ALLOCATION = int(os.getenv("API_TIER_B_ALLOCATION", "3"))
+        self.API_RESERVE_ALLOCATION = int(os.getenv("API_RESERVE_ALLOCATION", "1"))
+
+        # --- LLM Gating System ---
+        self.LLM_DAILY_CALL_LIMIT = int(os.getenv("LLM_DAILY_CALL_LIMIT", "120"))
+        self.LLM_CALL_COST_KRW = int(os.getenv("LLM_CALL_COST_KRW", "667"))
+        self.LLM_GATING_ENABLED = os.getenv("LLM_GATING_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+        
+        self.LLM_MIN_SIGNAL_SCORE = float(os.getenv("LLM_MIN_SIGNAL_SCORE", "0.7"))
+        self.LLM_CACHE_DURATION_MIN = int(os.getenv("LLM_CACHE_DURATION_MIN", "30"))
+
+        # --- Position Sizing Enhancement ---
+        self.POSITION_CAP_ENABLED = os.getenv("POSITION_CAP_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+        self.POSITION_MAX_EQUITY_PCT = float(os.getenv("POSITION_MAX_EQUITY_PCT", "0.8"))
+        self.POSITION_MIN_SLOTS = int(os.getenv("POSITION_MIN_SLOTS", "3"))
+
+        # --- EDGAR Override Items ---
+        self.EDGAR_OVERRIDE_ITEMS = os.getenv("EDGAR_OVERRIDE_ITEMS", "1.01,2.02,2.03,8.01").split(",")
+        self.REGULATORY_BLOCK_WORDS = os.getenv("REGULATORY_BLOCK_WORDS", "regulatory,litigation,FTC,SEC,DoJ,antitrust").split(",")
+
 settings = Settings()
 
 def get_signal_cutoffs():

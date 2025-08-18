@@ -6,7 +6,7 @@ GPT-5 권장 리스크 관리 시스템 통합
 
 import os
 import logging
-from typing import Protocol, Dict, List, Optional, Tuple, Any
+from typing import Protocol, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from datetime import datetime
 

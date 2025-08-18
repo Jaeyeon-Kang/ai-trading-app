@@ -637,7 +637,7 @@ class SlackBot:
                     logger.info(f"알파카 거래 성공: {trade.ticker} {trade.side} {trade.quantity}주 @ ${trade.price:.2f}")
                     
                     # 리스크 정보 포함 성공 메시지 전송
-                    success_msg = f"✅ **거래 체결 완료**\n\n"
+                    success_msg = "✅ **거래 체결 완료**\n\n"
                     success_msg += f"📊 **{trade.ticker}** {trade.side.upper()} {trade.quantity}주\n"
                     success_msg += f"💰 **체결가**: ${trade.price:.2f}\n"
                     success_msg += f"💵 **거래금액**: ${trade.quantity * trade.price:,.0f}\n"
@@ -649,11 +649,11 @@ class SlackBot:
                         concurrent_risk = trade.meta.get('concurrent_risk', 0)
                         confidence = trade.meta.get('confidence', 1.0)
                         
-                        success_msg += f"\n🛡️ **리스크 정보**:\n"
+                        success_msg += "\n🛡️ **리스크 정보**:\n"
                         success_msg += f"• 포지션 위험: {risk_pct:.2%}\n"
                         success_msg += f"• 총 동시위험: {concurrent_risk:.2%}/2.0%\n"
                         success_msg += f"• 신호 신뢰도: {confidence:.1%}\n"
-                        success_msg += f"• 사이징: GPT-5 권장 공식 적용"
+                        success_msg += "• 사이징: GPT-5 권장 공식 적용"
                     
                     success_msg += f"\n🆔 **거래ID**: {trade.trade_id}"
                     
@@ -661,7 +661,7 @@ class SlackBot:
                     
                 except Exception as e:
                     logger.error(f"알파카 거래 실행 실패: {e}")
-                    error_msg = f"❌ **거래 실행 실패**\n\n"
+                    error_msg = "❌ **거래 실행 실패**\n\n"
                     error_msg += f"📊 **{order_json.get('ticker')}** {order_json.get('side').upper()}\n"
                     error_msg += f"❌ **오류**: {str(e)}"
                     self.send_message({"text": error_msg})

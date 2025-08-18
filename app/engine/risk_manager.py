@@ -4,10 +4,12 @@ GPT-5 권장사항 구현
 """
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
+
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,8 @@ class RiskManager:
         logger.info(f"🛡️ 리스크 관리자 초기화: {self.config.risk_per_trade:.1%}/트레이드, {self.config.max_concurrent_risk:.1%} 동시위험 한도")
     
     def calculate_position_size(self, equity: float, entry_price: float, 
-                              stop_loss_price: float, signal_confidence: float = 1.0) -> Tuple[int, dict]:
+                              stop_loss_price: float, signal_confidence: float = 1.0,
+                              current_positions: int = 0) -> Tuple[int, dict]:
         """
         위험% 기반 포지션 크기 계산
         
@@ -72,18 +75,41 @@ class RiskManager:
                 logger.warning("⚠️ 진입가와 손절가가 동일함")
                 return 0, {}
             
-            # 4. 포지션 크기 계산
-            position_size = int(adjusted_risk / price_diff)
+            # 4. 포지션 크기 계산 (기존 GPT-5 공식)
+            position_size_risk_based = int(adjusted_risk / price_diff)
             
-            # 5. 최소/최대 제한
-            position_size = max(1, position_size)  # 최소 1주
-            max_size_by_equity = int(equity * 0.4 / entry_price)  # 최대 40% 노출
-            position_size = min(position_size, max_size_by_equity)
+            # 5. 소액계좌 보호: 명목 상한 계산 (settings 기반)
+            position_size_capped = position_size_risk_based
             
-            # 6. 실제 위험 재계산
+            if settings.POSITION_CAP_ENABLED:
+                # 남은 슬롯 수 계산 (최소 슬롯 보장)
+                remaining_slots = max(
+                    settings.POSITION_MIN_SLOTS - current_positions,
+                    1  # 적어도 1슬롯은 유지
+                )
+                
+                # 총노출 기반 상한 계산
+                max_exposure_per_slot = (equity * settings.POSITION_MAX_EQUITY_PCT) / remaining_slots
+                max_size_by_exposure = int(max_exposure_per_slot / entry_price)
+                
+                # 더 보수적인 값 선택 (GPT 추천 공식)
+                position_size_capped = min(position_size_risk_based, max_size_by_exposure)
+                
+                # 소액계좌 보호 적용 로그
+                if position_size_capped < position_size_risk_based:
+                    logger.info(f"🛡️ 소액계좌 보호 적용: {position_size_risk_based}주 → {position_size_capped}주 "
+                               f"(남은슬롯: {remaining_slots}, 최대노출: ${max_exposure_per_slot:,.0f})")
+            
+            # 6. 기본 제한사항 적용
+            position_size = max(1, position_size_capped)  # 최소 1주
+            max_size_by_legacy = int(equity * 0.4 / entry_price)  # 기존 40% 노출 제한
+            position_size = min(position_size, max_size_by_legacy)
+            
+            # 7. 실제 위험 재계산
             actual_risk_amount = position_size * price_diff
             actual_risk_pct = actual_risk_amount / equity
             
+            # 8. 종합 리스크 정보 (소액계좌 보호 정보 포함)
             risk_info = {
                 'position_size': position_size,
                 'risk_amount': actual_risk_amount,
@@ -91,7 +117,13 @@ class RiskManager:
                 'target_risk_pct': self.config.risk_per_trade,
                 'confidence_adjustment': signal_confidence,
                 'max_loss_usd': actual_risk_amount,
-                'exposure_pct': (position_size * entry_price) / equity
+                'exposure_pct': (position_size * entry_price) / equity,
+                # 소액계좌 보호 관련 정보
+                'risk_based_size': position_size_risk_based,
+                'cap_enabled': settings.POSITION_CAP_ENABLED,
+                'cap_applied': position_size_capped < position_size_risk_based if settings.POSITION_CAP_ENABLED else False,
+                'remaining_slots': max(settings.POSITION_MIN_SLOTS - current_positions, 1) if settings.POSITION_CAP_ENABLED else None,
+                'nominal_value': position_size * entry_price
             }
             
             logger.info(f"📊 포지션 사이징: {position_size}주 (위험 {actual_risk_pct:.2%}, 노출 {risk_info['exposure_pct']:.1%})")
@@ -195,7 +227,7 @@ class RiskManager:
                 return False, {'error': '포트폴리오 정보 부족'}
             
             position_size, risk_info = self.calculate_position_size(
-                equity, entry_price, stop_loss, confidence
+                equity, entry_price, stop_loss, confidence, len(positions)
             )
             
             # 2. 현재 포지션 위험 계산

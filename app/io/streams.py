@@ -7,8 +7,7 @@ import json
 import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime
-import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 

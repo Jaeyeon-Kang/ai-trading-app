@@ -5,7 +5,6 @@ GPT-5 리스크 관리 시스템 통합
 
 from fastapi import APIRouter, HTTPException
 import logging
-from typing import Dict, List
 
 from app.adapters.trading_adapter import get_trading_adapter
 from app.engine.risk_manager import get_risk_manager
