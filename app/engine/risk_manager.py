@@ -49,7 +49,7 @@ class RiskManager:
     
     def calculate_position_size(self, equity: float, entry_price: float, 
                               stop_loss_price: float, signal_confidence: float = 1.0,
-                              current_positions: int = 0) -> Tuple[int, dict]:
+                              current_positions: int = 0, ticker: str = "") -> Tuple[int, dict]:
         """
         위험% 기반 포지션 크기 계산
         
@@ -58,6 +58,8 @@ class RiskManager:
             entry_price: 진입가
             stop_loss_price: 손절가
             signal_confidence: 신호 신뢰도 (0-1, 리스크 조정용)
+            current_positions: 현재 포지션 수
+            ticker: 종목 코드 (레버리지 ETF 체크용)
             
         Returns:
             Tuple[포지션 크기, 리스크 정보]
@@ -77,6 +79,14 @@ class RiskManager:
             
             # 4. 포지션 크기 계산 (기존 GPT-5 공식)
             position_size_risk_based = int(adjusted_risk / price_diff)
+            
+            # **레버리지 ETF 추가 보호 로직**
+            is_leveraged_etf = ticker in settings.LEVERAGED_ETFS if hasattr(settings, 'LEVERAGED_ETFS') else False
+            if is_leveraged_etf:
+                # 레버리지 ETF는 변동성이 높으므로 리스크를 더 보수적으로 계산
+                leveraged_risk_reduction = 0.7  # 30% 추가 보수적 접근
+                position_size_risk_based = int(position_size_risk_based * leveraged_risk_reduction)
+                logger.info(f"🔥 레버리지 ETF 리스크 보호: {ticker} 포지션 30% 축소 적용")
             
             # 5. 소액계좌 보호: 명목 상한 계산 (settings 기반)
             position_size_capped = position_size_risk_based

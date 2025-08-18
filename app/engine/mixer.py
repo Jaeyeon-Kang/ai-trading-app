@@ -110,6 +110,14 @@ class SignalMixer:
         """
         # 입력 스케일 클램프: tech ∈ [-1,1], sent ∈ [-1,1]
         tech_score_normalized = max(-1.0, min(1.0, tech_score.score))
+        
+        # **인버스 ETF 신호 반전 로직**
+        # 인버스 ETF는 기초자산과 반대로 움직이므로 기술적 신호를 반전
+        is_inverse_etf = ticker in settings.INVERSE_ETFS
+        if is_inverse_etf:
+            tech_score_normalized = -tech_score_normalized
+            logger.debug(f"인버스 ETF 신호 반전: {ticker} 기술점수 {tech_score.score:.3f} → {tech_score_normalized:.3f}")
+        
         sentiment_score = 0.0
         
         # LLM 인사이트가 있으면 감성 점수 사용

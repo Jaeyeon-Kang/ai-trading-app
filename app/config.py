@@ -68,6 +68,10 @@ class Settings:
         # --- EDGAR Override Items ---
         self.EDGAR_OVERRIDE_ITEMS = os.getenv("EDGAR_OVERRIDE_ITEMS", "1.01,2.02,2.03,8.01").split(",")
         self.REGULATORY_BLOCK_WORDS = os.getenv("REGULATORY_BLOCK_WORDS", "regulatory,litigation,FTC,SEC,DoJ,antitrust").split(",")
+        
+        # --- Inverse ETF Support ---
+        self.INVERSE_ETFS = os.getenv("INVERSE_ETFS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS,DRV,SARK,UVXY").split(",")
+        self.LEVERAGED_ETFS = os.getenv("LEVERAGED_ETFS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS,DRV").split(",")
 
 settings = Settings()
 
