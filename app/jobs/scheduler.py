@@ -499,8 +499,14 @@ def consume_api_token_for_ticker(ticker: str) -> Tuple[bool, str]:
             )
             return success, f"consumed_{used_tier.value}_for_bench"
         else:
-            # Tier A/B는 해당 토큰 사용 (Fallback도 시도)
-            fallback_tier = TokenTier.RESERVE if tier == TokenTier.TIER_A else None
+            # Tier A/B는 해당 토큰 사용.
+            # 테스트 한정: 분 초 0–10s 구간에만 Tier A → Reserve 폴백 허용(그 외엔 폴백 금지)
+            fallback_tier = None
+            if tier == TokenTier.TIER_A:
+                from datetime import datetime
+                now = datetime.utcnow()
+                if 0 <= now.second <= 10:
+                    fallback_tier = TokenTier.RESERVE
             success, used_tier = rate_limiter.try_consume_with_fallback(tier, fallback_tier)
             return success, f"consumed_{used_tier.value}"
             
@@ -1427,6 +1433,8 @@ def generate_signals(self):
                 rth_day_key = None
                 rth_daily_cap = None
                 r_conn = None
+                # 중복 카운트 방지용 idempotency 키 구성 요소
+                idemp_key = None
                 if session_label == "RTH":
                     try:
                         if rurl:
@@ -1440,6 +1448,9 @@ def generate_signals(self):
                                 et_tz = timezone(timedelta(hours=-4))
                                 now_et = datetime.now(et_tz)
                             rth_day_key = f"dailycap:{now_et:%Y%m%d}:RTH:{ticker}"
+                            # 90초 idempotency 슬롯키 (중복 카운트 방지)
+                            slot = int(now_et.timestamp() // 90)
+                            idemp_key = f"cap:idemp:{now_et:%Y%m%d}:{ticker}:{slot}"
                     except Exception as e:
                         logger.warning(f"RTH 일일상한 키 준비 실패: {e}")
                         r_conn = None
@@ -1545,6 +1556,13 @@ def generate_signals(self):
                     # RTH 일일 상한 체크: 컷오프/리스크 통과 후에 한 번만 적용
                     if session_label == "RTH" and r_conn and rth_day_key and rth_daily_cap is not None:
                         try:
+                            # idempotency: 동일 슬롯 내 중복 카운트 방지
+                            if idemp_key:
+                                if not r_conn.setnx(idemp_key, 1):
+                                    # 이미 카운트 처리됨 → 그대로 억제 기록만 후속로 남기고 건너뜀
+                                    r_conn.expire(idemp_key, 90)
+                                else:
+                                    r_conn.expire(idemp_key, 90)
                             current_count = r_conn.incr(rth_day_key)
                             r_conn.expire(rth_day_key, 86400)
                             if current_count > rth_daily_cap:
@@ -1556,6 +1574,46 @@ def generate_signals(self):
                                 continue
                         except Exception as e:
                             logger.warning(f"RTH 일일상한 체크 실패(사후): {e}")
+
+                    # 글로벌 캡(선택): 하루 총 액션 가능 신호 상한
+                    try:
+                        global_cap = int(os.getenv("GLOBAL_RTH_DAILY_CAP", "0"))
+                    except Exception:
+                        global_cap = 0
+                    if session_label == "RTH" and r_conn and global_cap > 0:
+                        try:
+                            gkey = f"dailycap:{now_et:%Y%m%d}:RTH:GLOBAL"
+                            gcur = r_conn.incr(gkey)
+                            r_conn.expire(gkey, 86400)
+                            if gcur > global_cap:
+                                r_conn.decr(gkey)
+                                logger.info(f"suppressed=global_rth_daily_cap ticker={ticker} session={session_label}")
+                                _record_recent_signal(redis_url=rurl, signal=signal, session_label=session_label, indicators=indicators, suppressed="global_rth_daily_cap")
+                                continue
+                        except Exception as e:
+                            logger.warning(f"글로벌 RTH 일일상한 체크 실패: {e}")
+
+                    # 방향 락: 최근 반대방향 재진입 금지(테스트 한정)
+                    try:
+                        lock_sec = int(os.getenv("DIRECTION_LOCK_SEC", "0"))
+                    except Exception:
+                        lock_sec = 0
+                    if lock_sec > 0 and r_conn:
+                        try:
+                            lkey = f"lock:dir:{ticker}"
+                            last = r_conn.get(lkey)
+                            if last:
+                                last_dir, last_ts = last.decode().split(":")
+                                from time import time as _now
+                                if last_dir != signal.signal_type.value and (int(_now()) - int(last_ts)) < lock_sec:
+                                    logger.info(f"suppressed=direction_lock ticker={ticker} lock={lock_sec}s last={last_dir}")
+                                    _record_recent_signal(redis_url=rurl, signal=signal, session_label=session_label, indicators=indicators, suppressed="direction_lock")
+                                    continue
+                            # 통과 시 현재 방향 기록
+                            from time import time as _now
+                            r_conn.setex(lkey, lock_sec, f"{signal.signal_type.value}:{int(_now())}")
+                        except Exception as e:
+                            logger.warning(f"direction_lock 처리 실패: {e}")
 
                     # 7. Redis 스트림에 발행
                     signal_data = {

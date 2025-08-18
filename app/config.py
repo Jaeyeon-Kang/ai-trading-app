@@ -90,6 +90,14 @@ def get_signal_cutoffs():
                 ext = float(ev)
     except Exception:
         pass
+    # 임시 델타 적용(테스트 가속): SIGNAL_CUTOFF_RTH_DELTA, SIGNAL_CUTOFF_EXT_DELTA
+    try:
+        delta_rth = float(os.getenv("SIGNAL_CUTOFF_RTH_DELTA", "0.0"))
+        delta_ext = float(os.getenv("SIGNAL_CUTOFF_EXT_DELTA", "0.0"))
+        rth = rth + delta_rth
+        ext = ext + delta_ext
+    except Exception:
+        pass
     # 안전 범위로 최종 클램프
     rth = _clamp(rth, *SAFE_RTH_RANGE)
     ext = _clamp(ext, *SAFE_EXT_RANGE)
