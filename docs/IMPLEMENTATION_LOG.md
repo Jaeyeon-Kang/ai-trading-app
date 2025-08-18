@@ -327,4 +327,27 @@ The system now operates with GPT-5 recommended efficiency while expanding capabi
   docker logs --since 10m trading_bot_worker | grep -i 'unregistered task' || echo OK
   docker logs --since 10m trading_bot_scheduler | grep -E "check-stop-orders|paper_trading_manager"
   ```
-  Result: No unregistered task errors; scheduler continues emitting `check-stop-orders` (5m cadence).
+Result: No unregistered task errors; scheduler continues emitting `check-stop-orders` (5m cadence).
+
+### 2025-08-18 — 기획 검토 결과 및 결정(찹장 테스트 운영 계획)
+
+요약(기획 GPT 피드백 반영):
+- RTH 데일리 캡은 "액션 가능한 신호"만 카운트 → 유지(이미 코드 반영).
+- 병목은 컷오프/쿨다운/분당 토큰 몰림. 테스트 1–2일 한정으로 완화하고 롤백 조건을 명시.
+
+결정사항(코드 적용 전 합의):
+- 분 경계 버스트 완화: 분 초 0–10s 구간에 한해 Tier A에서 Reserve 토큰 폴백 허용(로깅 필수).
+- 중복 카운트 방지: RTH 캡 INCR 전 idempotency 키(`cap:{sym}:{date}:{slot}`)로 90s 중복 차단.
+- 타임존 일관성: America/New_York 기준 RTH 키 리셋 재점검(현행 ET/DST 처리 유지, 진단 로그 추가).
+- 방향 락(direction-lock): 동일 심볼 부호 반전 재진입 90s 금지(테스트 한정, 환경값으로 노출 예정).
+- 쿨다운: 180s → 120s(테스트 한정, 스팸 발생 시 150s로 롤백).
+- 컷오프 델타: RTH 동적 컷오프에 -0.03 임시 적용(테스트 한정, 하드 롤백 시간 지정).
+- 캡 구성: per-ticker(티어별 한도) + 글로벌 캡(안전장치) 설계 반영.
+
+롤백 트리거(운영 지표 기반):
+- 1시간 내 actionable ≥ 5 & stopout_rate ≥ 40% 또는 flip-flop ≥ 25% → cutoff_delta 축소, lock 120s, cooldown 150s.
+- 2시간 내 LLM calls 급증 또는 Tier-A overflow ≥ 15%/분 → LLM_MIN_SIGNAL_SCORE 0.65로 상향, Reserve 폴백 중단.
+
+모니터링/KPI(시간당 보고):
+- signals_generated vs suppressed 분포, strong-signal rate(|score| ≥ cutoff+0.2),
+  flip-flop count(10분 창), MAE/MFE 중앙값, token overflow rate, LLM calls, direction_lock hit 수.
