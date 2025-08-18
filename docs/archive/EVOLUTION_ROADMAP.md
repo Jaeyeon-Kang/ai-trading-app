@@ -1,7 +1,7 @@
-# Evolution Roadmap (Archive)
+# Evolution Roadmap (Archived)
 
-This is the original, full roadmap document preserved for reference.
+This roadmap has been consolidated into `docs/ROADMAP.md`.
 
-- Consolidated summary: see `docs/ROADMAP.md`.
-- Original full text remains at repository root: `EVOLUTION_ROADMAP.md`.
+- Universe tiers, token budgets, LLM gating, and risk caps now live in Roadmap.
+- For granular implementation notes, see `docs/UNIVERSE_EXPANSION_PLAN.md` and `docs/MIXED_UNIVERSE_IMPLEMENTATION.md`.
 

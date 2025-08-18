@@ -1,8 +1,6 @@
-# Development Journey (Archive)
+# Development Journey (Archived)
 
-This is the original debugging and bring-up journey document.
+This debugging/bring-up log is summarized in `docs/DEVELOPMENT_OVERVIEW.md` and continuously extended in `docs/IMPLEMENTATION_LOG.md`.
 
-- Consolidated developer view: see `docs/DEVELOPMENT_OVERVIEW.md`.
-- Detailed day-by-day log: `docs/IMPLEMENTATION_LOG.md`.
-- Original full text remains at repository root: `DEVELOPMENT_JOURNEY.md`.
+- Environment/Docker fixes, Celery task registration, streams typing, and Slack UX are captured in the overview.
 
