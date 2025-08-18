@@ -1422,11 +1422,15 @@ def generate_signals(self):
                 spread_bp = float(indicators.get("spread_bp", 0.0))
                 suppress_reason = None
                 
-                # RTH 일일 상한 (5건 목표) - 원자적 전치 체크
+                # RTH 일일 상한: '의미있는 신호'에 대해서만 카운트하기 위해
+                # 컷오프/리스크 체크를 통과한 이후로 INCR를 이동
+                rth_day_key = None
+                rth_daily_cap = None
+                r_conn = None
                 if session_label == "RTH":
                     try:
                         if rurl:
-                            r = redis.from_url(rurl)
+                            r_conn = redis.from_url(rurl)
                             rth_daily_cap = int(os.getenv("RTH_DAILY_CAP", "5"))
                             # ET 기준 날짜 키 (UTC-5, DST 간이 적용)
                             et_tz = timezone(timedelta(hours=-5))
@@ -1435,18 +1439,10 @@ def generate_signals(self):
                             if 3 <= now_et.month <= 11:
                                 et_tz = timezone(timedelta(hours=-4))
                                 now_et = datetime.now(et_tz)
-                            day_key = f"dailycap:{now_et:%Y%m%d}:RTH:{ticker}"
-                            # 원자적 체크-증가: INCR 후 결과로 판단
-                            current_count = r.incr(day_key)
-                            r.expire(day_key, 86400)  # ET EOD 만료 (24시간)
-                            if current_count > rth_daily_cap:
-                                # 상한 초과 시 카운터 롤백하고 억제
-                                r.decr(day_key)
-                                suppress_reason = "rth_daily_cap"
-                                logger.info(f"RTH 일일상한 초과: {ticker} ({current_count-1}/{rth_daily_cap})")
+                            rth_day_key = f"dailycap:{now_et:%Y%m%d}:RTH:{ticker}"
                     except Exception as e:
-                        logger.warning(f"RTH 일일상한 체크 실패: {e}")
-                        pass
+                        logger.warning(f"RTH 일일상한 키 준비 실패: {e}")
+                        r_conn = None
                 elif session_label in ["EXT", "CLOSED"]:  # CLOSED도 EXT 로직 적용
                     # EXT 세션 판별 및 억제 이유 로그 수집
                     logger.info(f"EXT 세션 체크: {ticker} ext_enabled={ext_enabled} dvol5m={dvol5m:.0f} spread_bp={spread_bp:.1f}")
@@ -1545,6 +1541,21 @@ def generate_signals(self):
                         # 최근 신호 리스트에 suppressed로 기록
                         _record_recent_signal(redis_url=rurl, signal=signal, session_label=session_label, indicators=indicators, suppressed=suppress_reason or "below_cutoff")
                         continue
+
+                    # RTH 일일 상한 체크: 컷오프/리스크 통과 후에 한 번만 적용
+                    if session_label == "RTH" and r_conn and rth_day_key and rth_daily_cap is not None:
+                        try:
+                            current_count = r_conn.incr(rth_day_key)
+                            r_conn.expire(rth_day_key, 86400)
+                            if current_count > rth_daily_cap:
+                                # 상한 초과면 롤백하고 억제 처리로 전환
+                                r_conn.decr(rth_day_key)
+                                logger.info(f"suppressed=rth_daily_cap ticker={ticker} session={session_label} "
+                                            f"score={signal.score:.3f} cut={cut:.3f} dvol5m={dvol5m:.0f} spread_bp={spread_bp:.1f}")
+                                _record_recent_signal(redis_url=rurl, signal=signal, session_label=session_label, indicators=indicators, suppressed="rth_daily_cap")
+                                continue
+                        except Exception as e:
+                            logger.warning(f"RTH 일일상한 체크 실패(사후): {e}")
 
                     # 7. Redis 스트림에 발행
                     signal_data = {

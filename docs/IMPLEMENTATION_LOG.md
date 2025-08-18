@@ -283,6 +283,18 @@ The system now operates with GPT-5 recommended efficiency while expanding capabi
 
 **Implementation Status: 🚀 COMPLETE - Ready for live trading Monday**
 
+### 2025-08-18 — Tuning for Live Testing (Option C)
+
+- Issue: Excessive `RTH 일일상한 초과` suppressions prevented signal accumulation and testing.
+- Env Tweaks: `RTH_DAILY_CAP=100`, `LLM_MIN_SIGNAL_SCORE=0.6` (in `.env`).
+- Code Change: Moved RTH daily-cap counter increment to after cutoff and risk checks in `app/jobs/scheduler.py` so only actionable signals count toward the cap.
+- Result: `rth_daily_cap` suppressions dropped to 0 in recent snapshots; remaining suppressions are mostly `below_cutoff` or `mixer_cooldown` as intended.
+- Verification:
+  ```bash
+  docker logs --since 2m trading_bot_worker | rg -i 'suppressed=rth_daily_cap' | wc -l   # → 0
+  docker logs --since 2m trading_bot_worker | rg -i 'suppressed=below_cutoff|mixer_cooldown'
+  ```
+
 ### 2025-08-18 — Fix: Celery unregistered task (paper_trading_manager.check_stop_orders)
 
 - Symptom: Worker logs showed “Received unregistered task of type 'app.jobs.paper_trading_manager.check_stop_orders'” and KeyError.
