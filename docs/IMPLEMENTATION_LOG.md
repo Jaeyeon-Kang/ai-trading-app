@@ -282,3 +282,17 @@ The system now operates with GPT-5 recommended efficiency while expanding capabi
 - Weekly Tier reassignment based on volatility changes
 
 **Implementation Status: 🚀 COMPLETE - Ready for live trading Monday**
+
+### 2025-08-18 — Fix: Celery unregistered task (paper_trading_manager.check_stop_orders)
+
+- Symptom: Worker logs showed “Received unregistered task of type 'app.jobs.paper_trading_manager.check_stop_orders'” and KeyError.
+- Root Cause: Celery worker did not import the task module, so tasks were not registered.
+- Change: Added Celery include list in `app/jobs/scheduler.py` to force task discovery:
+  - `include=["app.jobs.scheduler", "app.jobs.paper_trading_manager", "app.jobs.daily_briefing"]`
+- Deploy: Rebuilt and restarted `celery_worker` and `celery_beat` containers.
+- Verify:
+  ```bash
+  docker logs --since 10m trading_bot_worker | grep -i 'unregistered task' || echo OK
+  docker logs --since 10m trading_bot_scheduler | grep -E "check-stop-orders|paper_trading_manager"
+  ```
+  Result: No unregistered task errors; scheduler continues emitting `check-stop-orders` (5m cadence).

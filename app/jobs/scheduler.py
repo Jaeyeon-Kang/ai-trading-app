@@ -105,6 +105,11 @@ celery_app.conf.update(
     task_soft_time_limit=25 * 60,  # 25분
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=1000,
+    include=[
+        "app.jobs.scheduler",
+        "app.jobs.paper_trading_manager",
+        "app.jobs.daily_briefing",
+    ],
 )
 
 # 스케줄 설정
