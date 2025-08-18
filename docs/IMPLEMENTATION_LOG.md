@@ -351,3 +351,11 @@ Result: No unregistered task errors; scheduler continues emitting `check-stop-or
 모니터링/KPI(시간당 보고):
 - signals_generated vs suppressed 분포, strong-signal rate(|score| ≥ cutoff+0.2),
   flip-flop count(10분 창), MAE/MFE 중앙값, token overflow rate, LLM calls, direction_lock hit 수.
+
+### 2025-08-18 — 알파카 페이퍼 운영 스케줄(못 박음)
+
+- 최소 2세션(완화 모드), 권장 5세션(기본 모드 포함)로 이번 주 월~금 내 완료.
+- 8/18 밤–8/19 새벽, 8/19 밤–8/20 새벽: 완화 모드 2세션.
+- 8/20·8/21·8/22 밤: 기본 모드 3세션 → 8/23 05:00 KST 종료.
+- KPI 조기 합격 시 3~4세션에서 컷오버 가능. 급하면 KIS 작업으로 전환.
+- 임시 완화는 2세션 한정, 코어 로직 변경(캡 카운트 위치)은 지속 유지.
