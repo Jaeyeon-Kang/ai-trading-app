@@ -858,27 +858,41 @@ def get_basket_state(basket_name: str, window_seconds: int = 60) -> Dict[str, An
         # 최근 window_seconds 동안의 신호 수집
         now = time.time()
         cutoff_time = now - window_seconds
+        trend_cutoff_time = now - (window_seconds * 3)  # 3분 윈도우
         
-        scores = []
+        current_scores = []
+        trend_scores = []  # slope 계산용
+        
         for ticker in tickers:
-            # Redis에서 최근 스코어 가져오기 (예: signal_score:{ticker} 키)
+            # 현재 윈도우 스코어
             score_key = f"signal_score:{ticker}"
             score_data = r.get(score_key)
             if score_data:
                 try:
                     score_info = json.loads(score_data)
                     if score_info.get("timestamp", 0) >= cutoff_time:
-                        scores.append(score_info.get("score", 0))
+                        current_scores.append(score_info.get("score", 0))
+                except:
+                    pass
+            
+            # 추세 계산용 이전 스코어들
+            trend_key = f"score_history:{ticker}"
+            trend_data = r.lrange(trend_key, 0, -1)  # 전체 히스토리
+            for data in trend_data:
+                try:
+                    score_info = json.loads(data)
+                    if score_info.get("timestamp", 0) >= trend_cutoff_time:
+                        trend_scores.append((score_info.get("timestamp", 0), score_info.get("score", 0)))
                 except:
                     pass
         
-        if not scores:
+        if not current_scores:
             return {"neg_count": 0, "total_count": 0, "mean_score": 0, 
                    "neg_fraction": 0, "two_tick": False, "slope": 0}
         
-        neg_count = sum(1 for s in scores if s < -0.01)
-        total_count = len(scores)
-        mean_score = sum(scores) / len(scores) if scores else 0
+        neg_count = sum(1 for s in current_scores if s < -0.01)
+        total_count = len(current_scores)
+        mean_score = sum(current_scores) / len(current_scores) if current_scores else 0
         neg_fraction = neg_count / total_count if total_count > 0 else 0
         
         # 2틱 확인 (이전 윈도우와 비교)
@@ -900,8 +914,19 @@ def get_basket_state(basket_name: str, window_seconds: int = 60) -> Dict[str, An
             "timestamp": now
         }))
         
-        # 간단한 slope 계산 (추세)
-        slope = 0  # TODO: 실제 구현 시 시계열 분석 추가
+        # 실제 slope 계산 (간단한 선형 회귀)
+        slope = 0
+        if len(trend_scores) >= 3:
+            # 시간순 정렬
+            trend_scores.sort(key=lambda x: x[0])
+            
+            # 간단한 기울기 계산: (마지막 - 처음) / 시간차이
+            if len(trend_scores) >= 2:
+                first_score = trend_scores[0][1]
+                last_score = trend_scores[-1][1]
+                time_diff = trend_scores[-1][0] - trend_scores[0][0]
+                if time_diff > 0:
+                    slope = (last_score - first_score) / time_diff
         
         return {
             "neg_count": neg_count,
@@ -916,6 +941,22 @@ def get_basket_state(basket_name: str, window_seconds: int = 60) -> Dict[str, An
         logger.error(f"바스켓 상태 집계 실패: {e}")
         return {"neg_count": 0, "total_count": 0, "mean_score": 0, 
                "neg_fraction": 0, "two_tick": False, "slope": 0}
+
+def has_existing_position(symbol: str) -> bool:
+    """기존 포지션 존재 여부 체크 (GPT 요구: 추가 매수 금지)"""
+    try:
+        from app.adapters.trading_adapter import get_trading_adapter
+        trading_adapter = get_trading_adapter()
+        positions = trading_adapter.get_positions()
+        
+        for pos in positions:
+            if pos.ticker == symbol and pos.quantity > 0:
+                return True
+        return False
+        
+    except Exception as e:
+        logger.warning(f"포지션 체크 실패: {e}")
+        return False
 
 def can_open_etf_position(etf_symbol: str) -> Tuple[bool, str]:
     """
@@ -937,14 +978,10 @@ def can_open_etf_position(etf_symbol: str) -> Tuple[bool, str]:
             return False, "etf_locked"
         r.expire(lock_key, 90)
         
-        # 2. 기존 포지션 체크 (추가 구현 필요)
-        # TODO: trading_adapter에서 실제 포지션 확인
-        
-        # 3. 상충 포지션 체크
+        # 2. 상충 포지션 체크
         conflicts = CONFLICT_MAP.get(etf_symbol, set())
         for conflict_symbol in conflicts:
-            conflict_pos_key = f"position:{conflict_symbol}"
-            if r.exists(conflict_pos_key):
+            if has_existing_position(conflict_symbol):
                 r.delete(lock_key)  # 락 해제
                 return False, f"conflict_with_{conflict_symbol}"
         
@@ -984,36 +1021,47 @@ def route_signal_symbol(original_symbol: str, base_score: float) -> Dict[str, st
     # 숏 신호: 바스켓 체크
     basket_name = get_basket_for_symbol(original_symbol)
     if not basket_name:
-        # 바스켓에 속하지 않는 종목은 스킵
+        # 바스켓에 속하지 않는 종목은 스킵 (SPXS fallback 제거)
         return {
             "exec_symbol": None,
             "intent": "skip",
-            "route_reason": "not_in_basket"
+            "route_reason": "not_in_any_basket"
         }
     
     # 바스켓 상태 확인
     basket_state = get_basket_state(basket_name)
     basket_info = BASKETS[basket_name]
     
-    # 바스켓 조건 체크
+    # 바스켓 조건 체크 (GPT 요구: AND 게이트 4개 모두 충족)
     conditions_met = (
         basket_state["total_count"] >= basket_info.get("min_signals", 3) and
         basket_state["neg_fraction"] >= basket_info.get("neg_fraction", 0.60) and
         basket_state["mean_score"] <= basket_info.get("mean_threshold", -0.12) and
-        basket_state["two_tick"]  # 2틱 연속 확인
+        basket_state["two_tick"] and  # 2틱 연속 확인
+        basket_state["slope"] < 0  # 하락 기울기 확인 (GPT 요구)
     )
     
     if not conditions_met:
+        # 상세 로그로 바스켓 상태 출력 (GPT 요구)
+        state_detail = f"nf={basket_state['neg_fraction']:.2f},mean={basket_state['mean_score']:.3f},slope={basket_state['slope']:.4f},2tick={basket_state['two_tick']}"
         return {
             "exec_symbol": None,
             "intent": "suppress",
-            "route_reason": f"basket_conditions_not_met_{basket_name}"
+            "route_reason": f"basket_conditions_not_met_{basket_name}({state_detail})"
         }
     
     # ETF 결정
     target_etf = basket_info["etf"]
     
-    # ETF 포지션 오픈 가능 체크
+    # 기존 포지션 체크 (GPT 요구: 추가 매수 금지)
+    if has_existing_position(target_etf):
+        return {
+            "exec_symbol": None,
+            "intent": "suppress",
+            "route_reason": f"position_exists_{target_etf}"
+        }
+    
+    # ETF 포지션 오픈 가능 체크 (락 및 상충)
     can_open, reason = can_open_etf_position(target_etf)
     if not can_open:
         return {
@@ -1022,10 +1070,12 @@ def route_signal_symbol(original_symbol: str, base_score: float) -> Dict[str, st
             "route_reason": f"etf_blocked_{reason}"
         }
     
+    # 성공적 라우팅 (상세 로그 포함)
+    state_detail = f"nf={basket_state['neg_fraction']:.2f},mean={basket_state['mean_score']:.3f},slope={basket_state['slope']:.4f},2tick={basket_state['two_tick']}"
     return {
         "exec_symbol": target_etf,
         "intent": "enter_inverse",
-        "route_reason": f"{basket_name}_cluster->{target_etf}"
+        "route_reason": f"{basket_name}_cluster->{target_etf}({state_detail})"
     }
 
 def is_actionable_signal(effective_score: float) -> bool:
@@ -2617,18 +2667,27 @@ def generate_signals(self):
                         redis_streams.publish_signal(signal_data)
                         logger.info(f"🔥 [DEBUG] Redis 스트림 발행 성공: {ticker}")
                         
-                        # 바스켓 분석을 위한 슠호 스코어 저장
+                        # 바스켓 분석을 위한 신호 스코어 저장 및 히스토리 추가
                         try:
                             rurl = os.getenv("REDIS_URL")
                             if rurl:
                                 r = redis.from_url(rurl)
+                                now = time.time()
+                                
+                                # 현재 스코어 저장
                                 score_key = f"signal_score:{ticker}"
                                 score_data = {
                                     "score": signal.score,
-                                    "timestamp": time.time(),
+                                    "timestamp": now,
                                     "signal_type": signal.signal_type.value
                                 }
                                 r.setex(score_key, 300, json.dumps(score_data))  # 5분 TTL
+                                
+                                # 히스토리 저장 (slope 계산용)
+                                history_key = f"score_history:{ticker}"
+                                r.lpush(history_key, json.dumps(score_data))
+                                r.ltrim(history_key, 0, 19)  # 최근 20개만 유지
+                                r.expire(history_key, 1800)  # 30분 TTL
                         except Exception as e:
                             logger.warning(f"신호 스코어 저장 실패: {e}")
                         
