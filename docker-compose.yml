@@ -73,6 +73,8 @@ services:
       - LLM_GATING_ENABLED=${LLM_GATING_ENABLED:-true}
       - LLM_MIN_SIGNAL_SCORE=${LLM_MIN_SIGNAL_SCORE:-0.7}
       - LLM_CACHE_DURATION_MIN=${LLM_CACHE_DURATION_MIN:-30}
+      - MIXER_THRESHOLD=${MIXER_THRESHOLD:-0.15}
+      - SIGNAL_CUTOFF_RTH=${SIGNAL_CUTOFF_RTH:-0.12}
       - POSITION_CAP_ENABLED=${POSITION_CAP_ENABLED:-true}
       - POSITION_MAX_EQUITY_PCT=${POSITION_MAX_EQUITY_PCT:-0.8}
       - POSITION_MIN_SLOTS=${POSITION_MIN_SLOTS:-3}
@@ -98,7 +100,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: trading_bot_worker
-    command: celery -A app.jobs.scheduler worker --loglevel=info --concurrency=2
+    command: celery -A app.jobs.scheduler worker --loglevel=info --concurrency=2 --time-limit=600 --soft-time-limit=540
     env_file:
       - .env
     environment:
@@ -127,6 +129,8 @@ services:
       - LLM_GATING_ENABLED=${LLM_GATING_ENABLED:-true}
       - LLM_MIN_SIGNAL_SCORE=${LLM_MIN_SIGNAL_SCORE:-0.7}
       - LLM_CACHE_DURATION_MIN=${LLM_CACHE_DURATION_MIN:-30}
+      - MIXER_THRESHOLD=${MIXER_THRESHOLD:-0.15}
+      - SIGNAL_CUTOFF_RTH=${SIGNAL_CUTOFF_RTH:-0.12}
       - POSITION_CAP_ENABLED=${POSITION_CAP_ENABLED:-true}
       - POSITION_MAX_EQUITY_PCT=${POSITION_MAX_EQUITY_PCT:-0.8}
       - POSITION_MIN_SLOTS=${POSITION_MIN_SLOTS:-3}
@@ -173,6 +177,8 @@ services:
       - LLM_GATING_ENABLED=${LLM_GATING_ENABLED:-true}
       - LLM_MIN_SIGNAL_SCORE=${LLM_MIN_SIGNAL_SCORE:-0.7}
       - LLM_CACHE_DURATION_MIN=${LLM_CACHE_DURATION_MIN:-30}
+      - MIXER_THRESHOLD=${MIXER_THRESHOLD:-0.15}
+      - SIGNAL_CUTOFF_RTH=${SIGNAL_CUTOFF_RTH:-0.12}
       - POSITION_CAP_ENABLED=${POSITION_CAP_ENABLED:-true}
       - POSITION_MAX_EQUITY_PCT=${POSITION_MAX_EQUITY_PCT:-0.8}
       - POSITION_MIN_SLOTS=${POSITION_MIN_SLOTS:-3}

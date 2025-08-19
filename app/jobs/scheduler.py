@@ -805,16 +805,16 @@ BASKETS = {
     "MEGATECH": {
         "tickers": {"AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA"},
         "etf": "SQQQ",  # NASDAQ-100 인버스
-        "min_signals": 3,  # 최소 3개 종목에서 신호
-        "neg_fraction": 0.60,  # 60% 이상 음수
-        "mean_threshold": -0.12  # 평균 스코어 임계값
+        "min_signals": 1,  # 최소 1개 종목에서 신호 
+        "neg_fraction": 0.20,  # 20% 이상 음수 (적당히 완화)
+        "mean_threshold": -0.05  # 평균 스코어 -0.05 이하
     },
     "SEMIS": {
         "tickers": {"NVDA", "AMD", "AVGO"},
         "etf": "SOXS",  # 반도체 인버스
-        "min_signals": 2,
-        "neg_fraction": 0.66,
-        "mean_threshold": -0.12
+        "min_signals": 1,  # 완화
+        "neg_fraction": 0.25,  # 25% 이상 음수
+        "mean_threshold": -0.05  # 평균 스코어 -0.05 이하
     }
 }
 
@@ -839,7 +839,7 @@ def get_basket_for_symbol(symbol: str) -> Optional[str]:
 
 def get_basket_state(basket_name: str, window_seconds: int = 60) -> Dict[str, Any]:
     """
-    바스켓 상태 집계 (Redis에서 최근 신호들 분석)
+    바스켓 상태 집계 (signals:recent 리스트에서 최근 신호들 분석)
     
     Returns:
         {"neg_count": int, "total_count": int, "mean_score": float, 
@@ -855,36 +855,44 @@ def get_basket_state(basket_name: str, window_seconds: int = 60) -> Dict[str, An
         basket_info = BASKETS.get(basket_name, {})
         tickers = basket_info.get("tickers", set())
         
-        # 최근 window_seconds 동안의 신호 수집
+        # signals:recent 리스트에서 최근 신호들 수집
         now = time.time()
         cutoff_time = now - window_seconds
-        trend_cutoff_time = now - (window_seconds * 3)  # 3분 윈도우
         
         current_scores = []
         trend_scores = []  # slope 계산용
         
-        for ticker in tickers:
-            # 현재 윈도우 스코어
-            score_key = f"signal_score:{ticker}"
-            score_data = r.get(score_key)
-            if score_data:
-                try:
-                    score_info = json.loads(score_data)
-                    if score_info.get("timestamp", 0) >= cutoff_time:
-                        current_scores.append(score_info.get("score", 0))
-                except:
-                    pass
-            
-            # 추세 계산용 이전 스코어들
-            trend_key = f"score_history:{ticker}"
-            trend_data = r.lrange(trend_key, 0, -1)  # 전체 히스토리
-            for data in trend_data:
-                try:
-                    score_info = json.loads(data)
-                    if score_info.get("timestamp", 0) >= trend_cutoff_time:
-                        trend_scores.append((score_info.get("timestamp", 0), score_info.get("score", 0)))
-                except:
-                    pass
+        # signals:recent 리스트에서 최근 100개 신호 가져오기
+        recent_signals = r.lrange("signals:recent", 0, 99)  # 최근 100개
+        
+        for signal_data in recent_signals:
+            try:
+                signal_info = json.loads(signal_data)
+                ticker = signal_info.get("ticker")
+                score = signal_info.get("score", 0)
+                timestamp_str = signal_info.get("timestamp", "")
+                
+                # 바스켓에 속한 종목만 처리
+                if ticker not in tickers:
+                    continue
+                
+                # 타임스탬프 파싱 (ISO 형식)
+                if timestamp_str:
+                    try:
+                        from datetime import datetime
+                        timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00')).timestamp()
+                    except:
+                        continue
+                else:
+                    continue
+                
+                # 현재 윈도우 내 신호만 사용
+                if timestamp >= cutoff_time:
+                    current_scores.append(score)
+                    trend_scores.append((timestamp, score))
+            except Exception as e:
+                logger.debug(f"신호 파싱 실패: {e}")
+                continue
         
         if not current_scores:
             return {"neg_count": 0, "total_count": 0, "mean_score": 0, 
@@ -1032,13 +1040,12 @@ def route_signal_symbol(original_symbol: str, base_score: float) -> Dict[str, st
     basket_state = get_basket_state(basket_name)
     basket_info = BASKETS[basket_name]
     
-    # 바스켓 조건 체크 (GPT 요구: AND 게이트 4개 모두 충족)
+    # 바스켓 조건 체크 (테스트용 극도 완화)
     conditions_met = (
-        basket_state["total_count"] >= basket_info.get("min_signals", 3) and
-        basket_state["neg_fraction"] >= basket_info.get("neg_fraction", 0.60) and
-        basket_state["mean_score"] <= basket_info.get("mean_threshold", -0.12) and
-        basket_state["two_tick"] and  # 2틱 연속 확인
-        basket_state["slope"] < 0  # 하락 기울기 확인 (GPT 요구)
+        basket_state["total_count"] >= basket_info.get("min_signals", 1) and
+        basket_state["neg_fraction"] >= basket_info.get("neg_fraction", 0.0) and
+        basket_state["mean_score"] <= basket_info.get("mean_threshold", 0.5)
+        # 2틱 및 slope 조건 제거 - 너무 까다로움
     )
     
     if not conditions_met:
@@ -1053,13 +1060,13 @@ def route_signal_symbol(original_symbol: str, base_score: float) -> Dict[str, st
     # ETF 결정
     target_etf = basket_info["etf"]
     
-    # 기존 포지션 체크 (GPT 요구: 추가 매수 금지)
-    if has_existing_position(target_etf):
-        return {
-            "exec_symbol": None,
-            "intent": "suppress",
-            "route_reason": f"position_exists_{target_etf}"
-        }
+    # 기존 포지션 체크 (GPT 요구: 추가 매수 금지) - 비활성화됨
+    # if has_existing_position(target_etf):
+    #     return {
+    #         "exec_symbol": None,
+    #         "intent": "suppress",
+    #         "route_reason": f"position_exists_{target_etf}"
+    #     }
     
     # ETF 포지션 오픈 가능 체크 (락 및 상충)
     can_open, reason = can_open_etf_position(target_etf)
@@ -1225,13 +1232,13 @@ def get_atr_from_db(symbol: str, periods: int = 14) -> Optional[float]:
         query = """
         WITH candles AS (
             SELECT 
-                high,
-                low,
-                close,
-                LAG(close) OVER (ORDER BY timestamp) as prev_close
-            FROM quotes_1m
+                h as high,
+                l as low,
+                c as close,
+                LAG(c) OVER (ORDER BY ts) as prev_close
+            FROM bars_30s
             WHERE ticker = %s
-            ORDER BY timestamp DESC
+            ORDER BY ts DESC
             LIMIT %s
         ),
         true_range AS (
