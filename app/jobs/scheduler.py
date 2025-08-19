@@ -1269,31 +1269,64 @@ def calc_entry_quantity(trading_adapter, symbol: str, equity: float, stop_distan
         if not current_price or current_price <= 0 or stop_distance <= 0:
             return 0
         
+        # === 1. 사이징 자본 오버라이드 (GPT 권장) ===
+        sizing_mode = os.getenv("SIZING_EQUITY_MODE", "broker")
+        if sizing_mode == "override":
+            equity_krw = float(os.getenv("SIZING_EQUITY_KRW", "1000000"))
+            usd_krw_rate = float(os.getenv("USD_KRW_RATE", "1350"))
+            equity_usd = equity_krw / usd_krw_rate
+        else:
+            # 기존 브로커 계좌 기준 (USD)
+            equity_usd = equity
+            equity_krw = equity * float(os.getenv("USD_KRW_RATE", "1350"))
+        
+        # === 2. 고가 종목 하드 필터 (GPT 권장) ===
+        max_price_per_share = float(os.getenv("MAX_PRICE_PER_SHARE_USD", "120"))
+        if current_price > max_price_per_share and not FRACTIONAL_ENABLED:
+            logger.warning(f"🚫 고가종목 스킵: {symbol} ${current_price:.2f} > ${max_price_per_share}")
+            return 0  # suppress("price_cap_exceeded")
+        
         # 리스크 금액 = 계좌 자산 * 거래당 리스크 비율
-        risk_amount = equity * RISK_PER_TRADE
+        risk_amount_usd = equity_usd * RISK_PER_TRADE
         
         # 포지션 사이즈 = 리스크 금액 / 스톱 거리
-        # GPT 권장 공식: position_size = (risk_per_trade * equity) / stop_loss_distance
-        raw_qty = risk_amount / stop_distance
+        raw_qty = risk_amount_usd / stop_distance
         
-        # 소액 계좌 보호: 최대 계좌의 80% / 최소 3개 포지션 보장
-        max_position_value = equity * 0.8 / 3  # 최대 포지션당 자산의 26.7%
-        max_qty_by_equity = max_position_value / current_price
+        # === 3. 프랙셔널 스위치 명확화 (GPT 권장) ===
+        min_notional_usd = float(os.getenv("MIN_ORDER_NOTIONAL_USD", "20"))
+        if FRACTIONAL_ENABLED:
+            qty = round(raw_qty, 2)  # 소수점 2자리
+        else:
+            qty = math.floor(raw_qty)
         
-        # 두 제한 중 작은 값 사용
-        raw_qty = min(raw_qty, max_qty_by_equity)
+        # 최소 주문 금액 체크
+        if qty * current_price < min_notional_usd:
+            logger.warning(f"🚫 최소 주문금액 미달: {symbol} ${qty * current_price:.2f} < ${min_notional_usd}")
+            return 0  # suppress("notional_too_small")
         
+        # === 4. 노출 상한 (한화 기준) 세이프티넷 (GPT 권장) ===
+        max_notional_krw = float(os.getenv("MAX_NOTIONAL_PER_TRADE_KRW", "600000"))
+        notional_krw = qty * current_price * float(os.getenv("USD_KRW_RATE", "1350"))
+        if notional_krw > max_notional_krw:
+            # 한화 기준 상한에 맞춰 수량 조정
+            adjusted_qty = int(max_notional_krw / (current_price * float(os.getenv("USD_KRW_RATE", "1350"))))
+            logger.warning(f"⚠️ 한화 노출 상한 조정: {symbol} {qty}주 → {adjusted_qty}주 (₩{notional_krw:,.0f} → ₩{max_notional_krw:,.0f})")
+            qty = adjusted_qty
+        
+        # 최소 수량 보장
         meta = INSTRUMENT_META.get(symbol, {"min_qty": 1})
         min_qty = meta["min_qty"]
+        final_qty = max(qty, min_qty) if qty > 0 else 0
         
-        # 최종 수량 결정
-        if FRACTIONAL_ENABLED:
-            final_qty = max(round(raw_qty, 4), min_qty)
-        else:
-            final_qty = max(int(math.floor(raw_qty)), min_qty)
-        
-        # 수량 결정 로깅
-        logger.info(f"📊 수량 계산 {symbol}: 리스크${risk_amount:.2f} / 스톱${stop_distance:.2f} = {raw_qty:.2f}주 → {final_qty}주")
+        # === 5. 사이징 디버그 로그 (GPT 권장) ===
+        logger.info(
+            f"📊 sizing: equity_krw={equity_krw:,.0f} equity_usd={equity_usd:.0f} "
+            f"risk={RISK_PER_TRADE*100}% risk_usd={risk_amount_usd:.2f} "
+            f"stop={stop_distance:.2f} last={current_price:.2f} qty={final_qty} "
+            f"fractional={'ON' if FRACTIONAL_ENABLED else 'OFF'} "
+            f"notional_krw={final_qty * current_price * float(os.getenv('USD_KRW_RATE', '1350')):,.0f} "
+            f"decision={'enter' if final_qty > 0 else 'skip'}"
+        )
         
         return final_qty
     except Exception as e:
