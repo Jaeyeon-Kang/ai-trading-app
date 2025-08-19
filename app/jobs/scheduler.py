@@ -9,7 +9,7 @@ import logging
 import os
 import time
 import math
-from decimal import Decimal
+# from decimal import Decimal  # 사용되지 않음
 from typing import Dict, List, Optional, Tuple, Union
 import urllib.parse as _urlparse
 
@@ -24,6 +24,9 @@ from celery.signals import beat_init, task_prerun, worker_process_init, worker_r
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from app.config import settings, get_signal_cutoffs, sanitize_cutoffs_in_redis
+from app.utils.rate_limiter import get_rate_limiter, TokenTier
+
 # GPT-5 리스크 관리 통합
 try:
     from app.engine.risk_manager import get_risk_manager
@@ -32,9 +35,6 @@ try:
 except ImportError:
     RISK_MANAGER_AVAILABLE = False
     logger.warning("⚠️ 리스크 관리자 import 실패 - 기본 모드로 동작")
-
-from app.config import settings, get_signal_cutoffs, sanitize_cutoffs_in_redis
-from app.utils.rate_limiter import get_rate_limiter, TokenTier
 
 def check_signal_risk_feasibility(signal, session_label):
     """
@@ -800,6 +800,58 @@ INSTRUMENT_META = {
     "SARK": {"underlying": "ARKK", "exposure_sign": -1, "min_qty": 1},
 }
 
+# 심볼 라우팅 맵 (개별주 숏 신호 → 인버스 ETF 매수)
+SYMBOL_ROUTING_MAP = {
+    # NASDAQ-100 메가캡 → SQQQ
+    "AAPL": "SQQQ",
+    "MSFT": "SQQQ", 
+    "TSLA": "SQQQ",
+    "AMZN": "SQQQ",
+    "META": "SQQQ",
+    "GOOGL": "SQQQ",
+    
+    # 반도체 → SOXS
+    "NVDA": "SOXS",
+    "AMD": "SOXS",
+    "AVGO": "SOXS",
+    
+    # 이미 인버스 ETF인 경우는 그대로
+    "SQQQ": "SQQQ",
+    "SOXS": "SOXS", 
+    "SPXS": "SPXS",
+    "TZA": "TZA",
+    "SDOW": "SDOW",
+    "TECS": "TECS",
+    "DRV": "DRV",
+    "SARK": "SARK",
+}
+
+def route_signal_symbol(original_symbol: str, base_score: float) -> Dict[str, str]:
+    """
+    신호 심볼을 실제 거래 심볼로 라우팅
+    
+    Args:
+        original_symbol: 원래 신호 심볼 (예: MSFT)
+        base_score: 원래 신호 스코어 (예: -0.395)
+        
+    Returns:
+        {"exec_symbol": "SQQQ", "intent": "enter_inverse", "route_reason": "MSFT->SQQQ"}
+    """
+    if base_score >= 0:  # 롱 신호는 원래 심볼 그대로
+        return {
+            "exec_symbol": original_symbol, 
+            "intent": "enter_long",
+            "route_reason": f"{original_symbol}->자체(롱)"
+        }
+    
+    # 숏 신호 → 인버스 ETF 매수로 변환
+    exec_symbol = SYMBOL_ROUTING_MAP.get(original_symbol, "SPXS")  # 기본값: SPXS
+    return {
+        "exec_symbol": exec_symbol,
+        "intent": "enter_inverse", 
+        "route_reason": f"{original_symbol}->{exec_symbol}(인버스)"
+    }
+
 def is_actionable_signal(effective_score: float) -> bool:
     """신호가 액션 가능한지 확인"""
     return effective_score >= BUY_THRESHOLD or effective_score <= SELL_THRESHOLD
@@ -1191,35 +1243,54 @@ def place_bracket_order(trading_adapter, symbol: str, side: str, quantity: int, 
             logger.error(f"❌ 잘못된 OCO 가격: SL=${stop_price:.2f}, TP=${take_profit_price:.2f}")
             raise ValueError("Invalid OCO prices")
         
-        # 시장가 주문 실행
-        main_order = trading_adapter.submit_market_order(
-            ticker=symbol,
-            side=side,
-            quantity=quantity,
-            signal_id=f"bracket_{symbol}_{int(time.time())}"
-        )
-        
-        # OCO 주문 등록 (Redis에 저장하여 별도 태스크에서 처리)
+        # 브래킷 주문 (진입 + 스톱로스 + 익절) 원샷 제출
         try:
-            redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
-            oco_data = {
-                "symbol": symbol,
-                "quantity": quantity,
-                "stop_loss": stop_price,
-                "take_profit": take_profit_price,
-                "parent_order_id": getattr(main_order, 'id', 'unknown'),
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }
-            redis_client.hset(
-                f"oco_pending:{symbol}",
-                getattr(main_order, 'id', f"temp_{int(time.time())}"),
-                json.dumps(oco_data)
+            if hasattr(trading_adapter, 'submit_bracket_order'):
+                # 알파카 브래킷 주문 사용 (GPT 권장: 원샷 제출)
+                main_order, stop_order_id, profit_order_id = trading_adapter.submit_bracket_order(
+                    ticker=symbol,
+                    side=side,
+                    quantity=quantity,
+                    stop_loss_price=stop_price,
+                    take_profit_price=take_profit_price,
+                    signal_id=f"bracket_{symbol}_{int(time.time())}"
+                )
+                logger.info(f"🎯 브래킷 주문 완료: {symbol} SL=${stop_price:.2f}, TP=${take_profit_price:.2f}, stop_id={stop_order_id}, profit_id={profit_order_id}")
+            else:
+                # 폴백: 기존 방식 (시장가 + Redis OCO)
+                main_order = trading_adapter.submit_market_order(
+                    ticker=symbol,
+                    side=side,
+                    quantity=quantity,
+                    signal_id=f"bracket_{symbol}_{int(time.time())}"
+                )
+                
+                # Redis OCO 등록
+                redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+                oco_data = {
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "stop_loss": stop_price,
+                    "take_profit": take_profit_price,
+                    "parent_order_id": getattr(main_order, 'id', 'unknown'),
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }
+                redis_client.hset(
+                    f"oco_pending:{symbol}",
+                    getattr(main_order, 'id', f"temp_{int(time.time())}"),
+                    json.dumps(oco_data)
+                )
+                redis_client.expire(f"oco_pending:{symbol}", 86400)
+                logger.info(f"🎯 폴백 OCO 등록: {symbol} SL=${stop_price:.2f}, TP=${take_profit_price:.2f}")
+        except Exception as bracket_e:
+            logger.warning(f"브래킷 주문 실패, 폴백 시도: {bracket_e}")
+            # 브래킷 실패 시 최소한 시장가 주문만이라도 실행
+            main_order = trading_adapter.submit_market_order(
+                ticker=symbol,
+                side=side,
+                quantity=quantity,
+                signal_id=f"fallback_{symbol}_{int(time.time())}"
             )
-            redis_client.expire(f"oco_pending:{symbol}", 86400)  # 24시간 TTL
-            
-            logger.info(f"🎯 OCO 주문 등록: {symbol} SL=${stop_price:.2f}, TP=${take_profit_price:.2f}")
-        except Exception as oco_e:
-            logger.warning(f"OCO 등록 실패 (주문은 실행됨): {oco_e}")
         
         logger.info(
             f"✅ 브래킷 주문 실행: {symbol} {side} {quantity}주 @ ${float(current_price):.2f}\n"
@@ -1355,15 +1426,27 @@ def pipeline_e2e(self):
                     log_signal_decision(signal_data, symbol or "unknown", "suppress", "unknown_symbol")
                     continue
                 
-                # 인버스 ETF 신호 처리
-                meta = INSTRUMENT_META[symbol]
-                effective_score = meta["exposure_sign"] * base_score
+                # 🔄 심볼 라우팅 (개별주 숏 → 인버스 ETF 매수)
+                route_result = route_signal_symbol(symbol, base_score)
+                exec_symbol = route_result["exec_symbol"]
+                route_reason = route_result["route_reason"]
+                
+                # 실행 심볼의 메타데이터 확인
+                if exec_symbol not in INSTRUMENT_META:
+                    log_signal_decision(signal_data, symbol, "suppress", f"routed_symbol_unknown:{exec_symbol}")
+                    continue
+                
+                # 라우팅된 심볼로 effective_score 계산
+                exec_meta = INSTRUMENT_META[exec_symbol]
+                effective_score = exec_meta["exposure_sign"] * base_score
                 
                 # 액션 가능성 확인
                 if not is_actionable_signal(effective_score):
-                    log_signal_decision(signal_data, symbol, "suppress", "below_cutoff")
+                    log_signal_decision(signal_data, symbol, "suppress", f"below_cutoff:routed_to_{exec_symbol}")
                     signals_suppressed["below_cutoff"] += 1
                     continue
+                
+                logger.info(f"🔄 라우팅: {route_reason}, 스코어: {base_score:.3f} → {effective_score:.3f}")
                 
                 # 중복 이벤트 차단
                 if not claim_idempotency(redis_client, event_id, ttl=900):
@@ -1371,20 +1454,20 @@ def pipeline_e2e(self):
                     signals_suppressed["dup_event"] += 1
                     continue
                 
-                # 쿨다운 확인
-                if is_in_cooldown(redis_client, symbol):
-                    log_signal_decision(signal_data, symbol, "suppress", "cooldown")
+                # 쿨다운 확인 (실행 심볼 기준)
+                if is_in_cooldown(redis_client, exec_symbol):
+                    log_signal_decision(signal_data, symbol, "suppress", f"cooldown:{exec_symbol}")
                     signals_suppressed["cooldown"] += 1
                     continue
                 
-                # 일일 신호 한도 확인
-                if exceeds_daily_cap(redis_client, symbol):
-                    log_signal_decision(signal_data, symbol, "suppress", "daily_cap")
+                # 일일 신호 한도 확인 (실행 심볼 기준)
+                if exceeds_daily_cap(redis_client, exec_symbol):
+                    log_signal_decision(signal_data, symbol, "suppress", f"daily_cap:{exec_symbol}")
                     signals_suppressed["daily_cap"] += 1
                     continue
                 
-                # 현재 포지션 확인
-                current_position = get_open_position(trading_adapter, symbol)
+                # 현재 포지션 확인 (실행 심볼 기준)
+                current_position = get_open_position(trading_adapter, exec_symbol)
                 
                 # 거래 방향 결정
                 if effective_score >= BUY_THRESHOLD:
@@ -1397,16 +1480,16 @@ def pipeline_e2e(self):
                     log_signal_decision(signal_data, symbol, "suppress", "neutral_zone")
                     continue
                 
-                # 방향락 확인
-                if is_direction_locked(redis_client, symbol, wanted_direction):
-                    log_signal_decision(signal_data, symbol, "suppress", "direction_lock")
+                # 방향락 확인 (실행 심볼 기준)
+                if is_direction_locked(redis_client, exec_symbol, wanted_direction):
+                    log_signal_decision(signal_data, symbol, "suppress", f"direction_lock:{exec_symbol}")
                     signals_suppressed["direction_lock"] += 1
                     continue
                 
-                # 스톱 거리 계산
-                stop_distance = get_stop_distance(trading_adapter, symbol)
+                # 스톱 거리 계산 (실행 심볼 기준)
+                stop_distance = get_stop_distance(trading_adapter, exec_symbol)
                 if stop_distance <= 0:
-                    log_signal_decision(signal_data, symbol, "suppress", "invalid_stop_distance")
+                    log_signal_decision(signal_data, symbol, "suppress", f"invalid_stop_distance:{exec_symbol}")
                     continue
                 
                 # 거래 실행 로직
@@ -1414,23 +1497,23 @@ def pipeline_e2e(self):
                     if current_position:
                         # 추가 매수 (피라미딩) 검토
                         if can_pyramid(trading_adapter, current_position, equity, stop_distance):
-                            quantity = calc_add_quantity(trading_adapter, symbol, current_position, equity, stop_distance)
+                            quantity = calc_add_quantity(trading_adapter, exec_symbol, current_position, equity, stop_distance)
                             if quantity > 0:
-                                trade = place_bracket_order(trading_adapter, symbol, "buy", quantity, stop_distance)
-                                set_cooldown(redis_client, symbol, COOLDOWN_SECONDS)
-                                set_direction_lock(redis_client, symbol, "long", DIRECTION_LOCK_SECONDS)
-                                count_daily_cap(redis_client, symbol)
+                                trade = place_bracket_order(trading_adapter, exec_symbol, "buy", quantity, stop_distance)
+                                set_cooldown(redis_client, exec_symbol, COOLDOWN_SECONDS)
+                                set_direction_lock(redis_client, exec_symbol, "long", DIRECTION_LOCK_SECONDS)
+                                count_daily_cap(redis_client, exec_symbol)
                                 orders_executed += 1
-                                log_signal_decision(signal_data, symbol, "add", f"qty={quantity}")
+                                log_signal_decision(signal_data, symbol, "add", f"exec_symbol={exec_symbol},qty={quantity}")
                                 
                                 # Slack 알림
                                 if slack_bot:
-                                    slack_message = f"📈 *추가 매수*\n• {symbol} +{quantity}주 @ ${float(getattr(trade, 'price', 0)):.2f}\n• 신호점수: {effective_score:.3f}\n• 기존포지션: {current_position['qty']}주"
+                                    slack_message = f"📈 *추가 매수*\n• {exec_symbol} +{quantity}주 @ ${float(getattr(trade, 'price', 0)):.2f}\n• 원신호: {symbol}({base_score:.3f})\n• 라우팅: {route_reason}\n• 기존포지션: {current_position['qty']}주"
                                     slack_bot.send_message(slack_message)
                             else:
-                                log_signal_decision(signal_data, symbol, "suppress", "qty_zero_add")
+                                log_signal_decision(signal_data, symbol, "suppress", f"qty_zero_add:{exec_symbol}")
                         else:
-                            log_signal_decision(signal_data, symbol, "suppress", "already_long_no_pyramid")
+                            log_signal_decision(signal_data, symbol, "suppress", f"already_long_no_pyramid:{exec_symbol}")
                     else:
                         # 신규 진입
                         if risk_budget_left <= 0:
@@ -1438,47 +1521,47 @@ def pipeline_e2e(self):
                             signals_suppressed["risk_budget"] += 1
                             continue
                         
-                        quantity = calc_entry_quantity(trading_adapter, symbol, equity, stop_distance)
+                        quantity = calc_entry_quantity(trading_adapter, exec_symbol, equity, stop_distance)
                         if quantity > 0:
-                            trade = place_bracket_order(trading_adapter, symbol, "buy", quantity, stop_distance)
-                            set_cooldown(redis_client, symbol, COOLDOWN_SECONDS)
-                            set_direction_lock(redis_client, symbol, "long", DIRECTION_LOCK_SECONDS)
-                            count_daily_cap(redis_client, symbol)
+                            trade = place_bracket_order(trading_adapter, exec_symbol, "buy", quantity, stop_distance)
+                            set_cooldown(redis_client, exec_symbol, COOLDOWN_SECONDS)
+                            set_direction_lock(redis_client, exec_symbol, "long", DIRECTION_LOCK_SECONDS)
+                            count_daily_cap(redis_client, exec_symbol)
                             risk_budget_left -= (equity * RISK_PER_TRADE)
                             orders_executed += 1
-                            log_signal_decision(signal_data, symbol, "entry", f"qty={quantity}")
+                            log_signal_decision(signal_data, symbol, "entry", f"exec_symbol={exec_symbol},qty={quantity}")
                             
                             # Slack 알림
                             if slack_bot:
-                                slack_message = f"🚀 *신규 진입*\n• {symbol} {quantity}주 @ ${float(getattr(trade, 'price', 0)):.2f}\n• 신호점수: {effective_score:.3f}\n• 스톱거리: ${float(stop_distance):.2f}"
+                                slack_message = f"🚀 *신규 진입*\n• {exec_symbol} {quantity}주 @ ${float(getattr(trade, 'price', 0)):.2f}\n• 원신호: {symbol}({base_score:.3f})\n• 라우팅: {route_reason}\n• 스톱거리: ${float(stop_distance):.2f}"
                                 slack_bot.send_message(slack_message)
                         else:
-                            log_signal_decision(signal_data, symbol, "suppress", "qty_zero_entry")
+                            log_signal_decision(signal_data, symbol, "suppress", f"qty_zero_entry:{exec_symbol}")
                 
                 elif action == "sell":
                     if current_position:
-                        # 포지션 청산
+                        # 포지션 청산 (실행 심볼 기준)
                         quantity = abs(current_position["qty"])
                         trade = trading_adapter.submit_market_order(
-                            ticker=symbol,
+                            ticker=exec_symbol,
                             side="sell",
                             quantity=quantity,
-                            signal_id=f"exit_{symbol}_{int(time.time())}"
+                            signal_id=f"exit_{exec_symbol}_{int(time.time())}"
                         )
-                        clear_direction_lock(redis_client, symbol)
-                        set_cooldown(redis_client, symbol, COOLDOWN_SECONDS // 2)  # 청산 후 짧은 쿨다운
-                        count_daily_cap(redis_client, symbol)
+                        clear_direction_lock(redis_client, exec_symbol)
+                        set_cooldown(redis_client, exec_symbol, COOLDOWN_SECONDS // 2)  # 청산 후 짧은 쿨다운
+                        count_daily_cap(redis_client, exec_symbol)
                         orders_executed += 1
-                        log_signal_decision(signal_data, symbol, "exit", f"qty={quantity}")
+                        log_signal_decision(signal_data, symbol, "exit", f"exec_symbol={exec_symbol},qty={quantity}")
                         
                         # Slack 알림
                         if slack_bot:
                             pnl = current_position["unrealized_pl"]
                             pnl_emoji = "📈" if pnl >= 0 else "📉"
-                            slack_message = f"{pnl_emoji} *포지션 청산*\n• {symbol} -{quantity}주 @ ${float(getattr(trade, 'price', 0)):.2f}\n• 신호점수: {effective_score:.3f}\n• 손익: ${float(pnl):.2f}"
+                            slack_message = f"{pnl_emoji} *포지션 청산*\n• {exec_symbol} -{quantity}주 @ ${float(getattr(trade, 'price', 0)):.2f}\n• 원신호: {symbol}({base_score:.3f})\n• 라우팅: {route_reason}\n• 손익: ${float(pnl):.2f}"
                             slack_bot.send_message(slack_message)
                     else:
-                        log_signal_decision(signal_data, symbol, "suppress", "no_position_to_exit")
+                        log_signal_decision(signal_data, symbol, "suppress", f"no_position_to_exit:{exec_symbol}")
                 
                 # 메시지 ACK
                 stream_consumer.acknowledge("signals.raw", signal_event.message_id)
