@@ -13,6 +13,8 @@
 - 캡: per-ticker(티어별) + 글로벌 캡 동시 적용(설계 반영).
 - 토큰: 분 초 0–10s에 한해 Tier A→Reserve 폴백 허용(로그 기록).
 - LLM: `LLM_MIN_SIGNAL_SCORE=0.6` 유지(테스트 종료 시 0.7 복원).
+- **리스크**: `RISK_PER_TRADE=0.002` (0.2%), `MAX_CONCURRENT_RISK=0.01` (1%) - 테스트용 축소
+- **바스켓**: MEGATECH/SEMIS 바스켓 집계 조건 적용 (최소 3개/2개 신호, 60%+ 음수, 평균 ≤-0.12)
 
 ## 롤백 조건
 - 1h 내 actionable ≥ 5 & stopout_rate ≥ 40% 또는 flip-flop ≥ 25% → cutoff_delta 완화 축소, lock 120s, cooldown 150s.

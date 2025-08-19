@@ -18,8 +18,11 @@
 
 ## Recent Changes (Merged from Plans)
 - Added tier-based scheduler, Redis token buckets, and gating.
-- Roadmapped “quiet market” messaging and stronger Slack UX.
+- Roadmapped "quiet market" messaging and stronger Slack UX.
 - Risk caps: 0.5% per trade, 2% concurrent; 80% exposure cap, min 3 slots.
+- **2025-08-19**: Basket-based routing system (MEGATECH/SEMIS baskets)
+- **2025-08-19**: ETF single lock & conflict position prevention  
+- **2025-08-19**: Risk parameters temporarily reduced for testing (0.2%/1%)
 
 ## References
 - Planning history: `docs/archive/EVOLUTION_ROADMAP.md`.
