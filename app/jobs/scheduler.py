@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import time
+import math
+from decimal import Decimal
 from typing import Dict, List, Optional, Tuple, Union
 import urllib.parse as _urlparse
 
@@ -766,236 +768,751 @@ def get_llm_usage_stats() -> Dict[str, int]:
         logger.error(f"LLM 사용량 조회 실패: {e}")
         return {"daily_used": 0, "daily_limit": settings.LLM_DAILY_CALL_LIMIT, "error": str(e)}
 
+# ============================================================================
+# 포지션 관리 및 리스크 계산 헬퍼 함수들
+# ============================================================================
+
+# 거래 파라미터 (환경변수에서 로드)
+BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "0.15"))
+SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "-0.15")) 
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "120"))
+DIRECTION_LOCK_SECONDS = int(os.getenv("DIRECTION_LOCK_SECONDS", "90"))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.005"))  # 0.5%
+MAX_CONCURRENT_RISK = float(os.getenv("MAX_CONCURRENT_RISK", "0.02"))  # 2%
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.015"))  # 1.5%
+TAKE_PROFIT_RR = float(os.getenv("TAKE_PROFIT_RR", "1.5"))  # 1.5R
+EOD_FLATTEN_MINUTES = int(os.getenv("EOD_FLATTEN_MINUTES", "5"))  # 마감 5분 전
+FRACTIONAL_ENABLED = os.getenv("FRACTIONAL_ENABLED", "0") == "1"
+
+# 인버스 ETF 메타데이터
+INSTRUMENT_META = {
+    "AAPL": {"underlying": "AAPL", "exposure_sign": +1, "min_qty": 1},
+    "NVDA": {"underlying": "NVDA", "exposure_sign": +1, "min_qty": 1},
+    "TSLA": {"underlying": "TSLA", "exposure_sign": +1, "min_qty": 1},
+    "MSFT": {"underlying": "MSFT", "exposure_sign": +1, "min_qty": 1},
+    "SQQQ": {"underlying": "QQQ", "exposure_sign": -1, "min_qty": 1},
+    "SOXS": {"underlying": "SOXX", "exposure_sign": -1, "min_qty": 1},
+    "SPXS": {"underlying": "SPY", "exposure_sign": -1, "min_qty": 1},
+    "TZA": {"underlying": "IWM", "exposure_sign": -1, "min_qty": 1},
+    "SDOW": {"underlying": "DIA", "exposure_sign": -1, "min_qty": 1},
+    "TECS": {"underlying": "XLK", "exposure_sign": -1, "min_qty": 1},
+    "DRV": {"underlying": "XLE", "exposure_sign": -1, "min_qty": 1},
+    "SARK": {"underlying": "ARKK", "exposure_sign": -1, "min_qty": 1},
+}
+
+def is_actionable_signal(effective_score: float) -> bool:
+    """신호가 액션 가능한지 확인"""
+    return effective_score >= BUY_THRESHOLD or effective_score <= SELL_THRESHOLD
+
+def claim_idempotency(redis_client, event_id: str, ttl: int = 900) -> bool:
+    """중복 이벤트 처리 방지"""
+    key = f"seen:{event_id}"
+    if redis_client.setnx(key, 1):
+        redis_client.expire(key, ttl)
+        return True
+    return False
+
+def is_in_cooldown(redis_client, symbol: str) -> bool:
+    """심볼별 쿨다운 확인"""
+    return redis_client.ttl(f"cooldown:{symbol}") > 0
+
+def set_cooldown(redis_client, symbol: str, seconds: int) -> None:
+    """심볼별 쿨다운 설정"""
+    redis_client.setex(f"cooldown:{symbol}", seconds, 1)
+
+def is_direction_locked(redis_client, symbol: str, wanted_direction: str) -> bool:
+    """방향락 확인 (반대 방향 재진입 차단)"""
+    current_lock = redis_client.get(f"dirlock:{symbol}")
+    if not current_lock:
+        return False
+    
+    current_direction = current_lock.decode()
+    # long 원하는데 short 락이 걸려있거나, short 원하는데 long 락이 걸려있으면 차단
+    if wanted_direction == "long" and current_direction == "short":
+        return True
+    if wanted_direction == "short" and current_direction == "long":
+        return True
+    return False
+
+def set_direction_lock(redis_client, symbol: str, direction: str, seconds: int) -> None:
+    """방향락 설정"""
+    redis_client.setex(f"dirlock:{symbol}", seconds, direction)
+
+def clear_direction_lock(redis_client, symbol: str) -> None:
+    """방향락 해제"""
+    redis_client.delete(f"dirlock:{symbol}")
+
+def exceeds_daily_cap(redis_client, symbol: str) -> bool:
+    """일일 신호 한도 확인"""
+    cap = int(os.getenv("RTH_DAILY_CAP", "100"))
+    key = get_daily_key("cap", symbol)
+    current_count = int(redis_client.get(key) or 0)
+    return current_count >= cap
+
+def count_daily_cap(redis_client, symbol: str) -> bool:
+    """일일 신호 카운트 증가 (idempotency 적용)"""
+    # GPT 권장: 중복 카운트 방지를 위한 idempotency 키
+    slot_id = int(time.time() // 90)  # 90초 슬롯
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    idempotency_key = f"cap:{symbol}:{date_str}:{slot_id}"
+    
+    # 이미 카운트했으면 스킵
+    if not redis_client.setnx(idempotency_key, 1):
+        logger.debug(f"일일 캡 중복 카운트 방지: {symbol}")
+        return False
+    
+    redis_client.expire(idempotency_key, 90)  # 90초 TTL
+    
+    # 실제 카운트 증가
+    key = get_daily_key("cap", symbol)
+    redis_client.incr(key)
+    
+    # 다음 RTH 리셋 시간까지 TTL 설정
+    next_reset = get_next_rth_reset_timestamp()
+    redis_client.expireat(key, int(next_reset.timestamp()))
+    return True
+
+def get_daily_key(prefix: str, symbol: str) -> str:
+    """일일 기준 Redis 키 생성"""
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return f"{prefix}:{symbol}:{date_str}"
+
+def get_next_rth_reset_timestamp() -> datetime:
+    """다음 RTH 리셋 시간 (UTC 기준)"""
+    # 미국 동부시간 오전 9:30 = UTC 14:30 (EST) or 13:30 (EDT)
+    # 단순화: 매일 UTC 14:00으로 설정
+    now = datetime.now(timezone.utc)
+    reset_time = now.replace(hour=14, minute=0, second=0, microsecond=0)
+    if now >= reset_time:
+        reset_time += timedelta(days=1)
+    return reset_time
+
+def get_open_position(trading_adapter, symbol: str) -> Optional[Dict]:
+    """현재 오픈 포지션 확인"""
+    try:
+        positions = trading_adapter.get_positions()
+        for pos in positions:
+            if getattr(pos, 'ticker', None) == symbol and float(getattr(pos, 'quantity', 0)) != 0:
+                qty = float(pos.quantity)
+                return {
+                    "symbol": symbol,
+                    "qty": qty,
+                    "avg_price": float(getattr(pos, 'avg_price', 0) or 0),
+                    "side": "long" if qty > 0 else "short",
+                    "unrealized_pl": float(getattr(pos, 'unrealized_pnl', 0) or 0),
+                    "market_value": float(getattr(pos, 'market_value', 0) or 0),
+                    "added_layers": getattr(pos, 'added_layers', 0)
+                }
+        return None
+    except Exception as e:
+        logger.error(f"포지션 조회 실패 {symbol}: {e}")
+        return None
+
+def get_stop_distance(trading_adapter, symbol: str, fallback_pct: float = None) -> float:
+    """스톱 거리 계산 (ATR 기반 또는 퍼센트 폴백)"""
+    if fallback_pct is None:
+        fallback_pct = STOP_LOSS_PCT
+    
+    try:
+        # 현재 가격 조회
+        current_price = trading_adapter.get_current_price(symbol)
+        if not current_price or current_price <= 0:
+            return 0
+        
+        # ATR 기반 스톱 거리 계산 시도
+        atr = get_atr_from_db(symbol, periods=14)
+        if atr and atr > 0:
+            # GPT 권장: ATR의 0.7배, 최소 0.4% 보장
+            k = 0.7  # 보수적 멀티플라이어
+            return max(atr * k, current_price * 0.004)
+        
+        # 폴백: 고정 퍼센트
+        return current_price * fallback_pct
+    except Exception as e:
+        logger.error(f"스톱 거리 계산 실패 {symbol}: {e}")
+        return 0
+
+def get_atr_from_db(symbol: str, periods: int = 14) -> Optional[float]:
+    """DB에서 ATR(Average True Range) 계산"""
+    try:
+        # PostgreSQL 연결
+        conn_str = os.getenv("DATABASE_URL")
+        if not conn_str:
+            return None
+        
+        conn = psycopg2.connect(conn_str)
+        cursor = conn.cursor()
+        
+        # 최근 N개 캔들에서 TR 계산 후 평균
+        query = """
+        WITH candles AS (
+            SELECT 
+                high,
+                low,
+                close,
+                LAG(close) OVER (ORDER BY timestamp) as prev_close
+            FROM quotes_1m
+            WHERE ticker = %s
+            ORDER BY timestamp DESC
+            LIMIT %s
+        ),
+        true_range AS (
+            SELECT 
+                GREATEST(
+                    high - low,
+                    ABS(high - COALESCE(prev_close, close)),
+                    ABS(low - COALESCE(prev_close, close))
+                ) as tr
+            FROM candles
+            WHERE prev_close IS NOT NULL
+        )
+        SELECT AVG(tr) as atr
+        FROM true_range
+        """
+        
+        cursor.execute(query, (symbol, periods + 1))
+        result = cursor.fetchone()
+        
+        cursor.close()
+        conn.close()
+        
+        if result and result[0]:
+            return float(result[0])
+        return None
+        
+    except Exception as e:
+        logger.warning(f"ATR 계산 실패 {symbol}: {e}")
+        return None
+
+def calc_entry_quantity(trading_adapter, symbol: str, equity: float, stop_distance: float) -> int:
+    """진입 수량 계산 (GPT 권장 리스크 기반 사이징)"""
+    try:
+        current_price = trading_adapter.get_current_price(symbol)
+        if not current_price or current_price <= 0 or stop_distance <= 0:
+            return 0
+        
+        # 리스크 금액 = 계좌 자산 * 거래당 리스크 비율
+        risk_amount = equity * RISK_PER_TRADE
+        
+        # 포지션 사이즈 = 리스크 금액 / 스톱 거리
+        # GPT 권장 공식: position_size = (risk_per_trade * equity) / stop_loss_distance
+        raw_qty = risk_amount / stop_distance
+        
+        # 소액 계좌 보호: 최대 계좌의 80% / 최소 3개 포지션 보장
+        max_position_value = equity * 0.8 / 3  # 최대 포지션당 자산의 26.7%
+        max_qty_by_equity = max_position_value / current_price
+        
+        # 두 제한 중 작은 값 사용
+        raw_qty = min(raw_qty, max_qty_by_equity)
+        
+        meta = INSTRUMENT_META.get(symbol, {"min_qty": 1})
+        min_qty = meta["min_qty"]
+        
+        # 최종 수량 결정
+        if FRACTIONAL_ENABLED:
+            final_qty = max(round(raw_qty, 4), min_qty)
+        else:
+            final_qty = max(int(math.floor(raw_qty)), min_qty)
+        
+        # 수량 결정 로깅
+        logger.info(f"📊 수량 계산 {symbol}: 리스크${risk_amount:.2f} / 스톱${stop_distance:.2f} = {raw_qty:.2f}주 → {final_qty}주")
+        
+        return final_qty
+    except Exception as e:
+        logger.error(f"진입 수량 계산 실패 {symbol}: {e}")
+        return 0
+
+def calc_add_quantity(trading_adapter, symbol: str, position: Dict, equity: float, stop_distance: float) -> int:
+    """추가 매수 수량 계산 (GPT 권장 피라미딩)"""
+    try:
+        # 기본 수량의 50% (GPT 권장: 보수적 피라미딩)
+        base_qty = calc_entry_quantity(trading_adapter, symbol, equity, stop_distance)
+        add_qty = base_qty * 0.5  # 초기 수량의 50%
+        
+        # 현재 포지션 크기 고려
+        current_qty = abs(position.get("qty", 0))
+        current_price = trading_adapter.get_current_price(symbol)
+        
+        # 추가 후 총 포지션이 계좌의 40%를 초과하지 않도록
+        if current_price > 0:
+            total_position_value = (current_qty + add_qty) * current_price
+            max_allowed_value = equity * 0.4  # 단일 포지션 최대 40%
+            
+            if total_position_value > max_allowed_value:
+                # 조정된 수량 계산
+                max_add_value = max_allowed_value - (current_qty * current_price)
+                add_qty = max_add_value / current_price
+                logger.info(f"⚠️ 피라미딩 수량 조정: {add_qty:.2f}주 (최대 포지션 40% 제한)")
+        
+        if FRACTIONAL_ENABLED:
+            final_qty = round(add_qty, 4)
+        else:
+            final_qty = max(int(math.floor(add_qty)), 0)
+        
+        logger.info(f"📊 피라미딩 수량: {symbol} +{final_qty}주 (기존 {current_qty}주)")
+        return final_qty
+    except Exception as e:
+        logger.error(f"추가 수량 계산 실패 {symbol}: {e}")
+        return 0
+
+def can_pyramid(trading_adapter, position: Dict, equity: float, stop_distance: float) -> bool:
+    """피라미딩 가능 여부 확인 (GPT 권장 로직)"""
+    try:
+        # 1. 아직 추가매수 안함 (1회만 허용)
+        if position.get("added_layers", 0) >= 1:
+            logger.debug(f"피라미딩 불가: 이미 {position.get('added_layers', 0)}회 추가매수")
+            return False
+        
+        # 2. 미실현 수익 중 (수익 상태에서만 피라미딩)
+        unrealized_pl = position.get("unrealized_pl", 0)
+        if unrealized_pl <= 0:
+            logger.debug(f"피라미딩 불가: 손실 중 (PL: {unrealized_pl})")
+            return False
+        
+        # 3. 수익률이 최소 스톱 거리의 50% 이상일 때만 (추가 조건)
+        avg_price = position.get("avg_price", 0)
+        if avg_price > 0:
+            profit_pct = unrealized_pl / (avg_price * abs(position.get("qty", 1)))
+            min_profit_threshold = STOP_LOSS_PCT * 0.5  # 스톱의 50%
+            if profit_pct < min_profit_threshold:
+                logger.debug(f"피라미딩 불가: 수익률 부족 ({profit_pct:.2%} < {min_profit_threshold:.2%})")
+                return False
+        
+        # 4. 총 리스크 한도 확인
+        current_risk = get_current_total_risk(trading_adapter, equity)
+        additional_risk = equity * RISK_PER_TRADE
+        max_allowed_risk = equity * MAX_CONCURRENT_RISK
+        
+        if (current_risk + additional_risk) > max_allowed_risk:
+            logger.debug(f"피라미딩 불가: 리스크 한도 초과 ({current_risk + additional_risk:.2f} > {max_allowed_risk:.2f})")
+            return False
+        
+        logger.info(f"✅ 피라미딩 가능: 수익 ${unrealized_pl:.2f}, 리스크 여유 ${max_allowed_risk - current_risk:.2f}")
+        return True
+    except Exception as e:
+        logger.error(f"피라미딩 가능성 확인 실패: {e}")
+        return False
+
+def get_current_total_risk(trading_adapter, equity: float) -> float:
+    """현재 총 리스크 계산"""
+    try:
+        total_risk = 0.0
+        positions = trading_adapter.get_positions()
+        
+        for pos in positions:
+            if float(getattr(pos, 'quantity', 0)) == 0:
+                continue
+            
+            # 각 포지션의 리스크 = (현재가 - 스톱가) * 수량
+            sym = getattr(pos, 'ticker', None)
+            if not sym:
+                continue
+            current_price = trading_adapter.get_current_price(sym)
+            stop_distance = get_stop_distance(trading_adapter, sym)
+            
+            if current_price and stop_distance:
+                position_risk = stop_distance * abs(float(getattr(pos, 'quantity', 0)))
+                total_risk += position_risk
+        
+        return total_risk
+    except Exception as e:
+        logger.error(f"총 리스크 계산 실패: {e}")
+        return equity * MAX_CONCURRENT_RISK  # 보수적으로 최대치 반환
+
+def is_eod_window(market_calendar = None) -> bool:
+    """장 마감 전 윈도우 확인 (환경변수 기반)"""
+    try:
+        now_utc = datetime.now(timezone.utc)
+        
+        # EDT/EST 자동 판별
+        # 3월 둘째 일요일 ~ 11월 첫째 일요일: EDT (-4)
+        # 나머지: EST (-5)
+        month = now_utc.month
+        if 3 < month < 11:  # 4월 ~ 10월은 확실히 EDT
+            hours_offset = -4
+        elif month == 3 or month == 11:  # 3월, 11월은 날짜 체크 필요
+            # 간단히 처리: 3월 15일 이후는 EDT, 11월 1일 이전은 EDT
+            if (month == 3 and now_utc.day >= 15) or (month == 11 and now_utc.day <= 7):
+                hours_offset = -4
+            else:
+                hours_offset = -5
+        else:  # 12월 ~ 2월은 EST
+            hours_offset = -5
+        
+        # 미국 동부시간 기준 시장 마감: 16:00
+        # EOD_FLATTEN_MINUTES 분 전부터 윈도우 시작
+        eod_minutes_before = EOD_FLATTEN_MINUTES
+        
+        # UTC로 변환
+        # 마감시간 16:00 ET = (20:00 or 21:00) UTC
+        market_close_utc_hour = 16 - hours_offset  # 20 or 21
+        
+        eod_start = now_utc.replace(
+            hour=market_close_utc_hour, 
+            minute=0, 
+            second=0, 
+            microsecond=0
+        ) - timedelta(minutes=eod_minutes_before)
+        
+        eod_end = now_utc.replace(
+            hour=market_close_utc_hour, 
+            minute=0, 
+            second=0, 
+            microsecond=0
+        )
+        
+        in_window = eod_start <= now_utc <= eod_end
+        
+        if in_window:
+            logger.info(f"🌅 EOD 윈도우 활성: 마감 {eod_minutes_before}분 전")
+        
+        return in_window
+    except Exception as e:
+        logger.error(f"EOD 윈도우 확인 실패: {e}")
+        return False
+
+def place_bracket_order(trading_adapter, symbol: str, side: str, quantity: int, stop_distance: float) -> Optional[Dict]:
+    """브래킷 주문 (시장가 + OCO) - GPT 권장 구현"""
+    try:
+        current_price = trading_adapter.get_current_price(symbol)
+        if not current_price:
+            raise ValueError(f"가격 조회 실패: {symbol}")
+        
+        # 스톱로스/익절 가격 계산 (GPT 권장: RR 비율 적용)
+        if side == "buy":
+            stop_price = current_price - stop_distance
+            take_profit_price = current_price + (stop_distance * TAKE_PROFIT_RR)
+        else:
+            stop_price = current_price + stop_distance
+            take_profit_price = current_price - (stop_distance * TAKE_PROFIT_RR)
+        
+        # 스톱/익절 가격 검증
+        if stop_price <= 0 or take_profit_price <= 0:
+            logger.error(f"❌ 잘못된 OCO 가격: SL=${stop_price:.2f}, TP=${take_profit_price:.2f}")
+            raise ValueError("Invalid OCO prices")
+        
+        # 시장가 주문 실행
+        main_order = trading_adapter.submit_market_order(
+            ticker=symbol,
+            side=side,
+            quantity=quantity,
+            signal_id=f"bracket_{symbol}_{int(time.time())}"
+        )
+        
+        # OCO 주문 등록 (Redis에 저장하여 별도 태스크에서 처리)
+        try:
+            redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+            oco_data = {
+                "symbol": symbol,
+                "quantity": quantity,
+                "stop_loss": stop_price,
+                "take_profit": take_profit_price,
+                "parent_order_id": getattr(main_order, 'id', 'unknown'),
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+            redis_client.hset(
+                f"oco_pending:{symbol}",
+                getattr(main_order, 'id', f"temp_{int(time.time())}"),
+                json.dumps(oco_data)
+            )
+            redis_client.expire(f"oco_pending:{symbol}", 86400)  # 24시간 TTL
+            
+            logger.info(f"🎯 OCO 주문 등록: {symbol} SL=${stop_price:.2f}, TP=${take_profit_price:.2f}")
+        except Exception as oco_e:
+            logger.warning(f"OCO 등록 실패 (주문은 실행됨): {oco_e}")
+        
+        logger.info(
+            f"✅ 브래킷 주문 실행: {symbol} {side} {quantity}주 @ ${float(current_price):.2f}\n"
+            f"   ├─ 스톱로스: ${float(stop_price):.2f} (-{(stop_distance/current_price)*100:.1f}%)\n"
+            f"   └─ 익절목표: ${float(take_profit_price):.2f} (+{(stop_distance*TAKE_PROFIT_RR/current_price)*100:.1f}%)"
+        )
+        return main_order
+        
+    except Exception as e:
+        logger.error(f"브래킷 주문 실패 {symbol}: {e}")
+        raise
+
+def flatten_all_positions(trading_adapter, reason: str = "eod_flatten") -> int:
+    """모든 포지션 강제 청산"""
+    flattened_count = 0
+    try:
+        positions = trading_adapter.get_positions()
+        for pos in positions:
+            if float(getattr(pos, 'quantity', 0)) == 0:
+                continue
+            
+            # 시장가로 청산
+            side = "sell" if float(getattr(pos, 'quantity', 0)) > 0 else "buy"
+            quantity = abs(int(float(getattr(pos, 'quantity', 0))))
+            
+            trading_adapter.submit_market_order(
+                ticker=getattr(pos, 'ticker', ''),
+                side=side,
+                quantity=quantity,
+                signal_id=f"{reason}_{getattr(pos, 'ticker', '')}_{int(time.time())}"
+            )
+            
+            logger.info(f"EOD 청산: {getattr(pos, 'ticker', '')} {side} {quantity}주 (사유: {reason})")
+            flattened_count += 1
+            
+    except Exception as e:
+        logger.error(f"포지션 청산 실패: {e}")
+    
+    return flattened_count
+
+def log_signal_decision(signal_data: Dict, symbol: str, decision: str, reason: str = None) -> None:
+    """신호 처리 결정 로깅"""
+    score = signal_data.get("score", 0)
+    signal_type = signal_data.get("signal_type", "unknown")
+    
+    if decision == "suppress":
+        logger.info(f"🚫 신호 억제: {symbol} {signal_type} (score: {score:.3f}) - {reason}")
+    elif decision in ["entry", "add", "exit"]:
+        logger.info(f"✅ 신호 실행: {symbol} {signal_type} (score: {score:.3f}) - {decision}")
+    else:
+        logger.info(f"📝 신호 처리: {symbol} {signal_type} (score: {score:.3f}) - {decision}")
+
 @celery_app.task(bind=True, name="app.jobs.scheduler.pipeline_e2e")
 def pipeline_e2e(self):
-    """E2E 파이프라인: EDGAR 이벤트 + 생성된 신호 → 실제 거래 실행"""
+    """포지션 관리 기반 E2E 파이프라인: 신호 소비 → 포지션 상태 기반 거래 실행"""
     try:
         start_time = time.time()
-        logger.info("E2E 파이프라인 시작 (EDGAR + 자동거래)")
+        logger.info("🚀 포지션 관리 E2E 파이프라인 시작")
         
-        # 컴포넌트 강제 초기화 (디버깅용)
-        logger.info("🔧 컴포넌트 강제 초기화...")
-        try:
-            _autoinit_components_if_enabled()
-            logger.info("✅ 컴포넌트 초기화 완료")
-        except Exception as init_e:
-            logger.error(f"⚠️ 컴포넌트 초기화 실패: {init_e}")
-            # 초기화 실패해도 계속 진행
-        
-        # 컴포넌트 확인 (필수 최소 구성만 강제, LLM은 선택)
-        components_status = {k: v is not None for k, v in trading_components.items()}
-        logger.info(f"📋 컴포넌트 상태: {components_status}")
-        
-        # 테스트용: 컴포넌트 체크 우회
-        # if not all([
-        #     trading_components["stream_consumer"],
-        #     trading_components["regime_detector"], 
-        #     trading_components["signal_mixer"],
-        #     trading_components["slack_bot"]
-        # ]):
-        #     logger.warning("필수 컴포넌트 미준비(stream_consumer/regime_detector/signal_mixer/slack_bot)")
-        #     return {"status": "skipped", "reason": "components_not_ready"}
-        
+        # 컴포넌트 초기화
+        _autoinit_components_if_enabled()
         stream_consumer = trading_components["stream_consumer"]
-        llm_engine = trading_components["llm_engine"]
-        regime_detector = trading_components["regime_detector"]
-        signal_mixer = trading_components["signal_mixer"]
         slack_bot = trading_components["slack_bot"]
         
         signals_processed = 0
         orders_executed = 0
+        signals_suppressed = {"cooldown": 0, "direction_lock": 0, "daily_cap": 0, "below_cutoff": 0, "dup_event": 0, "risk_budget": 0}
         
-        # AUTO_MODE 체크 - 실제 거래 vs 시뮬레이션
+        # AUTO_MODE 체크
         auto_mode = os.getenv("AUTO_MODE", "0").lower() in ("1", "true", "yes", "on")
-        logger.info(f"🎯 거래모드: {'실제 Alpaca 주문' if auto_mode else '시뮬레이션'}")
+        if not auto_mode:
+            logger.info("🔄 시뮬레이션 모드 - 실제 거래 건너뜀")
+            return {"status": "skipped", "reason": "simulation_mode"}
         
         # 거래 어댑터 초기화
-        trading_adapter = None
-        if auto_mode:
-            try:
-                from app.adapters.trading_adapter import get_trading_adapter
-                trading_adapter = get_trading_adapter()
-                logger.info("✅ Alpaca Trading Adapter 초기화 완료")
-            except Exception as e:
-                logger.error(f"❌ Trading Adapter 초기화 실패: {e}")
-                auto_mode = False
+        from app.adapters.trading_adapter import get_trading_adapter
+        trading_adapter = get_trading_adapter()
+        redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
         
-        # Paper Trading Manager (fallback)
-        if not auto_mode:
-            try:
-                from app.jobs.paper_trading_manager import get_paper_trading_manager
-                paper_manager = get_paper_trading_manager()
-                logger.info("✅ Paper Trading Manager 초기화 완료")
-            except Exception as e:
-                logger.warning(f"⚠️ Paper Trading Manager 초기화 실패: {e}")
+        # 계좌 정보 조회
+        account_info = trading_adapter.get_portfolio_summary()
+        equity = float(account_info.get('equity', 100000))
+        logger.info(f"💰 현재 계좌 자산: ${equity:,.2f}")
         
-        # 1. 생성된 신호들 소비하여 실제 거래 실행 (AUTO_MODE=1일 때만)
-        if auto_mode and trading_adapter:
+        # EOD 윈도우 체크 - 강제 청산
+        if is_eod_window():
+            flattened = flatten_all_positions(trading_adapter, "eod_flatten")
+            logger.info(f"🌅 EOD 윈도우: {flattened}개 포지션 강제 청산")
+            return {
+                "status": "eod_flatten",
+                "positions_flattened": flattened,
+                "execution_time": time.time() - start_time
+            }
+        
+        # Redis 스트림에서 신호 소비
+        redis_streams = stream_consumer.redis_streams
+        raw_signals = redis_streams.consume_stream("signals.raw", count=50, block_ms=0, last_id="0")
+        logger.info(f"📊 Redis에서 {len(raw_signals)}개 신호 수신")
+        
+        # 리스크 예산 계산
+        current_total_risk = get_current_total_risk(trading_adapter, equity)
+        risk_budget_left = (equity * MAX_CONCURRENT_RISK) - current_total_risk
+        logger.info(f"🛡️ 총 리스크: ${current_total_risk:.2f}, 잔여 예산: ${risk_budget_left:.2f}")
+        
+        for signal_event in raw_signals:
             try:
-                logger.info("🔄 Redis 스트림에서 신호 소비 시작...")
-                # 기존 신호들과 최신 신호 모두 처리 (최근 7일 내)
-                redis_streams = stream_consumer.redis_streams
-                raw_signals = redis_streams.consume_stream("signals.raw", count=10, block_ms=0, last_id="0")
-                logger.info(f"📊 Redis에서 {len(raw_signals)}개 신호 수신")
+                signal_data = signal_event.data
+                event_id = signal_event.message_id
                 
-                for signal_event in raw_signals:
+                # 신호 기본 정보 추출
+                symbol = signal_data.get("ticker")
+                def parse_numeric_value(value):
+                    """numpy 및 기타 타입을 float로 안전하게 변환"""
                     try:
-                        signal_data = signal_event.data
+                        if hasattr(value, 'item'):  # numpy scalar
+                            return float(value.item())
                         
-                        # 신호 시간 확인 (테스트용: 7일 이내 신호만 처리)
-                        signal_timestamp = signal_event.timestamp
-                        cutoff_time = datetime.now() - timedelta(days=7)
-                        logger.info(f"🕐 신호 시간: {signal_timestamp}, 컷오프: {cutoff_time}")
-                        if signal_timestamp < cutoff_time:
-                            logger.info(f"⏳ 오래된 신호 스킵: {signal_timestamp} < {cutoff_time}")
+                        value_str = str(value)
+                        # numpy float64(...) 형태 처리
+                        if value_str.startswith('np.float64(') and value_str.endswith(')'):
+                            value_str = value_str[11:-1]
+                        elif value_str.startswith('np.float32(') and value_str.endswith(')'):
+                            value_str = value_str[11:-1]
+                        
+                        return float(value_str)
+                    except Exception:
+                        return 0.0
+                
+                base_score = parse_numeric_value(signal_data.get("score", 0))
+                signal_type = signal_data.get("signal_type", "unknown")
+                
+                if not symbol or symbol not in INSTRUMENT_META:
+                    log_signal_decision(signal_data, symbol or "unknown", "suppress", "unknown_symbol")
+                    continue
+                
+                # 인버스 ETF 신호 처리
+                meta = INSTRUMENT_META[symbol]
+                effective_score = meta["exposure_sign"] * base_score
+                
+                # 액션 가능성 확인
+                if not is_actionable_signal(effective_score):
+                    log_signal_decision(signal_data, symbol, "suppress", "below_cutoff")
+                    signals_suppressed["below_cutoff"] += 1
+                    continue
+                
+                # 중복 이벤트 차단
+                if not claim_idempotency(redis_client, event_id, ttl=900):
+                    log_signal_decision(signal_data, symbol, "suppress", "dup_event")
+                    signals_suppressed["dup_event"] += 1
+                    continue
+                
+                # 쿨다운 확인
+                if is_in_cooldown(redis_client, symbol):
+                    log_signal_decision(signal_data, symbol, "suppress", "cooldown")
+                    signals_suppressed["cooldown"] += 1
+                    continue
+                
+                # 일일 신호 한도 확인
+                if exceeds_daily_cap(redis_client, symbol):
+                    log_signal_decision(signal_data, symbol, "suppress", "daily_cap")
+                    signals_suppressed["daily_cap"] += 1
+                    continue
+                
+                # 현재 포지션 확인
+                current_position = get_open_position(trading_adapter, symbol)
+                
+                # 거래 방향 결정
+                if effective_score >= BUY_THRESHOLD:
+                    wanted_direction = "long"
+                    action = "buy"
+                elif effective_score <= SELL_THRESHOLD:
+                    wanted_direction = "exit"
+                    action = "sell"
+                else:
+                    log_signal_decision(signal_data, symbol, "suppress", "neutral_zone")
+                    continue
+                
+                # 방향락 확인
+                if is_direction_locked(redis_client, symbol, wanted_direction):
+                    log_signal_decision(signal_data, symbol, "suppress", "direction_lock")
+                    signals_suppressed["direction_lock"] += 1
+                    continue
+                
+                # 스톱 거리 계산
+                stop_distance = get_stop_distance(trading_adapter, symbol)
+                if stop_distance <= 0:
+                    log_signal_decision(signal_data, symbol, "suppress", "invalid_stop_distance")
+                    continue
+                
+                # 거래 실행 로직
+                if action == "buy":
+                    if current_position:
+                        # 추가 매수 (피라미딩) 검토
+                        if can_pyramid(trading_adapter, current_position, equity, stop_distance):
+                            quantity = calc_add_quantity(trading_adapter, symbol, current_position, equity, stop_distance)
+                            if quantity > 0:
+                                trade = place_bracket_order(trading_adapter, symbol, "buy", quantity, stop_distance)
+                                set_cooldown(redis_client, symbol, COOLDOWN_SECONDS)
+                                set_direction_lock(redis_client, symbol, "long", DIRECTION_LOCK_SECONDS)
+                                count_daily_cap(redis_client, symbol)
+                                orders_executed += 1
+                                log_signal_decision(signal_data, symbol, "add", f"qty={quantity}")
+                                
+                                # Slack 알림
+                                if slack_bot:
+                                    slack_message = f"📈 *추가 매수*\n• {symbol} +{quantity}주 @ ${float(getattr(trade, 'price', 0)):.2f}\n• 신호점수: {effective_score:.3f}\n• 기존포지션: {current_position['qty']}주"
+                                    slack_bot.send_message(slack_message)
+                            else:
+                                log_signal_decision(signal_data, symbol, "suppress", "qty_zero_add")
+                        else:
+                            log_signal_decision(signal_data, symbol, "suppress", "already_long_no_pyramid")
+                    else:
+                        # 신규 진입
+                        if risk_budget_left <= 0:
+                            log_signal_decision(signal_data, symbol, "suppress", "risk_budget_exhausted")
+                            signals_suppressed["risk_budget"] += 1
                             continue
                         
-                        ticker = signal_data.get("ticker")
-                        signal_type = signal_data.get("signal_type")  # "long" or "short"
-                        entry_price = float(signal_data.get("entry_price", 0))
-                        stop_loss = float(signal_data.get("stop_loss", 0))
-                        take_profit = float(signal_data.get("take_profit", 0))
-                        score = float(signal_data.get("score", 0))
-                        
-                        if not ticker or not signal_type:
-                            continue
-                        
-                        logger.info(f"🎯 신호 처리 중: {ticker} {signal_type} (score: {score:.3f})")
-                        
-                        # 시장 상태 확인 (테스트용: 일시 비활성화)
-                        # if not trading_adapter.is_market_open():
-                        #     logger.warning(f"⏰ {ticker} 주문 스킵: 시장 닫힌 상태")
-                        #     continue
-                        logger.info(f"📈 시장 상태 체크 스킵 (테스트 모드)")
-                        
-                        # 리스크 체크
-                        risk_ok, risk_reason = check_signal_risk_feasibility_detailed(signal_data)
-                        if not risk_ok:
-                            logger.warning(f"🛡️ {ticker} 리스크 차단: {risk_reason}")
-                            continue
-                        
-                        # 포지션 크기 계산 (기본 1주, 실제로는 리스크 매니저 활용)
-                        quantity = 1  # TODO: 리스크 매니저 연동 후 동적 계산
-                        
-                        # 실제 주문 실행
-                        side = "buy" if signal_type == "long" else "sell"
-                        
-                        try:
-                            trade = trading_adapter.submit_market_order(
-                                ticker=ticker,
-                                side=side,
-                                quantity=quantity,
-                                signal_id=signal_event.message_id
-                            )
-                            
+                        quantity = calc_entry_quantity(trading_adapter, symbol, equity, stop_distance)
+                        if quantity > 0:
+                            trade = place_bracket_order(trading_adapter, symbol, "buy", quantity, stop_distance)
+                            set_cooldown(redis_client, symbol, COOLDOWN_SECONDS)
+                            set_direction_lock(redis_client, symbol, "long", DIRECTION_LOCK_SECONDS)
+                            count_daily_cap(redis_client, symbol)
+                            risk_budget_left -= (equity * RISK_PER_TRADE)
                             orders_executed += 1
-                            logger.info(f"✅ Alpaca 주문 체결: {ticker} {side} {quantity}주 @ ${trade.filled_price:.2f}")
+                            log_signal_decision(signal_data, symbol, "entry", f"qty={quantity}")
                             
                             # Slack 알림
                             if slack_bot:
-                                slack_message = f"🚀 *실제 주문 체결*\n• {ticker} {side.upper()} {quantity}주\n• 체결가: ${trade.filled_price:.2f}\n• 신호점수: {score:.3f}"
+                                slack_message = f"🚀 *신규 진입*\n• {symbol} {quantity}주 @ ${float(getattr(trade, 'price', 0)):.2f}\n• 신호점수: {effective_score:.3f}\n• 스톱거리: ${float(stop_distance):.2f}"
                                 slack_bot.send_message(slack_message)
-                            
-                            # 스톱로스/익절 주문 설정 (TODO: 구현 필요)
-                            # trading_adapter.set_stop_loss(trade.order_id, stop_loss)
-                            # trading_adapter.set_take_profit(trade.order_id, take_profit)
-                            
-                        except Exception as order_e:
-                            logger.error(f"❌ {ticker} 주문 실패: {order_e}")
-                            continue
+                        else:
+                            log_signal_decision(signal_data, symbol, "suppress", "qty_zero_entry")
+                
+                elif action == "sell":
+                    if current_position:
+                        # 포지션 청산
+                        quantity = abs(current_position["qty"])
+                        trade = trading_adapter.submit_market_order(
+                            ticker=symbol,
+                            side="sell",
+                            quantity=quantity,
+                            signal_id=f"exit_{symbol}_{int(time.time())}"
+                        )
+                        clear_direction_lock(redis_client, symbol)
+                        set_cooldown(redis_client, symbol, COOLDOWN_SECONDS // 2)  # 청산 후 짧은 쿨다운
+                        count_daily_cap(redis_client, symbol)
+                        orders_executed += 1
+                        log_signal_decision(signal_data, symbol, "exit", f"qty={quantity}")
                         
-                        # 메시지 ACK
-                        stream_consumer.acknowledge("signals.raw", signal_event.message_id)
-                        signals_processed += 1
-                        
-                    except Exception as sig_e:
-                        logger.error(f"신호 처리 실패: {sig_e}")
-                        continue
-                        
-                logger.info(f"🔥 신호 처리 완료: {signals_processed}개 처리, {orders_executed}개 주문 실행")
-                        
-            except Exception as consume_e:
-                logger.error(f"❌ 신호 소비 실패: {consume_e}")
-        
-        # 2. EDGAR 이벤트 소비 (기존 로직 유지)
-        edgar_events = stream_consumer.consume_edgar_events(count=5, block_ms=100)
-        
-        for event in edgar_events:
-            try:
-                ticker = event.data.get("ticker")
-                if not ticker:
-                    continue
+                        # Slack 알림
+                        if slack_bot:
+                            pnl = current_position["unrealized_pl"]
+                            pnl_emoji = "📈" if pnl >= 0 else "📉"
+                            slack_message = f"{pnl_emoji} *포지션 청산*\n• {symbol} -{quantity}주 @ ${float(getattr(trade, 'price', 0)):.2f}\n• 신호점수: {effective_score:.3f}\n• 손익: ${float(pnl):.2f}"
+                            slack_bot.send_message(slack_message)
+                    else:
+                        log_signal_decision(signal_data, symbol, "suppress", "no_position_to_exit")
                 
-                # 2. LLM 분석 (EDGAR 이벤트이므로 조건 충족)
-                llm_insight = None
-                if llm_engine:
-                    text = event.data.get("snippet_text", "")
-                    url = event.data.get("url", "")
-                    llm_insight = llm_engine.analyze_text(text, url, edgar_event=True)
+                # 메시지 ACK
+                stream_consumer.acknowledge("signals.raw", signal_event.message_id)
+                signals_processed += 1
                 
-                # 3. 시세 데이터 가져오기 (간단한 모의 데이터)
-                candles = get_mock_candles(ticker)
-                get_mock_indicators(ticker)
-                
-                # 4. 레짐 감지
-                regime_result = regime_detector.detect_regime(candles)
-                
-                # 5. 기술적 점수 계산
-                tech_score = get_mock_tech_score(ticker)
-                
-                # 6. 시그널 믹싱
-                current_price = 150.0  # 모의 가격
-                signal = signal_mixer.mix_signals(
-                    ticker=ticker,
-                    regime_result=regime_result,
-                    tech_score=tech_score,
-                    llm_insight=llm_insight,
-                    edgar_filing=event.data,
-                    current_price=current_price
-                )
-                
-                if signal:
-                    # 메타에 세션/품질 지표 심기 → Slack 헤더 라벨용
-                    if not signal.meta:
-                        signal.meta = {}
-                    session_label = _session_label()
-                    signal.meta["session"] = session_label
-                    # 안전 가드: 미정의 변수 처리
-                    signal.meta.setdefault("spread_bp", 0.0)
-                    signal.meta.setdefault("dollar_vol_5m", 0.0)
-                    # 7. DB에 저장
-                    if trading_components.get("db_connection"):
-                        signal_mixer.save_signal_to_db(signal, trading_components["db_connection"])
-                    
-                    # 8. Slack 알림
-                    if slack_bot:
-                        slack_message = format_slack_message(signal)
-                        slack_bot.send_message(slack_message)
-                    
-                    # 9. 메시지 ACK
-                    stream_consumer.acknowledge("news.edgar", event.message_id)
-                    
-                    signals_processed += 1
-                    logger.info(f"파이프라인 완료: {ticker} {signal.signal_type.value}")
-                
-            except Exception as e:
-                logger.error(f"이벤트 처리 실패: {e}")
+            except Exception as sig_e:
+                logger.error(f"신호 처리 실패 {signal_event.message_id}: {sig_e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
         execution_time = time.time() - start_time
-        logger.info(f"E2E 파이프라인 완료: {signals_processed}개 신호 처리, {orders_executed}개 주문 실행, {execution_time:.2f}초")
+        
+        # 성능 통계 로깅
+        total_signals = signals_processed + sum(signals_suppressed.values())
+        logger.info(f"🎯 파이프라인 완료: {execution_time:.2f}초")
+        logger.info(f"📊 신호 통계: 총 {total_signals}개, 처리 {signals_processed}개, 주문 {orders_executed}개")
+        logger.info(f"🚫 억제 통계: {signals_suppressed}")
         
         return {
             "status": "success",
             "signals_processed": signals_processed,
             "orders_executed": orders_executed,
-            "auto_mode": auto_mode,
+            "signals_suppressed": signals_suppressed,
+            "risk_budget_used": current_total_risk,
+            "risk_budget_left": risk_budget_left,
             "execution_time": execution_time,
             "timestamp": datetime.now().isoformat()
         }
         
     except Exception as e:
         logger.error(f"E2E 파이프라인 실패: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "status": "error",
             "error": str(e),
