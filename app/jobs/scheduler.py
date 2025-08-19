@@ -10,7 +10,7 @@ import os
 import time
 import math
 # from decimal import Decimal  # 사용되지 않음
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import urllib.parse as _urlparse
 
 import psycopg2
@@ -800,56 +800,232 @@ INSTRUMENT_META = {
     "SARK": {"underlying": "ARKK", "exposure_sign": -1, "min_qty": 1},
 }
 
-# 심볼 라우팅 맵 (개별주 숏 신호 → 인버스 ETF 매수)
-SYMBOL_ROUTING_MAP = {
-    # NASDAQ-100 메가캡 → SQQQ
-    "AAPL": "SQQQ",
-    "MSFT": "SQQQ", 
-    "TSLA": "SQQQ",
-    "AMZN": "SQQQ",
-    "META": "SQQQ",
-    "GOOGL": "SQQQ",
-    
-    # 반도체 → SOXS
-    "NVDA": "SOXS",
-    "AMD": "SOXS",
-    "AVGO": "SOXS",
-    
-    # 이미 인버스 ETF인 경우는 그대로
-    "SQQQ": "SQQQ",
-    "SOXS": "SOXS", 
-    "SPXS": "SPXS",
-    "TZA": "TZA",
-    "SDOW": "SDOW",
-    "TECS": "TECS",
-    "DRV": "DRV",
-    "SARK": "SARK",
+# 바스켓 기반 라우팅 시스템
+BASKETS = {
+    "MEGATECH": {
+        "tickers": {"AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA"},
+        "etf": "SQQQ",  # NASDAQ-100 인버스
+        "min_signals": 3,  # 최소 3개 종목에서 신호
+        "neg_fraction": 0.60,  # 60% 이상 음수
+        "mean_threshold": -0.12  # 평균 스코어 임계값
+    },
+    "SEMIS": {
+        "tickers": {"NVDA", "AMD", "AVGO"},
+        "etf": "SOXS",  # 반도체 인버스
+        "min_signals": 2,
+        "neg_fraction": 0.66,
+        "mean_threshold": -0.12
+    }
 }
+
+# 인버스 ETF 목록
+INVERSE_ETFS = {"SQQQ", "SOXS", "SPXS", "TZA", "SDOW", "TECS", "DRV", "SARK"}
+
+# 상충 포지션 맵
+CONFLICT_MAP = {
+    "SQQQ": {"QQQ"},      # NASDAQ 롱/숏 동시 금지
+    "SOXS": {"SOXL", "SOXX"},  # 반도체 롱/숏 동시 금지
+    "SPXS": {"SPY"},      # S&P 500 롱/숏 동시 금지
+    "TZA": {"IWM"},       # Russell 2000 롱/숏 동시 금지
+    "SDOW": {"DIA"},      # Dow Jones 롱/숏 동시 금지
+}
+
+def get_basket_for_symbol(symbol: str) -> Optional[str]:
+    """심볼이 속한 바스켓 찾기"""
+    for basket_name, basket_info in BASKETS.items():
+        if symbol in basket_info["tickers"]:
+            return basket_name
+    return None
+
+def get_basket_state(basket_name: str, window_seconds: int = 60) -> Dict[str, Any]:
+    """
+    바스켓 상태 집계 (Redis에서 최근 신호들 분석)
+    
+    Returns:
+        {"neg_count": int, "total_count": int, "mean_score": float, 
+         "neg_fraction": float, "two_tick": bool, "slope": float}
+    """
+    try:
+        rurl = os.getenv("REDIS_URL")
+        if not rurl:
+            return {"neg_count": 0, "total_count": 0, "mean_score": 0, 
+                   "neg_fraction": 0, "two_tick": False, "slope": 0}
+        
+        r = redis.from_url(rurl)
+        basket_info = BASKETS.get(basket_name, {})
+        tickers = basket_info.get("tickers", set())
+        
+        # 최근 window_seconds 동안의 신호 수집
+        now = time.time()
+        cutoff_time = now - window_seconds
+        
+        scores = []
+        for ticker in tickers:
+            # Redis에서 최근 스코어 가져오기 (예: signal_score:{ticker} 키)
+            score_key = f"signal_score:{ticker}"
+            score_data = r.get(score_key)
+            if score_data:
+                try:
+                    score_info = json.loads(score_data)
+                    if score_info.get("timestamp", 0) >= cutoff_time:
+                        scores.append(score_info.get("score", 0))
+                except:
+                    pass
+        
+        if not scores:
+            return {"neg_count": 0, "total_count": 0, "mean_score": 0, 
+                   "neg_fraction": 0, "two_tick": False, "slope": 0}
+        
+        neg_count = sum(1 for s in scores if s < -0.01)
+        total_count = len(scores)
+        mean_score = sum(scores) / len(scores) if scores else 0
+        neg_fraction = neg_count / total_count if total_count > 0 else 0
+        
+        # 2틱 확인 (이전 윈도우와 비교)
+        prev_key = f"basket_state:{basket_name}:prev"
+        prev_data = r.get(prev_key)
+        two_tick = False
+        if prev_data:
+            try:
+                prev_state = json.loads(prev_data)
+                if prev_state.get("neg_fraction", 0) >= 0.5 and neg_fraction >= 0.5:
+                    two_tick = True
+            except:
+                pass
+        
+        # 현재 상태 저장 (다음 비교용)
+        r.setex(prev_key, 120, json.dumps({
+            "neg_fraction": neg_fraction,
+            "mean_score": mean_score,
+            "timestamp": now
+        }))
+        
+        # 간단한 slope 계산 (추세)
+        slope = 0  # TODO: 실제 구현 시 시계열 분석 추가
+        
+        return {
+            "neg_count": neg_count,
+            "total_count": total_count,
+            "mean_score": mean_score,
+            "neg_fraction": neg_fraction,
+            "two_tick": two_tick,
+            "slope": slope
+        }
+        
+    except Exception as e:
+        logger.error(f"바스켓 상태 집계 실패: {e}")
+        return {"neg_count": 0, "total_count": 0, "mean_score": 0, 
+               "neg_fraction": 0, "two_tick": False, "slope": 0}
+
+def can_open_etf_position(etf_symbol: str) -> Tuple[bool, str]:
+    """
+    ETF 포지션 오픈 가능 여부 체크
+    - ETF 락 체크
+    - 기존 포지션 체크
+    - 상충 포지션 체크
+    """
+    try:
+        rurl = os.getenv("REDIS_URL")
+        if not rurl:
+            return True, "redis_not_available"
+        
+        r = redis.from_url(rurl)
+        
+        # 1. ETF 락 체크 (90초 TTL)
+        lock_key = f"etf_lock:{etf_symbol}"
+        if not r.setnx(lock_key, 1):
+            return False, "etf_locked"
+        r.expire(lock_key, 90)
+        
+        # 2. 기존 포지션 체크 (추가 구현 필요)
+        # TODO: trading_adapter에서 실제 포지션 확인
+        
+        # 3. 상충 포지션 체크
+        conflicts = CONFLICT_MAP.get(etf_symbol, set())
+        for conflict_symbol in conflicts:
+            conflict_pos_key = f"position:{conflict_symbol}"
+            if r.exists(conflict_pos_key):
+                r.delete(lock_key)  # 락 해제
+                return False, f"conflict_with_{conflict_symbol}"
+        
+        return True, "ok"
+        
+    except Exception as e:
+        logger.error(f"ETF 포지션 체크 실패: {e}")
+        return False, f"error_{e}"
 
 def route_signal_symbol(original_symbol: str, base_score: float) -> Dict[str, str]:
     """
-    신호 심볼을 실제 거래 심볼로 라우팅
+    바스켓 기반 신호 라우팅 (개선된 버전)
     
     Args:
-        original_symbol: 원래 신호 심볼 (예: MSFT)
-        base_score: 원래 신호 스코어 (예: -0.395)
+        original_symbol: 원래 신호 심볼
+        base_score: 원래 신호 스코어
         
     Returns:
-        {"exec_symbol": "SQQQ", "intent": "enter_inverse", "route_reason": "MSFT->SQQQ"}
+        라우팅 결과 딕셔너리
     """
-    if base_score >= 0:  # 롱 신호는 원래 심볼 그대로
+    # 인버스 ETF는 라우팅하지 않음 (패스스루)
+    if original_symbol in INVERSE_ETFS:
         return {
-            "exec_symbol": original_symbol, 
+            "exec_symbol": original_symbol,
+            "intent": "direct",
+            "route_reason": "inverse_etf_passthrough"
+        }
+    
+    # 롱 신호는 원래 심볼 그대로
+    if base_score >= 0:
+        return {
+            "exec_symbol": original_symbol,
             "intent": "enter_long",
             "route_reason": f"{original_symbol}->자체(롱)"
         }
     
-    # 숏 신호 → 인버스 ETF 매수로 변환
-    exec_symbol = SYMBOL_ROUTING_MAP.get(original_symbol, "SPXS")  # 기본값: SPXS
+    # 숏 신호: 바스켓 체크
+    basket_name = get_basket_for_symbol(original_symbol)
+    if not basket_name:
+        # 바스켓에 속하지 않는 종목은 스킵
+        return {
+            "exec_symbol": None,
+            "intent": "skip",
+            "route_reason": "not_in_basket"
+        }
+    
+    # 바스켓 상태 확인
+    basket_state = get_basket_state(basket_name)
+    basket_info = BASKETS[basket_name]
+    
+    # 바스켓 조건 체크
+    conditions_met = (
+        basket_state["total_count"] >= basket_info.get("min_signals", 3) and
+        basket_state["neg_fraction"] >= basket_info.get("neg_fraction", 0.60) and
+        basket_state["mean_score"] <= basket_info.get("mean_threshold", -0.12) and
+        basket_state["two_tick"]  # 2틱 연속 확인
+    )
+    
+    if not conditions_met:
+        return {
+            "exec_symbol": None,
+            "intent": "suppress",
+            "route_reason": f"basket_conditions_not_met_{basket_name}"
+        }
+    
+    # ETF 결정
+    target_etf = basket_info["etf"]
+    
+    # ETF 포지션 오픈 가능 체크
+    can_open, reason = can_open_etf_position(target_etf)
+    if not can_open:
+        return {
+            "exec_symbol": None,
+            "intent": "block",
+            "route_reason": f"etf_blocked_{reason}"
+        }
+    
     return {
-        "exec_symbol": exec_symbol,
-        "intent": "enter_inverse", 
-        "route_reason": f"{original_symbol}->{exec_symbol}(인버스)"
+        "exec_symbol": target_etf,
+        "intent": "enter_inverse",
+        "route_reason": f"{basket_name}_cluster->{target_etf}"
     }
 
 def is_actionable_signal(effective_score: float) -> bool:
@@ -1334,6 +1510,11 @@ def flatten_all_positions(trading_adapter, reason: str = "eod_flatten") -> int:
 def log_signal_decision(signal_data: Dict, symbol: str, decision: str, reason: str = None) -> None:
     """신호 처리 결정 로깅"""
     score = signal_data.get("score", 0)
+    # score가 문자열로 올 수 있으므로 float로 변환
+    try:
+        score = float(score) if score else 0
+    except (ValueError, TypeError):
+        score = 0
     signal_type = signal_data.get("signal_type", "unknown")
     
     if decision == "suppress":
@@ -1426,10 +1607,23 @@ def pipeline_e2e(self):
                     log_signal_decision(signal_data, symbol or "unknown", "suppress", "unknown_symbol")
                     continue
                 
-                # 🔄 심볼 라우팅 (개별주 숏 → 인버스 ETF 매수)
+                # 🔄 심볼 라우팅 (바스켓 기반)
                 route_result = route_signal_symbol(symbol, base_score)
                 exec_symbol = route_result["exec_symbol"]
                 route_reason = route_result["route_reason"]
+                route_intent = route_result.get("intent", "")
+                
+                # 라우팅 결과에 따른 처리
+                if exec_symbol is None:
+                    # skip, suppress, block 등의 경우
+                    log_signal_decision(signal_data, symbol, route_intent, route_reason)
+                    if "basket_conditions_not_met" in route_reason:
+                        signals_suppressed["below_cutoff"] += 1
+                    elif "etf_locked" in route_reason:
+                        signals_suppressed["cooldown"] += 1
+                    elif "conflict" in route_reason:
+                        signals_suppressed["direction_lock"] += 1
+                    continue
                 
                 # 실행 심볼의 메타데이터 확인
                 if exec_symbol not in INSTRUMENT_META:
@@ -2422,6 +2616,21 @@ def generate_signals(self):
                     try:
                         redis_streams.publish_signal(signal_data)
                         logger.info(f"🔥 [DEBUG] Redis 스트림 발행 성공: {ticker}")
+                        
+                        # 바스켓 분석을 위한 슠호 스코어 저장
+                        try:
+                            rurl = os.getenv("REDIS_URL")
+                            if rurl:
+                                r = redis.from_url(rurl)
+                                score_key = f"signal_score:{ticker}"
+                                score_data = {
+                                    "score": signal.score,
+                                    "timestamp": time.time(),
+                                    "signal_type": signal.signal_type.value
+                                }
+                                r.setex(score_key, 300, json.dumps(score_data))  # 5분 TTL
+                        except Exception as e:
+                            logger.warning(f"신호 스코어 저장 실패: {e}")
                         
                         # Slack 전송: 강신호만 (원래 기획 - 소수·굵직한 알림)
                         if slack_bot:
