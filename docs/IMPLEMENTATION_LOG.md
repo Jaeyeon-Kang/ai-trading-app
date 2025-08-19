@@ -517,3 +517,50 @@ Result: No unregistered task errors; scheduler continues emitting `check-stop-or
 - 신호 생성 → 바스켓 라우팅 → 위험 관리 → 주문 실행 파이프라인 완전 복구
 - Docker 컨테이너 안정적 실행
 - EOD 자동 청산 시스템 검증 완료
+
+### 🚨 2025-08-19 (심야): 워커 크래시 문제 재발 및 청산 로직 재활성화
+
+**문제 상황**: 사용자 요청 - 매도가 안됐다며 수동 매도 및 오류 확인 요청
+- 증상: 자동 청산 로직이 작동하지 않음, 워커 크래시 반복 발생
+- 현재 포지션: SQQQ 10주, TZA 34주 보유 중
+
+**진단 결과**:
+1. **워커 크래시**: SIGKILL로 인한 ForkPoolWorker 지속적 종료
+   ```
+   ERROR: Timed out waiting for UP message from ForkPoolWorker
+   ERROR: Process 'ForkPoolWorker' exited with 'signal 9 (SIGKILL)'
+   ```
+
+2. **청산 로직 실행 실패**: 파이프라인이 시작되지만 워커 타임아웃으로 완료되지 않음
+3. **데이터베이스 거래 기록 누락**: trades, signals, orders_paper 테이블 모두 비어있음
+
+**해결 작업**:
+
+1. **시스템 재빌드**:
+   ```bash
+   docker compose build --no-cache
+   docker compose up -d
+   ```
+
+2. **수동 청산 실행**:
+   - SQQQ 10주 매도 주문: Order ID `e048271b-3367-413c-91d5-6c169d52fb74`
+   - TZA 34주 매도 주문: Order ID `7d314b68-6b4d-457b-8465-d7caffc5ba22`
+   - Alpaca API 직접 호출로 성공적으로 제출
+
+3. **청산 로직 상태 확인**:
+   - 숏 ETF 청산 조건 체크가 정상 작동 중
+   - 성능 최적화된 청산 로직이 활성화됨
+   - 로그: "🎯 숏 ETF 청산 조건 체크 (갑작스러운 롱 전환 시 매도) - 성능 최적화 완료"
+
+**현재 상태**:
+- ✅ 파이프라인 E2E 정상 실행 (5-8초 완료)
+- ✅ 청산 로직 재활성화 및 작동 확인
+- ✅ 수동 매도 주문 제출 완료
+- ⚠️ 워커 SIGKILL 문제는 지속적으로 발생 중 (하지만 파이프라인은 정상 완료)
+- ⚠️ 수동 매도 주문은 장외시간으로 인해 아직 체결되지 않음
+
+**기술적 세부사항**:
+- 청산 조건: BUY_THRESHOLD(0.15) 이상 신호 시 50% 부분 청산
+- 쿨다운: 90초 TTL로 중복 매수 방지
+- 워커 타임아웃: 600초로 연장 설정
+- 환경변수: MIXER_THRESHOLD, SIGNAL_CUTOFF_RTH 등 정상 로드 확인
