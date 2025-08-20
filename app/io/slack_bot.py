@@ -739,12 +739,10 @@ class SlackBot:
     
     def _is_semi_auto_mode(self) -> bool:
         """반자동 버튼 표시 여부.
-        우선순위: SEMI_AUTO_BUTTONS=true → 표시. 아니면 AUTO_MODE=1일 때 표시(하위 호환).
+        버튼은 오직 '반자동'일 때만. AUTO는 버튼 금지.
         """
-        env = os.getenv
-        if env("SEMI_AUTO_BUTTONS", "0").lower() in ("1", "true", "yes", "on"):
-            return True
-        return env("AUTO_MODE", "0").lower() in ("1", "true", "yes", "on")
+        # 버튼은 오직 SEMI_AUTO_BUTTONS=1일 때만 표시
+        return os.getenv("SEMI_AUTO_BUTTONS", "0").lower() in ("1", "true", "yes", "on")
     
     def cleanup_old_callbacks(self, max_age_hours: int = 24):
         """오래된 콜백 정리"""

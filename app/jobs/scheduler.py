@@ -391,6 +391,12 @@ def _on_worker_ready(sender=None, **kwargs):
     # 컷오프 정화 및 로깅
     result = sanitize_cutoffs_in_redis()
     if result:
+        # 컷오프 정합성 체크
+        mixer_thr = settings.MIXER_THRESHOLD
+        rth_cut = result['rth']
+        if rth_cut > mixer_thr:
+            logger.warning(f"⚠️ RTH cutoff({rth_cut}) > MIXER({mixer_thr}) : 재검토 필요")
+        logger.info(f"컷오프 정합성: mixer={mixer_thr}, rth={rth_cut}, delta={rth_cut - mixer_thr:.3f}")
         logger.info(f"컷오프 로드됨: RTH={result['rth']:.3f}, EXT={result['ext']:.3f}")
     else:
         rth, ext = get_signal_cutoffs()
@@ -640,6 +646,9 @@ def should_call_llm_for_event(ticker: str, event_type: str, signal_score: float 
         Tuple[bool, str]: (호출 허용 여부, 사유)
     """
     try:
+        # 테스트용 RTH 강제 플래그
+        TEST_FORCE_RTH = os.getenv("TEST_FORCE_RTH", "0").lower() in ("1", "true", "on")
+        
         # LLM 게이팅 비활성화시 무조건 허용
         if not settings.LLM_GATING_ENABLED:
             return True, "gating_disabled"
@@ -670,7 +679,9 @@ def should_call_llm_for_event(ticker: str, event_type: str, signal_score: float 
         elif event_type == "vol_spike":
             # vol_spike는 신호 점수 조건 필요
             if signal_score is None or abs(signal_score) < settings.LLM_MIN_SIGNAL_SCORE:
-                return False, f"signal_score_too_low (|{signal_score}| < {settings.LLM_MIN_SIGNAL_SCORE})"
+                logger.info(f"🤖 LLM gate: block {ticker}/{event_type} "
+                           f"score={signal_score:.3f} < min={settings.LLM_MIN_SIGNAL_SCORE}")
+                return False, "signal_score_too_low"
             
             cache_key = f"llm_cache:vol_spike:{ticker}"
             
@@ -843,7 +854,7 @@ def get_basket_for_symbol(symbol: str) -> Optional[str]:
             return basket_name
     return None
 
-def get_basket_state(basket_name: str, window_seconds: int = 60) -> Dict[str, Any]:
+def get_basket_state(basket_name: str, window_seconds: int = None) -> Dict[str, Any]:
     """
     바스켓 상태 집계 (signals:recent 리스트에서 최근 신호들 분석)
     
@@ -852,6 +863,13 @@ def get_basket_state(basket_name: str, window_seconds: int = 60) -> Dict[str, An
          "neg_fraction": float, "two_tick": bool, "slope": float}
     """
     try:
+        # 파라미터 명확화
+        WINDOW_SEC = int(os.getenv("BASKET_WINDOW_SEC", "120"))
+        SAMPLE_N = int(os.getenv("BASKET_SAMPLE_N", "200"))
+        
+        if window_seconds is None:
+            window_seconds = WINDOW_SEC
+            
         rurl = os.getenv("REDIS_URL")
         if not rurl:
             return {"neg_count": 0, "total_count": 0, "mean_score": 0, 
@@ -868,8 +886,8 @@ def get_basket_state(basket_name: str, window_seconds: int = 60) -> Dict[str, An
         current_scores = []
         trend_scores = []  # slope 계산용
         
-        # signals:recent 리스트에서 최근 100개 신호 가져오기
-        recent_signals = r.lrange("signals:recent", 0, 99)  # 최근 100개
+        # signals:recent 리스트에서 설정된 표본 수만큼 가져오기
+        recent_signals = r.lrange("signals:recent", 0, SAMPLE_N - 1)
         
         for signal_data in recent_signals:
             try:
@@ -1158,9 +1176,10 @@ def count_daily_cap(redis_client, symbol: str) -> bool:
     key = get_daily_key("cap", symbol)
     redis_client.incr(key)
     
-    # 다음 RTH 리셋 시간까지 TTL 설정
-    next_reset = get_next_rth_reset_timestamp()
-    redis_client.expireat(key, int(next_reset.timestamp()))
+    # TTL이 설정되지 않았으면 ET 자정까지 설정
+    if redis_client.ttl(key) < 0:
+        next_reset = get_next_rth_reset_timestamp()
+        redis_client.expireat(key, int(next_reset.timestamp()))
     return True
 
 def get_daily_key(prefix: str, symbol: str) -> str:
@@ -1169,14 +1188,20 @@ def get_daily_key(prefix: str, symbol: str) -> str:
     return f"{prefix}:{symbol}:{date_str}"
 
 def get_next_rth_reset_timestamp() -> datetime:
-    """다음 RTH 리셋 시간 (UTC 기준)"""
-    # 미국 동부시간 오전 9:30 = UTC 14:30 (EST) or 13:30 (EDT)
-    # 단순화: 매일 UTC 14:00으로 설정
-    now = datetime.now(timezone.utc)
-    reset_time = now.replace(hour=14, minute=0, second=0, microsecond=0)
-    if now >= reset_time:
-        reset_time += timedelta(days=1)
-    return reset_time
+    """다음 RTH 리셋 시간 (미 동부시간 자정 기준)"""
+    import pytz
+    
+    # 미 동부시간 자정으로 설정
+    et = pytz.timezone("America/New_York")
+    now_et = datetime.now(et)
+    
+    # 다음 자정 계산
+    next_midnight = (now_et + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    
+    # UTC로 변환하여 반환
+    return next_midnight.astimezone(timezone.utc)
 
 def get_open_position(trading_adapter, symbol: str) -> Optional[Dict]:
     """현재 오픈 포지션 확인"""
@@ -2189,11 +2214,8 @@ def format_slack_message(signal) -> Dict:
         f"이유: {signal.trigger} (<= {signal.horizon_minutes}m)"
     )
     
-    # 버튼 생성 여부 확인 (반자동 모드)
-    show_buttons = (
-        os.getenv("SEMI_AUTO_BUTTONS", "0").lower() in ("1", "true", "yes", "on") or
-        os.getenv("AUTO_MODE", "0").lower() in ("1", "true", "yes", "on")
-    )
+    # 버튼 생성 여부 확인 (반자동 모드만)
+    show_buttons = os.getenv("SEMI_AUTO_BUTTONS", "0").lower() in ("1", "true", "yes", "on")
     
     # 블록 구성
     blocks = [
@@ -2292,11 +2314,8 @@ def format_enhanced_slack_message(signal, llm_insight) -> Dict:
         }
     ]
     
-    # 버튼 추가 (기존 로직 재사용)
-    show_buttons = (
-        os.getenv("SEMI_AUTO_BUTTONS", "0").lower() in ("1", "true", "yes", "on") or
-        os.getenv("AUTO_MODE", "0").lower() in ("1", "true", "yes", "on")
-    )
+    # 버튼 추가 (반자동 모드만)
+    show_buttons = os.getenv("SEMI_AUTO_BUTTONS", "0").lower() in ("1", "true", "yes", "on")
     
     if show_buttons:
         button_text = "매수" if signal.signal_type.value == "long" else "매도"
