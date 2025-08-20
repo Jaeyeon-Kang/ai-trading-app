@@ -1830,65 +1830,66 @@ def pipeline_e2e(self):
                 "execution_time": time.time() - start_time
             }
         
-        # 🎯 숏 ETF 청산 조건 체크 (갑작스러운 롱 전환 시 매도) - 성능 최적화 완료
-        liquidation_count = 0
-        try:
-            # 현재 포지션을 한 번만 조회하여 성능 최적화
-            positions = trading_adapter.get_positions() if trading_adapter else []
-            inverse_etfs = set(os.getenv("INVERSE_ETFS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS").split(","))
-            
-            for pos in positions:
-                if (hasattr(pos, 'ticker') and pos.ticker in inverse_etfs and 
-                    hasattr(pos, 'quantity') and float(pos.quantity) > 0):
-                    
-                    # 포지션 기본 정보
-                    symbol = pos.ticker
-                    qty = float(pos.quantity)
-                    
-                    try:
-                        # 최신 가격 및 점수 확인 (캐시된 값 활용)
-                        current_price = trading_adapter.get_current_price(symbol)
-                        if current_price <= 0:
-                            continue
-                        
-                        # 간단한 청산 조건: BUY_THRESHOLD 이상의 점수 (롱 전환)
-                        # 복잡한 볼륨/캔들 체크는 성능상 생략
-                        latest_signal = redis_client.get(f"latest_score:{symbol}")
-                        if latest_signal:
-                            try:
-                                current_score = float(latest_signal)
-                                if current_score >= BUY_THRESHOLD:
-                                    # 부분 청산 (50%)
-                                    partial_qty = max(1, int(qty * 0.5))
-                                    
-                                    # 청산 주문 실행
-                                    trade = trading_adapter.submit_market_order(
-                                        ticker=symbol,
-                                        side="sell",
-                                        quantity=partial_qty,
-                                        signal_id=f"liquidation_{symbol}_{int(time.time())}"
-                                    )
-                                    
-                                    if trade:
-                                        liquidation_count += 1
-                                        logger.info(f"🔄 숏 ETF 부분 청산: {symbol} {partial_qty}주 @ ${current_price:.2f} (스코어: {current_score:.3f})")
-                                        
-                                        # Slack 알림
-                                        if slack_bot:
-                                            slack_message = f"🔄 *롱 전환 청산*\n• {symbol} {partial_qty}주 매도 @ ${current_price:.2f}\n• 전환 스코어: {current_score:.3f}"
-                                            slack_bot.send_message(slack_message)
-                            except ValueError:
-                                continue
-                    except Exception as e:
-                        logger.debug(f"숏 ETF 청산 체크 실패 {symbol}: {e}")
-                        continue
-            
-            if liquidation_count > 0:
-                logger.info(f"✅ 숏 ETF 청산 완료: {liquidation_count}개 포지션 처리")
-        
-        except Exception as e:
-            logger.error(f"숏 ETF 청산 로직 오류: {e}")
-            # 오류가 발생해도 전체 파이프라인은 계속 진행
+        # 🎯 숏 ETF 청산 조건 체크 - 비활성화 (2025-08-20)
+        # 정규장 직전 전량 청산만 유지하기로 결정
+        # liquidation_count = 0
+        # try:
+        #     # 현재 포지션을 한 번만 조회하여 성능 최적화
+        #     positions = trading_adapter.get_positions() if trading_adapter else []
+        #     inverse_etfs = set(os.getenv("INVERSE_ETFS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS").split(","))
+        #     
+        #     for pos in positions:
+        #         if (hasattr(pos, 'ticker') and pos.ticker in inverse_etfs and 
+        #             hasattr(pos, 'quantity') and float(pos.quantity) > 0):
+        #             
+        #             # 포지션 기본 정보
+        #             symbol = pos.ticker
+        #             qty = float(pos.quantity)
+        #             
+        #             try:
+        #                 # 최신 가격 및 점수 확인 (캐시된 값 활용)
+        #                 current_price = trading_adapter.get_current_price(symbol)
+        #                 if current_price <= 0:
+        #                     continue
+        #                 
+        #                 # 간단한 청산 조건: BUY_THRESHOLD 이상의 점수 (롱 전환)
+        #                 # 복잡한 볼륨/캔들 체크는 성능상 생략
+        #                 latest_signal = redis_client.get(f"latest_score:{symbol}")
+        #                 if latest_signal:
+        #                     try:
+        #                         current_score = float(latest_signal)
+        #                         if current_score >= BUY_THRESHOLD:
+        #                             # 부분 청산 (50%)
+        #                             partial_qty = max(1, int(qty * 0.5))
+        #                             
+        #                             # 청산 주문 실행
+        #                             trade = trading_adapter.submit_market_order(
+        #                                 ticker=symbol,
+        #                                 side="sell",
+        #                                 quantity=partial_qty,
+        #                                 signal_id=f"liquidation_{symbol}_{int(time.time())}"
+        #                             )
+        #                             
+        #                             if trade:
+        #                                 liquidation_count += 1
+        #                                 logger.info(f"🔄 숏 ETF 부분 청산: {symbol} {partial_qty}주 @ ${current_price:.2f} (스코어: {current_score:.3f})")
+        #                                 
+        #                                 # Slack 알림
+        #                                 if slack_bot:
+        #                                     slack_message = f"🔄 *롱 전환 청산*\n• {symbol} {partial_qty}주 매도 @ ${current_price:.2f}\n• 전환 스코어: {current_score:.3f}"
+        #                                     slack_bot.send_message(slack_message)
+        #                     except ValueError:
+        #                         continue
+        #             except Exception as e:
+        #                 logger.debug(f"숏 ETF 청산 체크 실패 {symbol}: {e}")
+        #                 continue
+        #     
+        #     if liquidation_count > 0:
+        #         logger.info(f"✅ 숏 ETF 청산 완료: {liquidation_count}개 포지션 처리")
+        # 
+        # except Exception as e:
+        #     logger.error(f"숏 ETF 청산 로직 오류: {e}")
+        #     # 오류가 발생해도 전체 파이프라인은 계속 진행
         
         # Redis 스트림에서 신호 소비
         redis_streams = stream_consumer.redis_streams
