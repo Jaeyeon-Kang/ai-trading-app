@@ -1,7 +1,4 @@
 import types
-import time as _time
-
-import pytest
 
 
 class DummyPos:

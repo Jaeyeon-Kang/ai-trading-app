@@ -25,8 +25,8 @@ from celery.signals import beat_init, task_prerun, worker_process_init, worker_r
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from app.config import settings, get_signal_cutoffs, sanitize_cutoffs_in_redis
-from app.utils.rate_limiter import get_rate_limiter, TokenTier
+from app.config import settings, get_signal_cutoffs, sanitize_cutoffs_in_redis  # noqa: E402
+from app.utils.rate_limiter import get_rate_limiter, TokenTier  # noqa: E402
 
 # GPT-5 리스크 관리 통합
 try:
@@ -511,7 +511,6 @@ def should_process_ticker_now(ticker: str, current_time: Optional[Union[datetime
     
     # 현재 분의 초 (timestamp에서 datetime 객체로 변환)
     if isinstance(current_time, int):
-        from datetime import datetime
         current_time = datetime.fromtimestamp(current_time)
     current_second = current_time.second
     
@@ -668,7 +667,7 @@ def should_call_llm_for_event(ticker: str, event_type: str, signal_score: float 
     """
     try:
         # 테스트용 RTH 강제 플래그
-        TEST_FORCE_RTH = os.getenv("TEST_FORCE_RTH", "0").lower() in ("1", "true", "on")
+        _TEST_FORCE_RTH = os.getenv("TEST_FORCE_RTH", "0").lower() in ("1", "true", "on")
         
         # LLM 게이팅 비활성화시 무조건 허용
         if not settings.LLM_GATING_ENABLED:
@@ -941,9 +940,8 @@ def get_basket_state(basket_name: str, window_seconds: int = None) -> Dict[str, 
                 # 타임스탬프 파싱 (ISO 형식)
                 if timestamp_str:
                     try:
-                        from datetime import datetime
                         timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00')).timestamp()
-                    except:
+                    except Exception:
                         continue
                 else:
                     continue
@@ -974,7 +972,7 @@ def get_basket_state(basket_name: str, window_seconds: int = None) -> Dict[str, 
                 prev_state = json.loads(prev_data)
                 if prev_state.get("neg_fraction", 0) >= 0.5 and neg_fraction >= 0.5:
                     two_tick = True
-            except:
+            except Exception:
                 pass
         
         # 현재 상태 저장 (다음 비교용)
@@ -1644,7 +1642,6 @@ def flatten_all_positions(trading_adapter, reason: str = "eod_flatten") -> int:
             quantity = abs(qty_raw if FRACTIONAL_ENABLED else int(qty_raw))
 
             # 재시도 루프
-            last_err = None
             for attempt in range(1, EOD_MAX_RETRIES + 2):  # 최초 1회 + 재시도 N회
                 tif_used = "cls"  # 기본 의도는 CLS (submit_eod_exit가 실제 tif를 결정)
                 try:
@@ -1687,7 +1684,6 @@ def flatten_all_positions(trading_adapter, reason: str = "eod_flatten") -> int:
                         flattened_count += 1
                         break
                 except Exception as e:
-                    last_err = e
                     _log_exit_decision(symbol, side, quantity, policy="EOD", reason=f"error:{e}", tif=tif_used,
                                        attempt=attempt, market_state="closed")
                     if attempt <= EOD_MAX_RETRIES:
@@ -1952,20 +1948,21 @@ def enforce_regime_flatten_inverse(self):
 def check_volume_spike(symbol: str, current_volume: float) -> bool:
     """볼륨 스파이크 확인: 현재 볼륨 > 20일 평균 * 1.5배"""
     try:
-        # 타임아웃 설정으로 블로킹 방지
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            # 단순화된 쿼리 (최근 5일만 체크)
-            query = """
-            SELECT AVG(v) as avg_volume
-            FROM bars_30s 
-            WHERE ticker = %s 
-            AND ts >= NOW() - INTERVAL '5 days'
-            LIMIT 100
-            """
-            cursor.execute(query, (symbol,))
-            result = cursor.fetchone()
+        dsn = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+        if not dsn:
+            return True
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cursor:
+                # 단순화된 쿼리 (최근 5일만 체크)
+                query = """
+                SELECT AVG(v) as avg_volume
+                FROM bars_30s 
+                WHERE ticker = %s 
+                AND ts >= NOW() - INTERVAL '5 days'
+                LIMIT 100
+                """
+                cursor.execute(query, (symbol,))
+                result = cursor.fetchone()
             
             if result and result[0] and current_volume > 0:
                 avg_volume = float(result[0])
@@ -1986,21 +1983,22 @@ def check_volume_spike(symbol: str, current_volume: float) -> bool:
 def check_candle_break(symbol: str, current_close: float) -> bool:
     """캔들 브레이크 확인: 현재 종가 > 직전 고점 + epsilon"""
     try:
-        # 타임아웃 설정으로 블로킹 방지
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            # 단순화된 쿼리 (최근 5개 캔들만)
-            query = """
-            SELECT h as high
-            FROM bars_30s 
-            WHERE ticker = %s 
-            AND ts < NOW() - INTERVAL '30 seconds'
-            ORDER BY ts DESC 
-            LIMIT 5
-            """
-            cursor.execute(query, (symbol,))
-            result = cursor.fetchone()
+        dsn = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+        if not dsn:
+            return True
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cursor:
+                # 단순화된 쿼리 (최근 5개 캔들만)
+                query = """
+                SELECT h as high
+                FROM bars_30s 
+                WHERE ticker = %s 
+                AND ts < NOW() - INTERVAL '30 seconds'
+                ORDER BY ts DESC 
+                LIMIT 5
+                """
+                cursor.execute(query, (symbol,))
+                result = cursor.fetchone()
             
             if result and result[0] and current_close > 0:
                 prev_high = float(result[0])
@@ -2388,7 +2386,6 @@ def pipeline_e2e(self):
                         return 0.0
                 
                 base_score = parse_numeric_value(signal_data.get("score", 0))
-                signal_type = signal_data.get("signal_type", "unknown")
                 
                 if not symbol or symbol not in INSTRUMENT_META:
                     log_signal_decision(signal_data, symbol or "unknown", "suppress", "unknown_symbol")
