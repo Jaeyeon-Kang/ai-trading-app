@@ -178,6 +178,53 @@ curl -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" \
    - 시장 시간 체크 로직 재검토
    - 청산 실행 조건 확인
 
+## 🔴 RTH 들어가면(21:30 KST 이후) 꼭 볼 것
+
+### 1. LLM 호출 모니터링
+```bash
+# LLM 일일 카운트 확인
+docker exec trading_bot_redis redis-cli GET "llm:daily_calls"
+
+# signal_score_too_low 차단 로그 확인
+docker logs trading_bot_worker | grep "LLM gate: block" | tail -10
+```
+- **목표**: 일일 120콜 밑으로 유지
+- **확인사항**: `score=X.XXX < min=0.600` 형태의 상세 로그 출력
+
+### 2. 컷오프 정합성 검증
+```bash
+# 실시간 신호 필터링 확인
+docker logs -f trading_bot_worker | grep -E "MIXER_THRESHOLD|SIGNAL_CUTOFF_RTH"
+```
+- **설정값**: mixer=0.15, rth=0.12
+- **확인사항**: RTH 신호가 이중필터에서 충돌 없이 통과하는지
+
+### 3. EOD 전량청산 실행
+```bash
+# 장 마감 5분 전 (03:55 KST) 확인
+docker logs trading_bot_worker | grep -E "EOD 청산|flatten_all|liquidate"
+```
+- **시간**: NY 15:55 (KST 04:55 또는 05:55)
+- **확인사항**: 숏 ETF 포지션 전량 청산 로그
+
+### 4. 파이프라인 통계
+```bash
+# 파이프라인 요약 로그 확인
+docker logs trading_bot_worker | grep "Pipeline summary" | tail -5
+```
+- **형식**: `processed=X, orders=Y, suppressed=Z`
+- **분석포인트**:
+  - processed: 처리된 신호 수
+  - orders: 실제 주문 수
+  - suppressed: 억제된 신호 수 (쿨다운, 리스크 등)
+  - **정상 비율**: orders/processed > 10% (너무 낮으면 필터 과도)
+
+### 5. 실시간 모니터링 명령어 모음
+```bash
+# 한 화면에서 모든 핵심 로그 보기
+docker logs -f trading_bot_worker | grep -E "LLM gate|Pipeline summary|EOD|🚀|📈|orders_executed"
+```
+
 ## 📝 추가 참고사항
 
 ### 타임라인
@@ -192,5 +239,13 @@ curl -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" \
 - 리스크 관리 정상 작동 ✅
 - 내부 시스템 연동 문제 ❌
 
+### GPT 개선사항 반영 (2025-08-20)
+- 슬랙 버튼 규칙 수정 완료 ✅
+- RTH 테스트 플래그 추가 완료 ✅
+- LLM 로깅 강화 완료 ✅
+- 컷오프 정합성 체크 추가 완료 ✅
+- 바스켓 집계 파라미터 수정 완료 ✅
+- 일일캡 ET 자정 리셋 개선 완료 ✅
+
 ---
-*이 문서는 2025-08-20 00:30 KST 기준으로 작성되었습니다.*
+*이 문서는 2025-08-20 13:54 KST 기준으로 업데이트되었습니다.*

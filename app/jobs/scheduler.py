@@ -1613,12 +1613,26 @@ def flatten_all_positions(trading_adapter, reason: str = "eod_flatten") -> int:
             side = "sell" if float(getattr(pos, 'quantity', 0)) > 0 else "buy"
             quantity = abs(int(float(getattr(pos, 'quantity', 0))))
             
-            trading_adapter.submit_market_order(
+            trade = trading_adapter.submit_market_order(
                 ticker=getattr(pos, 'ticker', ''),
                 side=side,
                 quantity=quantity,
                 signal_id=f"{reason}_{getattr(pos, 'ticker', '')}_{int(time.time())}"
             )
+            
+            # GPT 제안: EOD 청산 DB 기록
+            if trade:
+                ticker = getattr(pos, 'ticker', '')
+                eod_signal_data = {
+                    "symbol": ticker,
+                    "score": 0.0,  # EOD는 강제 청산이므로 점수 없음
+                    "confidence": 1.0,
+                    "regime": "eod",
+                    "meta": {"reason": reason, "position_qty": float(getattr(pos, 'quantity', 0))}
+                }
+                # EOD 청산: 신호 저장 후 거래 기록
+                signal_db_id = save_signal_to_db(eod_signal_data, "eod_flatten", f"reason={reason},qty={quantity}")
+                save_trade_to_db(trade, eod_signal_data, ticker, signal_db_id)
             
             logger.info(f"EOD 청산: {getattr(pos, 'ticker', '')} {side} {quantity}주 (사유: {reason})")
             flattened_count += 1
@@ -1743,12 +1757,25 @@ def close_partial_position(trading_adapter, symbol: str, partial_qty: int, reaso
         
         # 시장가 매도 주문
         side = "sell" if current_pos.quantity > 0 else "buy"
-        trading_adapter.submit_market_order(
+        trade = trading_adapter.submit_market_order(
             ticker=symbol,
             side=side,
             quantity=actual_qty,
             signal_id=f"{reason}_{symbol}_{int(time.time())}"
         )
+        
+        # GPT 제안: 부분 청산 DB 기록
+        if trade:
+            partial_signal_data = {
+                "symbol": symbol,
+                "score": 0.0,  # 부분 청산은 강제 처리
+                "confidence": 1.0,
+                "regime": "partial_liquidation",
+                "meta": {"reason": reason, "partial_qty": actual_qty, "original_qty": current_pos.quantity}
+            }
+            # 부분 청산: 신호 저장 후 거래 기록
+            signal_db_id = save_signal_to_db(partial_signal_data, "partial_liquidate", f"reason={reason},qty={actual_qty}")
+            save_trade_to_db(trade, partial_signal_data, symbol, signal_db_id)
         
         logger.info(f"🔄 부분 청산: {symbol} {side} {actual_qty}주 (사유: {reason})")
         return True
@@ -1812,6 +1839,109 @@ def log_signal_decision(signal_data: Dict, symbol: str, decision: str, reason: s
         logger.info(f"✅ 신호 실행: {symbol} {signal_type} (score: {score:.3f}) - {decision}")
     else:
         logger.info(f"📝 신호 처리: {symbol} {signal_type} (score: {score:.3f}) - {decision}")
+
+# --- DB 저장 헬퍼 함수 (GPT 제안: 실제 거래 후 로컬 DB 기록) ---
+
+def save_trade_to_db(trade_result, signal_data: Dict, exec_symbol: str, signal_db_id: str = None) -> Optional[str]:
+    """거래 결과를 로컬 DB에 저장 - signal_id 연계 개선"""
+    if not trade_result:
+        return None
+        
+    dsn = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+    if not dsn:
+        logger.warning("DB DSN이 설정되지 않아 거래 기록을 건너뜀")
+        return None
+        
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                # trade_result가 객체인 경우와 dict인 경우 모두 처리
+                if hasattr(trade_result, 'side'):
+                    # 객체 형태 (알파카 Trade 객체)
+                    side = getattr(trade_result, 'side', 'buy')
+                    quantity = int(getattr(trade_result, 'quantity', 0))
+                    price = float(getattr(trade_result, 'price', 0))
+                    trade_id_str = getattr(trade_result, 'trade_id', f"trade_{int(time.time())}")
+                else:
+                    # dict 형태
+                    side = trade_result.get("side", "buy")
+                    quantity = int(trade_result.get("quantity", 0))
+                    price = float(trade_result.get("price", 0))
+                    trade_id_str = trade_result.get("trade_id", f"trade_{int(time.time())}")
+                
+                # signal_id 결정: 새로 생성된 signal_db_id 우선, 없으면 기존 signal_data에서
+                # signals.id는 INTEGER이므로 변환 필요
+                final_signal_id = None
+                if signal_db_id:
+                    try:
+                        final_signal_id = int(signal_db_id)
+                    except (ValueError, TypeError):
+                        final_signal_id = None
+                elif signal_data.get("signal_id"):
+                    try:
+                        final_signal_id = int(signal_data.get("signal_id"))
+                    except (ValueError, TypeError):
+                        final_signal_id = None
+                
+                # trades 테이블에 기록 - 실제 스키마 사용
+                cur.execute("""
+                    INSERT INTO trades (
+                        trade_id, ticker, side, quantity, price, signal_id, created_at, status
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (
+                    trade_id_str,
+                    exec_symbol,
+                    side,
+                    quantity,
+                    price,
+                    final_signal_id,  # 유효한 signal_id 사용 또는 NULL
+                    datetime.now(),
+                    'filled'
+                ))
+                db_trade_id = cur.fetchone()[0]
+                logger.info(f"💾 거래 기록 저장: ID={db_trade_id}, {exec_symbol} {side} {quantity}주 @ ${price:.2f}, signal_id={final_signal_id}")
+                return str(db_trade_id)
+                
+    except Exception as e:
+        logger.error(f"거래 DB 저장 실패: {e}")
+        return None
+
+def save_signal_to_db(signal_data: Dict, action: str, decision_reason: str) -> Optional[str]:
+    """신호를 로컬 DB에 저장"""
+    dsn = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+    if not dsn:
+        return None
+        
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                # signals 테이블에 기록
+                cur.execute("""
+                    INSERT INTO signals (
+                        ticker, signal_type, score, confidence, 
+                        regime, trigger_reason, created_at, 
+                        action_taken, meta
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (
+                    signal_data.get("symbol", "UNKNOWN"),
+                    "long" if signal_data.get("score", 0) > 0 else "short",
+                    float(signal_data.get("score", 0)),
+                    float(signal_data.get("confidence", 0.7)),
+                    signal_data.get("regime", "trend"),
+                    decision_reason,
+                    datetime.now(),
+                    action,  # "entry", "exit", "suppress"
+                    json.dumps(signal_data.get("meta", {}))
+                ))
+                signal_id = cur.fetchone()[0]
+                logger.debug(f"💾 신호 기록 저장: ID={signal_id}, {signal_data.get('symbol')} {action}")
+                return str(signal_id)
+                
+    except Exception as e:
+        logger.error(f"신호 DB 저장 실패: {e}")
+        return None
 
 @celery_app.task(bind=True, name="app.jobs.scheduler.pipeline_e2e")
 def pipeline_e2e(self):
@@ -2050,6 +2180,11 @@ def pipeline_e2e(self):
                                 orders_executed += 1
                                 log_signal_decision(signal_data, symbol, "add", f"exec_symbol={exec_symbol},qty={quantity}")
                                 
+                                # GPT 제안: DB 저장 로직 추가 - 신호 먼저 저장 후 거래에 연결
+                                if trade:
+                                    signal_db_id = save_signal_to_db(signal_data, "add", f"exec_symbol={exec_symbol},qty={quantity}")
+                                    save_trade_to_db(trade, signal_data, exec_symbol, signal_db_id)
+                                
                                 # Slack 알림
                                 if slack_bot:
                                     slack_message = f"📈 *추가 매수*\n• {exec_symbol} +{quantity}주 @ ${float(getattr(trade, 'price', 0)):.2f}\n• 원신호: {symbol}({base_score:.3f})\n• 라우팅: {route_reason}\n• 기존포지션: {current_position['qty']}주"
@@ -2080,6 +2215,11 @@ def pipeline_e2e(self):
                             orders_executed += 1
                             log_signal_decision(signal_data, symbol, "entry", f"exec_symbol={exec_symbol},qty={quantity}")
                             
+                            # GPT 제안: DB 저장 로직 추가 - 신호 먼저 저장 후 거래에 연결
+                            if trade:
+                                signal_db_id = save_signal_to_db(signal_data, "entry", f"exec_symbol={exec_symbol},qty={quantity}")
+                                save_trade_to_db(trade, signal_data, exec_symbol, signal_db_id)
+                            
                             # Slack 알림
                             if slack_bot:
                                 slack_message = f"🚀 *신규 진입*\n• {exec_symbol} {quantity}주 @ ${float(getattr(trade, 'price', 0)):.2f}\n• 원신호: {symbol}({base_score:.3f})\n• 라우팅: {route_reason}\n• 스톱거리: ${float(stop_distance):.2f}"
@@ -2102,6 +2242,11 @@ def pipeline_e2e(self):
                         count_daily_cap(redis_client, exec_symbol)
                         orders_executed += 1
                         log_signal_decision(signal_data, symbol, "exit", f"exec_symbol={exec_symbol},qty={quantity}")
+                        
+                        # GPT 제안: DB 저장 로직 추가 - 신호 먼저 저장 후 거래에 연결
+                        if trade:
+                            signal_db_id = save_signal_to_db(signal_data, "exit", f"exec_symbol={exec_symbol},qty={quantity}")
+                            save_trade_to_db(trade, signal_data, exec_symbol, signal_db_id)
                         
                         # Slack 알림
                         if slack_bot:

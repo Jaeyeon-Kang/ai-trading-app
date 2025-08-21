@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS signals_legacy (
 CREATE TABLE IF NOT EXISTS trades (
     id SERIAL PRIMARY KEY,
     trade_id VARCHAR(50) UNIQUE NOT NULL,
-    signal_id VARCHAR(50) REFERENCES signals_legacy(signal_id),
+    signal_id INTEGER REFERENCES signals(id),
     ticker VARCHAR(10) NOT NULL,
     side VARCHAR(10) NOT NULL, -- 'buy', 'sell'
     quantity INTEGER NOT NULL,

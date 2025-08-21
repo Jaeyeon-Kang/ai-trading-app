@@ -93,7 +93,7 @@ class RiskEngine:
         self.status = RiskStatus.NORMAL
         self.shutdown_reason = ""
         
-        logger.info(f"리스크 엔진 초기화: 자본 {initial_capital:,}원, 일일 한도 {daily_loss_limit*100}%")
+        logger.info(f"리스크 엔진 초기화: 자본 ${initial_capital:,}, 일일 한도 {daily_loss_limit*100}%")
     
     def update_position(self, ticker: str, side: str, quantity: int, 
                        price: float, timestamp: datetime):

@@ -46,7 +46,7 @@ class PaperLedger:
         self.daily_pnl = 0.0
         self.daily_trades = 0
         
-        logger.info(f"페이퍼 레저 초기화: 현금 {initial_cash:,}원")
+        logger.info(f"페이퍼 레저 초기화: 현금 ${initial_cash:,}")
     
     def simulate_fill(self, order_id: str, ticker: str, side: str, 
                      quantity: int, price: float, meta: dict = None) -> PaperTrade:

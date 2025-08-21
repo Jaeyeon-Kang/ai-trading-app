@@ -83,7 +83,7 @@ class SlackBot:
         logger.info(f"Slack Bot 초기화: 채널 {channel}")
     
     def send_message(self, message) -> bool:
-        """메시지 전송 (재시도 로직 포함). dict 또는 SlackMessage 모두 허용"""
+        """메시지 전송 (재시도 로직 포함). dict, str 또는 SlackMessage 모두 허용"""
         # dict 입력 호환 처리
         if isinstance(message, dict):
             message = SlackMessage(
@@ -92,6 +92,12 @@ class SlackBot:
                 blocks=message.get("blocks"),
                 attachments=message.get("attachments"),
                 thread_ts=message.get("thread_ts"),
+            )
+        # str 입력 호환 처리
+        elif isinstance(message, str):
+            message = SlackMessage(
+                channel=self.default_channel,
+                text=message
             )
         for attempt in range(self.max_retries):
             try:

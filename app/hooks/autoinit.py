@@ -39,12 +39,13 @@ def _build_components():
     comps["quotes_ingestor"] = qi
 
     # Engines
-    buy_th = float(
-        os.getenv("SIGNAL_CUTOFF_RTH", os.getenv("SIGNAL_CUTOFF_EXT", "0.0")) or 0.0
-    )
+    # GPT 제안: MIXER_THRESHOLD 사용, 매도는 음수로
+    mixer_thr = float(os.getenv("MIXER_THRESHOLD", "0.15"))
     comps["regime_detector"] = RegimeDetector()
     comps["tech_score_engine"] = TechScoreEngine()
-    comps["signal_mixer"] = SignalMixer(buy_threshold=buy_th, sell_threshold=0.0)
+    comps["signal_mixer"] = SignalMixer(buy_threshold=mixer_thr, sell_threshold=-mixer_thr)
+    # GPT 제안: 명시적 로그로 정합성 확인
+    log.info(f"[MixerInit] MIXER={mixer_thr}, buy={mixer_thr}, sell={-mixer_thr}, callsite=autoinit")
     init_cap = float(os.getenv("INITIAL_CAPITAL", "1000000") or 1000000)
     comps["risk_engine"] = RiskEngine(initial_capital=init_cap)
     comps["paper_ledger"] = PaperLedger(initial_cash=init_cap)

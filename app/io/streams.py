@@ -31,7 +31,12 @@ class RedisStreams:
         """
         self.redis_client = redis.Redis(host=host, port=port, db=db, decode_responses=True)
         self.consumer_group = "bot"  # 요구사항에 맞게 변경
-        self.consumer_name = "worker_1"
+        import os
+        import uuid
+        # 각 프로세스별 고유 consumer 이름 생성
+        process_id = os.getpid()
+        unique_id = str(uuid.uuid4())[:8]
+        self.consumer_name = f"worker_{process_id}_{unique_id}"
         
         # 스트림 키 정의
         self.streams = {
@@ -419,14 +424,22 @@ class RedisStreams:
 class StreamConsumer:
     """Redis Streams 소비자 (bot 그룹)"""
     
-    def __init__(self, redis_streams: RedisStreams, consumer_name: str = "worker_1"):
+    def __init__(self, redis_streams: RedisStreams, consumer_name: str = None):
         """
         Args:
             redis_streams: Redis Streams 인스턴스
             consumer_name: 컨슈머 이름
         """
         self.redis_streams = redis_streams
-        self.consumer_name = consumer_name
+        if consumer_name is None:
+            import os
+            import uuid
+            # 각 프로세스별 고유 consumer 이름 생성
+            process_id = os.getpid()
+            unique_id = str(uuid.uuid4())[:8]
+            self.consumer_name = f"worker_{process_id}_{unique_id}"
+        else:
+            self.consumer_name = consumer_name
         self.group_name = "bot"  # 요구사항에 맞게 고정
         
         # 소비할 스트림들

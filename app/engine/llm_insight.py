@@ -41,18 +41,24 @@ class LLMInsightEngine:
                  api_key: str = None,
                  monthly_cap_krw: float = 80000.0,  # 월 비용 한도 (KRW)
                  usd_to_krw: float = 1300.0,  # USD/KRW 환율
-                 cache_hours: int = 24):  # 캐시 시간 (시간)
+                 cache_hours: int = None):  # 캐시 시간 (시간, None이면 환경변수 사용)
         """
         Args:
             api_key: OpenAI API 키 (환경변수 OPENAI_API_KEY에서 로드)
             monthly_cap_krw: 월 비용 한도 (KRW)
             usd_to_krw: USD/KRW 환율
-            cache_hours: 캐시 시간 (시간)
+            cache_hours: 캐시 시간 (시간, None이면 환경변수에서 로드)
         """
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.monthly_cap_krw = monthly_cap_krw
         self.usd_to_krw = usd_to_krw
-        self.cache_hours = cache_hours
+        
+        # 캐시 시간 설정: 환경변수 우선, 없으면 기본값 24시간
+        if cache_hours is not None:
+            self.cache_hours = cache_hours
+        else:
+            cache_minutes = int(os.getenv("LLM_CACHE_DURATION_MIN", "30"))
+            self.cache_hours = cache_minutes / 60.0
         
         # OpenAI 클라이언트
         if self.api_key:
@@ -87,7 +93,7 @@ class LLMInsightEngine:
         except Exception:
             self.redis = None
         
-        logger.info(f"LLM 인사이트 엔진 초기화: 월 한도 {monthly_cap_krw:,.0f}원, 캐시 {cache_hours}시간")
+        logger.info(f"LLM 인사이트 엔진 초기화: 월 한도 {monthly_cap_krw:,.0f}원, 캐시 {self.cache_hours:.1f}시간")
     
     def set_slack_bot(self, slack_bot):
         """슬랙 봇 설정 (상태 변경 알림용)"""
