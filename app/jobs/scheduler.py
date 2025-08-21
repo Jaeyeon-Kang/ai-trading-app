@@ -264,22 +264,26 @@ celery_app.conf.beat_schedule = {
     # 마감 전 사전 예약 청산 (미 동부시간 15:48)
     "queue-preclose-liquidation": {
         "task": "app.jobs.scheduler.queue_preclose_liquidation",
-        "schedule": crontab(hour=15, minute=48, tz='America/New_York'),
+        "schedule": crontab(hour=15, minute=48),
+        "options": {"queue": "celery", "expires": 50},
     },
     # 타임 스톱 가드레일 (1분마다)
     "enforce-time-stop": {
         "task": "app.jobs.scheduler.enforce_time_stop",
         "schedule": 60.0,
+        "options": {"queue": "celery", "expires": 50},
     },
     # 트레일 스톱 가드레일 (1분마다)
     "enforce-trail-stop": {
         "task": "app.jobs.scheduler.enforce_trail_stop",
         "schedule": 60.0,
+        "options": {"queue": "celery", "expires": 50},
     },
     # 역ETF 레짐 플립 가드레일 (1분마다)
     "enforce-regime-flatten-inverse": {
         "task": "app.jobs.scheduler.enforce_regime_flatten_inverse",
         "schedule": 60.0,
+        "options": {"queue": "celery", "expires": 50},
     },
 }
 
