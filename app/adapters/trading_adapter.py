@@ -235,6 +235,20 @@ class AlpacaAdapter:
         
         return unified_trade, stop_id, profit_id
 
+    def submit_eod_exit(self, ticker: str, quantity: float | int, side: str) -> UnifiedTrade:
+        """EOD 전용 청산(클로즈/오프닝 예약 포함)"""
+        trade = self.client.submit_eod_exit(ticker, quantity, side)
+        return UnifiedTrade(
+            trade_id=trade.order_id,
+            ticker=trade.ticker,
+            side=trade.side,
+            quantity=trade.quantity,
+            price=trade.filled_price,
+            timestamp=trade.filled_at,
+            signal_id=getattr(trade, 'signal_id', None),
+            meta=getattr(trade, 'meta', None)
+        )
+
 class PaperLedgerAdapter:
     """기존 PaperLedger 어댑터 (통합 인터페이스)"""
     

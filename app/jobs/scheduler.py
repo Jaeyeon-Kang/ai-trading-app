@@ -3,6 +3,7 @@ Celery beat 스케줄러
 15-30초 주기로 시그널 생성 및 거래 실행
 """
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import hashlib
 import json
 import logging
@@ -259,6 +260,26 @@ celery_app.conf.beat_schedule = {
     "daily-paper-report": {
         "task": "app.jobs.paper_trading_manager.send_daily_report", 
         "schedule": crontab(hour=10, minute=0),  # 19:00 KST
+    },
+    # 마감 전 사전 예약 청산 (미 동부시간 15:48)
+    "queue-preclose-liquidation": {
+        "task": "app.jobs.scheduler.queue_preclose_liquidation",
+        "schedule": crontab(hour=15, minute=48, tz='America/New_York'),
+    },
+    # 타임 스톱 가드레일 (1분마다)
+    "enforce-time-stop": {
+        "task": "app.jobs.scheduler.enforce_time_stop",
+        "schedule": 60.0,
+    },
+    # 트레일 스톱 가드레일 (1분마다)
+    "enforce-trail-stop": {
+        "task": "app.jobs.scheduler.enforce_trail_stop",
+        "schedule": 60.0,
+    },
+    # 역ETF 레짐 플립 가드레일 (1분마다)
+    "enforce-regime-flatten-inverse": {
+        "task": "app.jobs.scheduler.enforce_regime_flatten_inverse",
+        "schedule": 60.0,
     },
 }
 
@@ -792,8 +813,25 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.005"))  # 0.5%
 MAX_CONCURRENT_RISK = float(os.getenv("MAX_CONCURRENT_RISK", "0.02"))  # 2%
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.015"))  # 1.5%
 TAKE_PROFIT_RR = float(os.getenv("TAKE_PROFIT_RR", "1.5"))  # 1.5R
-EOD_FLATTEN_MINUTES = int(os.getenv("EOD_FLATTEN_MINUTES", "5"))  # 마감 5분 전
+EOD_FLATTEN_MINUTES = int(os.getenv("EOD_FLATTEN_MINUTES", "10"))  # 기본 10분 전으로 확대
 FRACTIONAL_ENABLED = os.getenv("FRACTIONAL_ENABLED", "0") == "1"
+
+# 가드레일 플래그/파라미터
+ENABLE_TIME_STOP = os.getenv("ENABLE_TIME_STOP", "1") in ("1", "true", "True")
+TIME_STOP_MIN = int(os.getenv("TIME_STOP_MIN", "45"))
+TIME_STOP_LATE_ENTRY_CUTOFF_MIN = int(os.getenv("TIME_STOP_LATE_ENTRY_CUTOFF_MIN", "10"))
+
+ENABLE_TRAIL_STOP = os.getenv("ENABLE_TRAIL_STOP", "0") in ("1", "true", "True")
+TRAIL_RET_PCT = float(os.getenv("TRAIL_RET_PCT", "0.005"))
+TRAIL_MIN_HOLD_MIN = int(os.getenv("TRAIL_MIN_HOLD_MIN", "5"))
+
+ENABLE_REGIME_FLATTEN_INVERSE = os.getenv("ENABLE_REGIME_FLATTEN_INVERSE", "1") in ("1", "true", "True")
+INVERSE_TICKERS_ENV = os.getenv("INVERSE_TICKERS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS,DRV,SARK")
+INVERSE_TICKERS_SET = set(t.strip().upper() for t in INVERSE_TICKERS_ENV.split(",") if t.strip())
+
+# EOD 재시도 파라미터
+EOD_MAX_RETRIES = int(os.getenv("EOD_MAX_RETRIES", "2"))
+EOD_RETRY_DELAY_SEC = int(os.getenv("EOD_RETRY_DELAY_SEC", "30"))
 
 # 숏 ETF 청산 로직 파라미터
 MIN_HOLD_SEC = int(os.getenv("MIN_HOLD_SEC", "60"))  # 최소 보유시간 60초
@@ -1469,52 +1507,15 @@ def get_current_total_risk(trading_adapter, equity: float) -> float:
         return equity * MAX_CONCURRENT_RISK  # 보수적으로 최대치 반환
 
 def is_eod_window(market_calendar = None) -> bool:
-    """장 마감 전 윈도우 확인 (환경변수 기반)"""
+    """장 마감 전 윈도우 확인 (America/New_York 기준)"""
     try:
-        now_utc = datetime.now(timezone.utc)
-        
-        # EDT/EST 자동 판별
-        # 3월 둘째 일요일 ~ 11월 첫째 일요일: EDT (-4)
-        # 나머지: EST (-5)
-        month = now_utc.month
-        if 3 < month < 11:  # 4월 ~ 10월은 확실히 EDT
-            hours_offset = -4
-        elif month == 3 or month == 11:  # 3월, 11월은 날짜 체크 필요
-            # 간단히 처리: 3월 15일 이후는 EDT, 11월 1일 이전은 EDT
-            if (month == 3 and now_utc.day >= 15) or (month == 11 and now_utc.day <= 7):
-                hours_offset = -4
-            else:
-                hours_offset = -5
-        else:  # 12월 ~ 2월은 EST
-            hours_offset = -5
-        
-        # 미국 동부시간 기준 시장 마감: 16:00
-        # EOD_FLATTEN_MINUTES 분 전부터 윈도우 시작
+        now_ny = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
         eod_minutes_before = EOD_FLATTEN_MINUTES
-        
-        # UTC로 변환
-        # 마감시간 16:00 ET = (20:00 or 21:00) UTC
-        market_close_utc_hour = 16 - hours_offset  # 20 or 21
-        
-        eod_start = now_utc.replace(
-            hour=market_close_utc_hour, 
-            minute=0, 
-            second=0, 
-            microsecond=0
-        ) - timedelta(minutes=eod_minutes_before)
-        
-        eod_end = now_utc.replace(
-            hour=market_close_utc_hour, 
-            minute=0, 
-            second=0, 
-            microsecond=0
-        )
-        
-        in_window = eod_start <= now_utc <= eod_end
-        
+        close_dt = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
+        start_dt = close_dt - timedelta(minutes=eod_minutes_before)
+        in_window = start_dt <= now_ny <= close_dt
         if in_window:
             logger.info(f"🌅 EOD 윈도우 활성: 마감 {eod_minutes_before}분 전")
-        
         return in_window
     except Exception as e:
         logger.error(f"EOD 윈도우 확인 실패: {e}")
@@ -1600,47 +1601,353 @@ def place_bracket_order(trading_adapter, symbol: str, side: str, quantity: int, 
         logger.error(f"브래킷 주문 실패 {symbol}: {e}")
         raise
 
+def _log_exit_decision(symbol: str, side: str, qty: int, policy: str, reason: str,
+                       tif: str = "day", attempt: int = 1, market_state: str = "unknown",
+                       order_id: str | None = None, price: float | None = None) -> None:
+    parts = [
+        f"EXIT_DECISION symbol={symbol}",
+        f"side={side}",
+        f"qty={qty}",
+        f"policy={policy}",
+        f"reason={reason}",
+        f"tif={tif}",
+        f"attempt={attempt}",
+        f"market_state={market_state}"
+    ]
+    if order_id:
+        parts.append(f"order_id={order_id}")
+    if price is not None:
+        try:
+            parts.append(f"price={float(price):.2f}")
+        except Exception:
+            pass
+    logger.info(" ".join(parts))
+
 def flatten_all_positions(trading_adapter, reason: str = "eod_flatten") -> int:
-    """모든 포지션 강제 청산"""
+    """모든 포지션 강제 청산: 포지션 단위 예외/재시도 + 구조 로그"""
     flattened_count = 0
+    positions = []
     try:
-        positions = trading_adapter.get_positions()
-        for pos in positions:
-            if float(getattr(pos, 'quantity', 0)) == 0:
-                continue
-            
-            # 시장가로 청산
-            side = "sell" if float(getattr(pos, 'quantity', 0)) > 0 else "buy"
-            quantity = abs(int(float(getattr(pos, 'quantity', 0))))
-            
-            trade = trading_adapter.submit_market_order(
-                ticker=getattr(pos, 'ticker', ''),
-                side=side,
-                quantity=quantity,
-                signal_id=f"{reason}_{getattr(pos, 'ticker', '')}_{int(time.time())}"
-            )
-            
-            # GPT 제안: EOD 청산 DB 기록
-            if trade:
-                ticker = getattr(pos, 'ticker', '')
-                eod_signal_data = {
-                    "symbol": ticker,
-                    "score": 0.0,  # EOD는 강제 청산이므로 점수 없음
-                    "confidence": 1.0,
-                    "regime": "eod",
-                    "meta": {"reason": reason, "position_qty": float(getattr(pos, 'quantity', 0))}
-                }
-                # EOD 청산: 신호 저장 후 거래 기록
-                signal_db_id = save_signal_to_db(eod_signal_data, "eod_flatten", f"reason={reason},qty={quantity}")
-                save_trade_to_db(trade, eod_signal_data, ticker, signal_db_id)
-            
-            logger.info(f"EOD 청산: {getattr(pos, 'ticker', '')} {side} {quantity}주 (사유: {reason})")
-            flattened_count += 1
-            
+        positions = trading_adapter.get_positions() or []
     except Exception as e:
-        logger.error(f"포지션 청산 실패: {e}")
-    
+        logger.error(f"포지션 조회 실패: {e}")
+        return 0
+
+    failed = []
+    for pos in positions:
+        try:
+            qty_raw = float(getattr(pos, 'quantity', 0))
+            if qty_raw == 0:
+                continue
+            symbol = getattr(pos, 'ticker', '')
+            side = "sell" if qty_raw > 0 else "buy"
+            quantity = abs(qty_raw if FRACTIONAL_ENABLED else int(qty_raw))
+
+            # 재시도 루프
+            last_err = None
+            for attempt in range(1, EOD_MAX_RETRIES + 2):  # 최초 1회 + 재시도 N회
+                tif_used = "cls"  # 기본 의도는 CLS (submit_eod_exit가 실제 tif를 결정)
+                try:
+                    # 어댑터가 EOD 전용 출구를 지원하면 우선 사용
+                    if hasattr(trading_adapter, "submit_eod_exit"):
+                        trade = trading_adapter.submit_eod_exit(symbol, quantity, side)
+                    else:
+                        tif_used = "day"
+                        trade = trading_adapter.submit_market_order(
+                            ticker=symbol,
+                            side=side,
+                            quantity=quantity,
+                            signal_id=f"{reason}_{symbol}_{int(time.time())}"
+                        )
+
+                    # 기록 및 로깅
+                    if trade:
+                        # tif 보정 (예약 주문은 meta.tif 보유)
+                        try:
+                            tif_used = (getattr(trade, 'meta', {}) or {}).get('tif', tif_used)
+                        except Exception:
+                            pass
+                        eod_signal_data = {
+                            "symbol": symbol,
+                            "score": 0.0,
+                            "confidence": 1.0,
+                            "regime": "eod",
+                            "meta": {"reason": reason, "position_qty": qty_raw, "tif": tif_used, "side": side}
+                        }
+                        signal_db_id = save_signal_to_db(eod_signal_data, "eod_flatten", f"reason={reason},qty={quantity}")
+                        # 예약 주문(CLS/OPG)은 아직 미체결 → 트레이드 기록은 보류
+                        if tif_used not in ("cls", "opg"):
+                            save_trade_to_db(trade, eod_signal_data, symbol, signal_db_id)
+
+                        order_id = getattr(trade, 'trade_id', None)
+                        price = getattr(trade, 'price', None)
+                        _log_exit_decision(symbol, side, quantity, policy="EOD", reason=reason, tif=tif_used,
+                                           attempt=attempt, market_state="unknown", order_id=order_id, price=price)
+                        logger.info(f"EOD 청산: {symbol} {side} {quantity}주 (사유: {reason})")
+                        flattened_count += 1
+                        break
+                except Exception as e:
+                    last_err = e
+                    _log_exit_decision(symbol, side, quantity, policy="EOD", reason=f"error:{e}", tif=tif_used,
+                                       attempt=attempt, market_state="closed")
+                    if attempt <= EOD_MAX_RETRIES:
+                        try:
+                            time.sleep(EOD_RETRY_DELAY_SEC)
+                        except Exception:
+                            pass
+                        continue
+                    else:
+                        raise
+        except Exception as e:
+            logger.error(f"포지션 청산 실패: {getattr(pos, 'ticker', '')} - {e}")
+            failed.append((getattr(pos, 'ticker', ''), str(e)))
+            continue
+
+    # 잔존 포지션 경고
+    if failed:
+        try:
+            slack_bot = trading_components.get("slack_bot")
+            if slack_bot:
+                msg_lines = ["⚠️ EOD 청산 실패 요약"] + [f"• {sym}: {err}" for sym, err in failed]
+                slack_bot.send_message("\n".join(msg_lines))
+        except Exception:
+            pass
+
     return flattened_count
+
+def _minutes_to_close(now_utc: datetime | None = None) -> int:
+    ny = (now_utc or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+    close_dt = ny.replace(hour=16, minute=0, second=0, microsecond=0)
+    delta = (close_dt - ny).total_seconds() / 60.0
+    return int(delta)
+
+def _is_rth_now(now_utc: datetime | None = None) -> bool:
+    ny = (now_utc or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+    open_dt = ny.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_dt = ny.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_dt <= ny <= close_dt
+
+@celery_app.task(bind=True, name="app.jobs.scheduler.queue_preclose_liquidation")
+def queue_preclose_liquidation(self):
+    """마감 전(ET 15:48) 사전 예약 청산: CLS/OPG 예약 제출"""
+    try:
+        from app.adapters.trading_adapter import get_trading_adapter
+        trading_adapter = get_trading_adapter()
+        positions = trading_adapter.get_positions() or []
+        scheduled = 0
+        for p in positions:
+            qty_raw = float(getattr(p, 'quantity', 0))
+            quantity = abs(qty_raw if FRACTIONAL_ENABLED else int(qty_raw))
+            if quantity <= 0:
+                continue
+            sym = getattr(p, 'ticker', '')
+            try:
+                side = "sell" if qty_raw > 0 else "buy"
+                if hasattr(trading_adapter, "submit_eod_exit"):
+                    trade = trading_adapter.submit_eod_exit(sym, quantity, side)
+                else:
+                    trade = trading_adapter.submit_market_order(
+                        ticker=sym,
+                        side=side,
+                        quantity=quantity,
+                        signal_id=f"preclose_{sym}"
+                    )
+                scheduled += 1
+                tif_used = (getattr(trade, 'meta', {}) or {}).get('tif', 'cls')
+                _log_exit_decision(sym, side, quantity, policy="EOD", reason="preclose_queue", tif=tif_used, attempt=1, market_state="RTH",
+                                   order_id=getattr(trade, 'trade_id', None), price=getattr(trade, 'price', None))
+            except Exception as e:
+                logger.warning(f"사전 청산 예약 실패: {sym} - {e}")
+        return {"scheduled": scheduled}
+    except Exception as e:
+        logger.error(f"사전 청산 태스크 실패: {e}")
+        return {"error": str(e)}
+
+@celery_app.task(bind=True, name="app.jobs.scheduler.enforce_time_stop")
+def enforce_time_stop(self):
+    """세션 기준 결정론적 타임 스톱 (기본 ON)"""
+    if not ENABLE_TIME_STOP:
+        return {"status": "disabled"}
+    if not _is_rth_now():
+        return {"status": "off_session"}
+    try:
+        from app.adapters.trading_adapter import get_trading_adapter
+        trading_adapter = get_trading_adapter()
+        redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+        positions = trading_adapter.get_positions() or []
+        exited = 0
+        for p in positions:
+            qty_raw = float(getattr(p, 'quantity', 0))
+            quantity = abs(qty_raw if FRACTIONAL_ENABLED else int(qty_raw))
+            if quantity <= 0:
+                continue
+            sym = getattr(p, 'ticker', '')
+            side = "sell" if qty_raw > 0 else "buy"
+            entry_key = f"position_entry_time:{sym}"
+            try:
+                entry_ts = float(redis_client.get(entry_key) or 0)
+            except Exception:
+                entry_ts = 0
+            if entry_ts <= 0:
+                continue
+            age_min = int((time.time() - entry_ts) / 60)
+            if age_min >= TIME_STOP_MIN:
+                # 임박 시 OPG 예약
+                minutes_left = _minutes_to_close()
+                tif_used = "day"
+                try:
+                    if minutes_left <= TIME_STOP_LATE_ENTRY_CUTOFF_MIN and hasattr(trading_adapter, "submit_eod_exit"):
+                        trade = trading_adapter.submit_eod_exit(sym, quantity, side)
+                        try:
+                            tif_used = (getattr(trade, 'meta', {}) or {}).get('tif', tif_used)
+                        except Exception:
+                            pass
+                    else:
+                        trade = trading_adapter.submit_market_order(ticker=sym, side=side, quantity=quantity, signal_id=f"time_stop_{sym}")
+                    exited += 1
+                    # DB 기록: 예약 주문은 trade 기록 보류
+                    ts_signal = {"symbol": sym, "score": 0.0, "confidence": 1.0, "regime": "time_stop",
+                                 "meta": {"reason": "time_stop", "tif": tif_used}}
+                    sig_id = save_signal_to_db(ts_signal, "time_stop", f"age_min={age_min}")
+                    if tif_used not in ("cls", "opg"):
+                        save_trade_to_db(trade, ts_signal, sym, sig_id)
+                    _log_exit_decision(sym, side, quantity, policy="TIME_STOP", reason="time_stop", tif=tif_used, attempt=1, market_state="RTH",
+                                       order_id=getattr(trade, 'trade_id', None), price=getattr(trade, 'price', None))
+                except Exception as e:
+                    logger.warning(f"TIME_STOP 청산 실패: {sym} - {e}")
+        return {"exited": exited}
+    except Exception as e:
+        logger.error(f"TIME_STOP 태스크 실패: {e}")
+        return {"error": str(e)}
+
+@celery_app.task(bind=True, name="app.jobs.scheduler.enforce_trail_stop")
+def enforce_trail_stop(self):
+    """결정론적 트레일 스톱 (기본 OFF)"""
+    if not ENABLE_TRAIL_STOP:
+        return {"status": "disabled"}
+    try:
+        from app.adapters.trading_adapter import get_trading_adapter
+        trading_adapter = get_trading_adapter()
+        redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+        positions = trading_adapter.get_positions() or []
+        exited = 0
+        failed = []
+        for p in positions:
+            try:
+                qty_raw = float(getattr(p, 'quantity', 0))
+                quantity = abs(qty_raw if FRACTIONAL_ENABLED else int(qty_raw))
+                if quantity <= 0:
+                    continue
+                sym = getattr(p, 'ticker', '')
+                entry_key = f"position_entry_time:{sym}"
+                try:
+                    entry_ts = float(redis_client.get(entry_key) or 0)
+                except Exception:
+                    entry_ts = 0
+                if entry_ts <= 0:
+                    continue
+                age_min = int((time.time() - entry_ts) / 60)
+                if age_min < TRAIL_MIN_HOLD_MIN:
+                    continue
+                price = trading_adapter.get_current_price(sym) or 0.0
+                if price <= 0:
+                    continue
+                peak_key = f"trail:{sym}:peak"
+                try:
+                    prev_peak = float(redis_client.get(peak_key) or 0)
+                except Exception:
+                    prev_peak = 0.0
+                # 롱 기준 (숏은 추후 확장)
+                peak = max(prev_peak, price)
+                redis_client.setex(peak_key, 86400, str(peak))
+                if peak > 0 and price <= peak * (1 - TRAIL_RET_PCT):
+                    side = "sell" if qty_raw > 0 else "buy"
+                    tif_used = "day"
+                    try:
+                        if (not _is_rth_now()) or _minutes_to_close() <= TIME_STOP_LATE_ENTRY_CUTOFF_MIN:
+                            if hasattr(trading_adapter, "submit_eod_exit"):
+                                trade = trading_adapter.submit_eod_exit(sym, quantity, side)
+                                try:
+                                    tif_used = (getattr(trade, 'meta', {}) or {}).get('tif', tif_used)
+                                except Exception:
+                                    pass
+                            else:
+                                trade = trading_adapter.submit_market_order(ticker=sym, side=side, quantity=quantity, signal_id=f"trail_stop_{sym}")
+                        else:
+                            trade = trading_adapter.submit_market_order(ticker=sym, side=side, quantity=quantity, signal_id=f"trail_stop_{sym}")
+                        exited += 1
+                        # 기록
+                        tr_signal = {"symbol": sym, "score": 0.0, "confidence": 1.0, "regime": "trail_stop",
+                                     "meta": {"reason": "trail_retreat", "tif": tif_used}}
+                        sig_id = save_signal_to_db(tr_signal, "trail_stop", f"peak_ret={TRAIL_RET_PCT}")
+                        if tif_used not in ("cls", "opg"):
+                            save_trade_to_db(trade, tr_signal, sym, sig_id)
+                        _log_exit_decision(sym, side, quantity, policy="TRAIL_STOP", reason="trail_retreat", tif=tif_used, attempt=1, market_state=("RTH" if _is_rth_now() else "CLOSED"),
+                                           order_id=getattr(trade, 'trade_id', None), price=getattr(trade, 'price', None))
+                    except Exception as e:
+                        logger.warning(f"TRAIL_STOP 청산 실패: {sym} - {e}")
+                        failed.append((sym, str(e)))
+                        continue
+            except Exception as e:
+                logger.warning(f"TRAIL_STOP 처리 실패(심볼 단위): {getattr(p, 'ticker', '')} - {e}")
+                failed.append((getattr(p, 'ticker', ''), str(e)))
+                continue
+        # 요약 경고 (선택)
+        if failed:
+            try:
+                slack_bot = trading_components.get("slack_bot")
+                if slack_bot:
+                    msg_lines = ["⚠️ TRAIL_STOP 청산 실패 요약"] + [f"• {sym}: {err}" for sym, err in failed]
+                    slack_bot.send_message("\n".join(msg_lines))
+            except Exception:
+                pass
+        return {"exited": exited}
+    except Exception as e:
+        logger.error(f"TRAIL_STOP 태스크 실패: {e}")
+        return {"error": str(e)}
+
+@celery_app.task(bind=True, name="app.jobs.scheduler.enforce_regime_flatten_inverse")
+def enforce_regime_flatten_inverse(self):
+    """역ETF 레짐 플립 평탄화 (옵션)"""
+    if not ENABLE_REGIME_FLATTEN_INVERSE:
+        return {"status": "disabled"}
+    try:
+        from app.adapters.trading_adapter import get_trading_adapter
+        trading_adapter = get_trading_adapter()
+        redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+        positions = trading_adapter.get_positions() or []
+        flattened = 0
+        for p in positions:
+            sym = getattr(p, 'ticker', '').upper()
+            qty_raw = float(getattr(p, 'quantity', 0))
+            quantity = abs(qty_raw if FRACTIONAL_ENABLED else int(qty_raw))
+            if quantity <= 0 or sym not in INVERSE_TICKERS_SET:
+                continue
+            # underlying 매핑 (없으면 심볼 자체 기준)
+            underlying = INSTRUMENT_META.get(sym, {}).get("underlying", sym)
+            # 최신 점수(양수=리스크 온 가정)
+            try:
+                latest_score = float(redis_client.get(f"latest_score:{underlying}") or 0.0)
+            except Exception:
+                latest_score = 0.0
+            if latest_score >= BUY_THRESHOLD:
+                try:
+                    side = "sell" if qty_raw > 0 else "buy"
+                    trade = trading_adapter.submit_market_order(ticker=sym, side=side, quantity=quantity, signal_id=f"regime_flatten_{sym}")
+                    flattened += 1
+                    # 기록
+                    rg_signal = {"symbol": sym, "score": 0.0, "confidence": 1.0, "regime": "regime_flat",
+                                 "meta": {"reason": "regime_flip_inverse_flatten"}}
+                    sig_id = save_signal_to_db(rg_signal, "regime_flatten", "inverse_flip")
+                    save_trade_to_db(trade, rg_signal, sym, sig_id)
+                    _log_exit_decision(sym, side, quantity, policy="REGIME_FLAT", reason="regime_flip_inverse_flatten", tif="day",
+                                       attempt=1, market_state="RTH", order_id=getattr(trade, 'trade_id', None), price=getattr(trade, 'price', None))
+                except Exception as e:
+                    logger.warning(f"레짐 플립 평탄화 실패: {sym} - {e}")
+        return {"flattened": flattened}
+    except Exception as e:
+        logger.error(f"레짐 플립 가드레일 태스크 실패: {e}")
+        return {"error": str(e)}
 
 def check_volume_spike(symbol: str, current_volume: float) -> bool:
     """볼륨 스파이크 확인: 현재 볼륨 > 20일 평균 * 1.5배"""

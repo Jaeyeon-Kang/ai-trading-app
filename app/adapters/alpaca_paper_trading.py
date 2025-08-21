@@ -155,6 +155,43 @@ class AlpacaPaperTrading:
         except Exception as e:
             logger.error(f"알파카 주문 실패 {ticker} {side}: {e}")
             raise
+
+    def submit_eod_exit(self, ticker: str, quantity: float | int, side: str) -> AlpacaTrade:
+        """EOD 전용 청산 유틸: CLS 가능 시 CLS, 아니면 OPG 예약
+
+        - 시장가 가드(is_market_open) 우회
+        - side에 따라 SELL/BUY를 올바르게 설정
+        - 실패 시 예외 발생
+        """
+        try:
+            # 알파카 시계 기준으로 마감/개장 시점 확인
+            clock = self.trading_client.get_clock()
+            is_before_close = getattr(clock, 'is_open', False)
+            tif = TimeInForce.CLS if is_before_close else TimeInForce.OPG
+
+            order_side = OrderSide.BUY if (str(side).lower() == 'buy') else OrderSide.SELL
+            order_data = MarketOrderRequest(
+                symbol=ticker,
+                qty=quantity,
+                side=order_side,
+                time_in_force=tif
+            )
+            order = self.trading_client.submit_order(order_data=order_data)
+
+            trade = AlpacaTrade(
+                order_id=order.id,
+                ticker=ticker,
+                side=str(side).lower(),
+                quantity=int(quantity) if isinstance(quantity, bool) else quantity,  # 그대로 보존
+                filled_price=0.0,
+                filled_at=datetime.utcnow(),
+                meta={"tif": tif.value, "side": str(side).lower()}
+            )
+            logger.info(f"EOD 예약 주문: {ticker} {str(side).upper()} {quantity} tif={tif.value}")
+            return trade
+        except Exception as e:
+            logger.error(f"EOD 예약 주문 실패 {ticker}: {e}")
+            raise
     
     def _wait_for_fill(self, order_id: str, timeout: int = 30) -> Optional[Order]:
         """주문 체결 대기"""
