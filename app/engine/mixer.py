@@ -83,7 +83,7 @@ class SignalMixer:
         self.edgar_override_items = os.getenv("EDGAR_OVERRIDE_ITEMS", "1.01,2.02").split(",")
         
         # Regulatory/소송 차단 키워드
-        self.regulatory_block_words = os.getenv("REGULATORY_BLOCK_WORDS", "regulatory,litigation,FTC,SEC,DoJ").split(",")
+        self.regulatory_block_words = os.getenv("REGULATORY_BLOCK_WORDS", "regulatory,litigation,FTC,DoJ").split(",")
         
         logger.info(f"시그널 믹서 초기화: 매수 {buy_threshold}, 매도 {sell_threshold}, EDGAR 보너스 ±{edgar_bonus}, 쿨다운 {cooldown_seconds}초")
     
@@ -111,12 +111,8 @@ class SignalMixer:
         # 입력 스케일 클램프: tech ∈ [-1,1], sent ∈ [-1,1]
         tech_score_normalized = max(-1.0, min(1.0, tech_score.score))
         
-        # **인버스 ETF 신호 반전 로직**
-        # 인버스 ETF는 기초자산과 반대로 움직이므로 기술적 신호를 반전
-        is_inverse_etf = ticker in settings.INVERSE_ETFS
-        if is_inverse_etf:
-            tech_score_normalized = -tech_score_normalized
-            logger.debug(f"인버스 ETF 신호 반전: {ticker} 기술점수 {tech_score.score:.3f} → {tech_score_normalized:.3f}")
+        # 인버스 ETF 신호 반전 로직은 라우터(scheduler.py)에서 처리
+        # 믹서는 순수하게 기술점수만 정규화
         
         sentiment_score = 0.0
         

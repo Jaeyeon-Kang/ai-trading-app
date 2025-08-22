@@ -81,7 +81,7 @@ class APIRateLimiter:
                 bucket["tokens"] = self.tier_allocations[tier]
                 bucket["last_refill_minute"] = current_minute
                 self.redis_client.setex(key, 120, json.dumps(bucket))
-                logger.debug(f"토큰 리필: {tier.value} = {bucket['tokens']}개")
+                logger.info(f"🔄 토큰 리필: {tier.value}={bucket['tokens']}개 (minute: {current_minute:02d})")
                 
         except (json.JSONDecodeError, KeyError) as e:
             logger.warning(f"토큰 버킷 데이터 오류: {e}, 리셋")

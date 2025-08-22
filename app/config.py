@@ -39,7 +39,7 @@ class Settings:
         }
 
         # --- Universe Expansion & Tier System ---
-        self.TIER_A_TICKERS = os.getenv("TIER_A_TICKERS", "NVDA,TSLA,AAPL").split(",")
+        self.TIER_A_TICKERS = os.getenv("TIER_A_TICKERS", "NVDA,TSLA,AAPL,MSFT").split(",")
         self.TIER_B_TICKERS = os.getenv("TIER_B_TICKERS", "MSFT,AMZN,META").split(",")
         self.BENCH_TICKERS = os.getenv("BENCH_TICKERS", "GOOGL,AMD,AVGO").split(",")
         
@@ -58,6 +58,9 @@ class Settings:
         self.LLM_GATING_ENABLED = os.getenv("LLM_GATING_ENABLED", "true").lower() in ("true", "1", "yes", "on")
         
         self.LLM_MIN_SIGNAL_SCORE = float(os.getenv("LLM_MIN_SIGNAL_SCORE", "0.7"))
+        
+        # 이벤트별 LLM 필수 정책 (중요 이벤트는 점수 무관하게 분석)
+        self.LLM_REQUIRED_EVENTS = set(os.getenv("LLM_REQUIRED_EVENTS", "edgar,vol_spike").split(","))
         self.LLM_CACHE_DURATION_MIN = int(os.getenv("LLM_CACHE_DURATION_MIN", "30"))
 
         # --- Position Sizing Enhancement ---
@@ -67,11 +70,15 @@ class Settings:
 
         # --- EDGAR Override Items ---
         self.EDGAR_OVERRIDE_ITEMS = os.getenv("EDGAR_OVERRIDE_ITEMS", "1.01,2.02,2.03,8.01").split(",")
-        self.REGULATORY_BLOCK_WORDS = os.getenv("REGULATORY_BLOCK_WORDS", "regulatory,litigation,FTC,SEC,DoJ,antitrust").split(",")
+        self.REGULATORY_BLOCK_WORDS = os.getenv("REGULATORY_BLOCK_WORDS", "regulatory,litigation,FTC,DoJ,antitrust").split(",")
         
         # --- Inverse ETF Support ---
         self.INVERSE_ETFS = os.getenv("INVERSE_ETFS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS,DRV,SARK,UVXY").split(",")
         self.LEVERAGED_ETFS = os.getenv("LEVERAGED_ETFS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS,DRV").split(",")
+        
+        # --- 가격 상한/분할매수 설정 ---
+        self.FRACTIONAL_ENABLED = os.getenv("FRACTIONAL_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+        self.MAX_PRICE_PER_SHARE = float(os.getenv("MAX_PRICE_PER_SHARE_USD", "120"))
 
 settings = Settings()
 

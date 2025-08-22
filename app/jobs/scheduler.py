@@ -271,11 +271,11 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute="*/5"),  # 5분마다
     },
     
-    # 일일 성과 리포트 (저녁 19:00 KST = 10:00 UTC)
-    "daily-paper-report": {
-        "task": "app.jobs.paper_trading_manager.send_daily_report", 
-        "schedule": crontab(hour=10, minute=0),  # 19:00 KST
-    },
+    # 일일 성과 리포트 (비활성화 - 부정확한 데이터로 인해)
+    # "daily-paper-report": {
+    #     "task": "app.jobs.paper_trading_manager.send_daily_report", 
+    #     "schedule": crontab(hour=10, minute=0),  # 19:00 KST
+    # },
     # 마감 전 사전 예약 청산 (미 동부시간 15:48)
     "queue-preclose-liquidation": {
         "task": "app.jobs.scheduler.queue_preclose_liquidation",
@@ -532,11 +532,11 @@ def should_process_ticker_now(ticker: str, current_time: Optional[Union[datetime
     current_second = current_time.second
     
     if tier == TokenTier.TIER_A:
-        # Tier A: 30초마다 (0초, 30초)
-        return current_second % 30 == 0, "tier_a_schedule"
+        # Tier A: 30초마다 (0초, 30초 기준으로 ±10초 허용)
+        return current_second % 30 <= 10 or current_second % 30 >= 20, "tier_a_schedule"
     elif tier == TokenTier.TIER_B:
-        # Tier B: 60초마다 (0초만)
-        return current_second == 0, "tier_b_schedule"
+        # Tier B: 60초마다 (0초 기준으로 ±15초 허용)  
+        return current_second <= 15 or current_second >= 45, "tier_b_schedule"
     
     return False, "unknown_tier"
 
@@ -714,11 +714,15 @@ def should_call_llm_for_event(ticker: str, event_type: str, signal_score: float 
             cache_key = f"llm_cache:edgar:{ticker}:{edgar_filing.get('form_type', 'unknown')}"
             
         elif event_type == "vol_spike":
-            # vol_spike는 신호 점수 조건 필요
-            if signal_score is None or abs(signal_score) < settings.LLM_MIN_SIGNAL_SCORE:
-                logger.info(f"🤖 LLM gate: block {ticker}/{event_type} "
-                           f"score={signal_score:.3f} < min={settings.LLM_MIN_SIGNAL_SCORE}")
-                return False, "signal_score_too_low"
+            # vol_spike는 중요 이벤트이므로 LLM 필수 정책 적용
+            if event_type in settings.LLM_REQUIRED_EVENTS:
+                logger.info(f"🤖 LLM gate: required event {ticker}/{event_type} - bypassing score check")
+            else:
+                # 일반 vol_spike는 신호 점수 조건 필요
+                if signal_score is None or abs(signal_score) < settings.LLM_MIN_SIGNAL_SCORE:
+                    logger.info(f"🤖 LLM gate: block {ticker}/{event_type} "
+                               f"score={signal_score:.3f} < min={settings.LLM_MIN_SIGNAL_SCORE}")
+                    return False, "signal_score_too_low"
             
             cache_key = f"llm_cache:vol_spike:{ticker}"
             
@@ -889,8 +893,8 @@ BASKETS = {
     }
 }
 
-# 인버스 ETF 목록
-INVERSE_ETFS = {"SQQQ", "SOXS", "SPXS", "TZA", "SDOW", "TECS", "DRV", "SARK"}
+# 인버스 ETF 목록 (단일 소스: config.py)
+INVERSE_ETFS = set(settings.INVERSE_ETFS)
 
 # 상충 포지션 맵
 CONFLICT_MAP = {
@@ -1076,6 +1080,17 @@ def can_open_etf_position(etf_symbol: str) -> Tuple[bool, str]:
         logger.error(f"ETF 포지션 체크 실패: {e}")
         return False, f"error_{e}"
 
+def has_open_long(symbol: str) -> bool:
+    """포지션이 있는지 확인"""
+    try:
+        pos = get_current_position(symbol) if 'get_current_position' in globals() else None
+        if not pos and 'trading_adapter' in globals() and trading_adapter:
+            pos = trading_adapter.get_position(symbol)
+        qty = float(getattr(pos, "quantity", 0) or 0)
+        return qty > 0
+    except Exception:
+        return False
+
 def route_signal_symbol(original_symbol: str, base_score: float) -> Dict[str, str]:
     """
     바스켓 기반 신호 라우팅 (개선된 버전)
@@ -1087,13 +1102,39 @@ def route_signal_symbol(original_symbol: str, base_score: float) -> Dict[str, st
     Returns:
         라우팅 결과 딕셔너리
     """
-    # 인버스 ETF는 라우팅하지 않음 (패스스루)
+    # 인버스 ETF 처리: 믹서에서 이미 반전된 점수 해석
     if original_symbol in INVERSE_ETFS:
-        return {
-            "exec_symbol": original_symbol,
-            "intent": "direct",
-            "route_reason": "inverse_etf_passthrough"
-        }
+        effective_score = base_score  # 믹서에서 이미 반전 적용된 점수
+        cutoff_rth, cutoff_ext = get_signal_cutoffs()
+        buy_cutoff = cutoff_rth  # 기본적으로 RTH 사용
+        sell_cutoff = -cutoff_rth
+        
+        if effective_score >= buy_cutoff:
+            return {
+                "exec_symbol": original_symbol,
+                "intent": "enter_long",
+                "route_reason": "inverse_etf_enter"
+            }
+        elif effective_score <= sell_cutoff:
+            # 보유 포지션 확인 후 exit
+            if has_open_long(original_symbol):
+                return {
+                    "exec_symbol": original_symbol,
+                    "intent": "exit_long",
+                    "route_reason": "inverse_etf_exit"
+                }
+            else:
+                return {
+                    "exec_symbol": None,
+                    "intent": "skip",
+                    "route_reason": "inverse_exit_without_position"
+                }
+        else:
+            return {
+                "exec_symbol": None,
+                "intent": "hold",
+                "route_reason": "inverse_etf_hold"
+            }
     
     # 롱 신호는 원래 심볼 그대로
     if base_score >= 0:
@@ -2110,7 +2151,7 @@ def check_short_etf_exit_conditions(symbol: str, current_score: float, current_p
     """숏 ETF 청산 조건 체크"""
     try:
         # 숏 ETF인지 확인
-        inverse_etfs = os.getenv("INVERSE_ETFS", "").split(",")
+        inverse_etfs = settings.INVERSE_ETFS
         if symbol not in inverse_etfs:
             return None
         
@@ -2183,13 +2224,17 @@ def save_trade_to_db(trade_result, signal_data: Dict, exec_symbol: str, signal_d
                     side = getattr(trade_result, 'side', 'buy')
                     quantity = int(getattr(trade_result, 'quantity', 0))
                     price = float(getattr(trade_result, 'price', 0))
-                    trade_id_str = getattr(trade_result, 'trade_id', f"trade_{int(time.time())}")
+                    trade_id_raw = getattr(trade_result, 'trade_id', f"trade_{int(time.time())}")
+                    # UUID 객체를 문자열로 변환
+                    trade_id_str = str(trade_id_raw) if trade_id_raw else f"trade_{int(time.time())}"
                 else:
                     # dict 형태
                     side = trade_result.get("side", "buy")
                     quantity = int(trade_result.get("quantity", 0))
                     price = float(trade_result.get("price", 0))
-                    trade_id_str = trade_result.get("trade_id", f"trade_{int(time.time())}")
+                    trade_id_raw = trade_result.get("trade_id", f"trade_{int(time.time())}")
+                    # UUID 객체를 문자열로 변환
+                    trade_id_str = str(trade_id_raw) if trade_id_raw else f"trade_{int(time.time())}"
                 
                 # signal_id 결정: 새로 생성된 signal_db_id 우선, 없으면 기존 signal_data에서
                 # signals.id는 INTEGER이므로 변환 필요
@@ -2238,23 +2283,30 @@ def save_signal_to_db(signal_data: Dict, action: str, decision_reason: str) -> O
     try:
         with psycopg2.connect(dsn) as conn:
             with conn.cursor() as cur:
-                # signals 테이블에 기록
+                # signals 테이블에 기록 - 실제 스키마에 맞춤
                 cur.execute("""
                     INSERT INTO signals (
                         ticker, signal_type, score, confidence, 
-                        regime, trigger_reason, created_at, 
-                        action_taken, meta
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        regime, tech_score, sentiment_score, edgar_bonus,
+                        trigger, summary, entry_price, stop_loss, take_profit,
+                        horizon_minutes, meta
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (
                     signal_data.get("symbol", "UNKNOWN"),
-                    "long" if signal_data.get("score", 0) > 0 else "short",
+                    "long" if float(signal_data.get("score", 0)) > 0 else "short",
                     float(signal_data.get("score", 0)),
                     float(signal_data.get("confidence", 0.7)),
                     signal_data.get("regime", "trend"),
-                    decision_reason,
-                    datetime.now(),
-                    action,  # "entry", "exit", "suppress"
+                    float(signal_data.get("tech_score", 0)),  # 기본값 0
+                    float(signal_data.get("sentiment_score", 0)),  # 기본값 0
+                    float(signal_data.get("edgar_bonus", 0)),  # 기본값 0
+                    decision_reason,  # trigger 컬럼
+                    f"{action} signal",  # summary 컬럼
+                    float(signal_data.get("entry_price", 0)) if signal_data.get("entry_price") else None,
+                    float(signal_data.get("stop_loss", 0)) if signal_data.get("stop_loss") else None,
+                    float(signal_data.get("take_profit", 0)) if signal_data.get("take_profit") else None,
+                    int(signal_data.get("horizon_minutes", 60)),  # 기본값 60분
                     json.dumps(signal_data.get("meta", {}))
                 ))
                 signal_id = cur.fetchone()[0]
@@ -2378,9 +2430,11 @@ def pipeline_e2e(self):
         #     logger.error(f"숏 ETF 청산 로직 오류: {e}")
         #     # 오류가 발생해도 전체 파이프라인은 계속 진행
         
-        # Redis 스트림에서 신호 소비
+        # Redis 스트림에서 신호 소비 (XREADGROUP 방식)
         redis_streams = stream_consumer.redis_streams
-        raw_signals = redis_streams.consume_stream("signals.raw", count=50, block_ms=0, last_id="0")
+        # Pending 메시지 복구 (5분 이상 idle)
+        redis_streams.recover_pending("signals.raw", min_idle_ms=300000, count=200)
+        raw_signals = redis_streams.consume_stream("signals.raw", count=50, block_ms=0)
         logger.info(f"📊 Redis에서 {len(raw_signals)}개 신호 수신")
         
         # 리스크 예산 계산
@@ -2453,8 +2507,8 @@ def pipeline_e2e(self):
                 
                 logger.info(f"🔄 라우팅: {route_reason}, 스코어: {base_score:.3f} → {effective_score:.3f}")
                 
-                # 중복 이벤트 차단
-                if not claim_idempotency(redis_client, event_id, ttl=900):
+                # 중복 이벤트 차단 (5분 → 1분으로 단축)
+                if not claim_idempotency(redis_client, event_id, ttl=60):
                     log_signal_decision(signal_data, symbol, "suppress", "dup_event")
                     signals_suppressed["dup_event"] += 1
                     continue
@@ -2588,8 +2642,8 @@ def pipeline_e2e(self):
                     else:
                         log_signal_decision(signal_data, symbol, "suppress", f"no_position_to_exit:{exec_symbol}")
                 
-                # 메시지 ACK
-                stream_consumer.acknowledge("signals.raw", signal_event.message_id)
+                # 메시지 ACK (XREADGROUP 방식)
+                redis_streams.ack_message("signals.raw", signal_event.message_id)
                 signals_processed += 1
                 
             except Exception as sig_e:
@@ -2856,6 +2910,19 @@ def generate_signals(self):
         start_time = time.time()
         logger.info("시그널 생성 시작")
         
+        # 집계 카운터 초기화 (노이즈 로깅 절감)
+        stats = {
+            'processed': 0,
+            'signals_generated': 0,
+            'suppressed': {
+                'token_exhausted': 0,
+                'price_cap': 0,
+                'insufficient_data': 0,
+                'other': 0
+            },
+            'llm_calls': 0
+        }
+        
         # 필수 최소 컴포넌트 확인: 스캘프 경로만이라도 돌릴 수 있게 최소 deps만 강제
         # 1) quotes_ingestor 필수. 없으면 현 자리에서 생성 시도
         if not trading_components.get("quotes_ingestor"):
@@ -2976,7 +3043,8 @@ def generate_signals(self):
                 if tier is not None:  # Tier 시스템 활성화된 경우
                     can_consume, token_reason = can_consume_api_token_for_ticker(ticker)
                     if not can_consume:
-                        logger.info(f"🚫 토큰 부족으로 스킵: {ticker} ({tier.value}) - {token_reason}")
+                        logger.debug(f"🚫 토큰 부족으로 스킵: {ticker} ({tier.value}) - {token_reason}")
+                        stats['suppressed']['token_exhausted'] += 1
                         continue
                     
                     # 토큰 실제 소비
@@ -2987,9 +3055,27 @@ def generate_signals(self):
                     
                     logger.debug(f"✅ 토큰 소비: {ticker} ({tier.value}) - {consume_reason}")
                 
+                # 고가 종목 프리필터 (신호 생성 단계에서 사전 차단)
+                try:
+                    if 'trading_adapter' in globals() and trading_adapter:
+                        current_price = trading_adapter.get_current_price(ticker)
+                        if current_price:
+                            max_price_per_share = float(os.getenv("MAX_PRICE_PER_SHARE_USD", "120"))
+                            fractional_enabled = os.getenv("FRACTIONAL_ENABLED", "false").lower() in ("true", "1", "yes", "on")
+                            
+                            if current_price > max_price_per_share and not fractional_enabled:
+                                stats['suppressed']['price_cap'] += 1
+                                continue
+                except Exception as e:
+                    logger.debug(f"고가 종목 필터 스킵 ({ticker}): {e}")
+                
+                # 티커 평가 시도 카운트 (루프 진입 즉시)
+                stats['processed'] += 1
+                
                 # 1. 시세 데이터 가져오기
                 candles = quotes_ingestor.get_latest_candles(ticker, 50)
                 if len(candles) < 20:
+                    stats['suppressed']['insufficient_data'] += 1
                     continue
                 
                 # 2. 기술적 지표 계산
@@ -3066,6 +3152,7 @@ def generate_signals(self):
                                     else:
                                         logger.info(f"🔥 [SCALP DEBUG] 스캘프 신호 발행: {ticker} {quick_signal.signal_type.value} score={quick_signal.score:.3f} | 리스크: {risk_reason}")
                                         try:
+                                            stats['signals_generated'] += 1
                                             redis_streams.publish_signal({
                                             "ticker": quick_signal.ticker,
                                             "signal_type": quick_signal.signal_type.value,
@@ -3150,6 +3237,7 @@ def generate_signals(self):
                                         else:
                                             logger.info(f"🔥 [3MIN DEBUG] 3분3상승 신호 발행: {ticker} long score={quick_signal.score:.3f}")
                                             try:
+                                                stats['signals_generated'] += 1
                                                 redis_streams.publish_signal({
                                                 "ticker": quick_signal.ticker,
                                                 "signal_type": quick_signal.signal_type.value,
@@ -3199,6 +3287,7 @@ def generate_signals(self):
                         # 쿼터 소비 및 LLM 분석
                         if consume_llm_call_quota(ticker, "edgar", edgar_filing):
                             llm_insight = llm_engine.analyze_edgar_filing(edgar_filing)
+                            stats['llm_calls'] += 1
                             logger.info(f"🤖 LLM EDGAR 분석: {ticker} - {call_reason}")
                         else:
                             logger.warning(f"🤖 LLM 쿼터 소비 실패: {ticker} (EDGAR)")
@@ -3216,6 +3305,7 @@ def generate_signals(self):
                         if consume_llm_call_quota(ticker, "vol_spike"):
                             text = f"Volatility spike detected for {ticker} in {regime_result.regime.value} regime"
                             llm_insight = llm_engine.analyze_text(text, f"vol_spike_{ticker}", regime='vol_spike')
+                            stats['llm_calls'] += 1
                             logger.info(f"🤖 LLM vol_spike 분석: {ticker} - {call_reason}")
                         else:
                             logger.warning(f"🤖 LLM 쿼터 소비 실패: {ticker} (vol_spike)")
@@ -3449,6 +3539,7 @@ def generate_signals(self):
                     
                     try:
                         redis_streams.publish_signal(signal_data)
+                        stats['signals_generated'] += 1
                         logger.info(f"🔥 [DEBUG] Redis 스트림 발행 성공: {ticker}")
                         
                         # 바스켓 분석을 위한 신호 스코어 저장 및 히스토리 추가
@@ -3542,47 +3633,28 @@ def generate_signals(self):
                                     else:
                                         # 기존 메시지 사용
                                         slack_message = format_slack_message(signal)
-                                    result = slack_bot.send_message(slack_message)
-                                    if result:
-                                        logger.info(f"✅ Slack 전송 성공: {ticker} (카운터는 이미 전치 체크에서 증가됨)")
+                                    
+                                    # Phase 1.5: 페이퍼 트레이딩 자동 실행 후 성공시에만 슬랙 전송!
+                                    try:
+                                        from app.jobs.paper_trading_manager import get_paper_trading_manager
+                                        paper_manager = get_paper_trading_manager()
                                         
-                                        # Phase 1.5: 페이퍼 트레이딩 자동 실행!
-                                        try:
-                                            from app.jobs.paper_trading_manager import get_paper_trading_manager
-                                            paper_manager = get_paper_trading_manager()
-                                            
-                                            execution_result = paper_manager.execute_signal(validated_signal)
-                                            if execution_result:
-                                                logger.info(f"📊 페이퍼 트레이딩 실행: {ticker}")
+                                        execution_result = paper_manager.execute_signal(validated_signal)
+                                        if execution_result:
+                                            logger.info(f"📊 페이퍼 트레이딩 실행: {ticker}")
+                                            # 실제 주문 실행 성공 시에만 슬랙 전송
+                                            result = slack_bot.send_message(slack_message)
+                                            if result:
+                                                logger.info(f"✅ Slack 전송 성공: {ticker} (실제 주문 후)")
                                             else:
-                                                logger.info(f"📊 페이퍼 트레이딩 스킵: {ticker}")
-                                        except Exception as paper_e:
-                                            logger.warning(f"페이퍼 트레이딩 실행 실패: {ticker} - {paper_e}")
-                                    else:
-                                        # Slack 전송 실패 시 카운터 롤백 (전치 체크에서 이미 증가했으므로)
-                                        try:
-                                            if rurl:
-                                                r = redis.from_url(rurl)
-                                                if session_label == "RTH":
-                                                    et_tz = timezone(timedelta(hours=-5))
-                                                    now_et = datetime.now(et_tz)
-                                                    if 3 <= now_et.month <= 11:
-                                                        et_tz = timezone(timedelta(hours=-4))
-                                                        now_et = datetime.now(et_tz)
-                                                    day_key = f"dailycap:{now_et:%Y%m%d}:RTH:{ticker}"
-                                                    r.decr(day_key)
-                                                elif session_label == "EXT":
-                                                    et_tz = timezone(timedelta(hours=-5))
-                                                    now_et = datetime.now(et_tz)
-                                                    if 3 <= now_et.month <= 11:
-                                                        et_tz = timezone(timedelta(hours=-4))
-                                                        now_et = datetime.now(et_tz)
-                                                    day_key = f"dailycap:{now_et:%Y%m%d}:EXT:{ticker}"
-                                                    r.decr(day_key)
-                                                logger.info(f"Slack 전송 실패로 카운터 롤백: {ticker}")
-                                        except Exception as e:
-                                            logger.warning(f"카운터 롤백 실패: {e}")
-                                        logger.error(f"❌ Slack 전송 실패: {ticker}")
+                                                logger.warning(f"❌ Slack 전송 실패: {ticker}")
+                                        else:
+                                            logger.info(f"📊 페이퍼 트레이딩 스킵: {ticker} - 슬랙 전송 안함")
+                                    except Exception as paper_e:
+                                        logger.warning(f"페이퍼 트레이딩 실행 실패: {ticker} - {paper_e}")
+                                    
+                                    
+                                    # 기존 코드 정리 완료
                                 except Exception as e:
                                     # 예외 발생 시에도 카운터 롤백
                                     try:
@@ -3649,7 +3721,17 @@ def generate_signals(self):
         except Exception as e:
             logger.warning(f"LLM 사용량 조회 실패: {e}")
         
-        logger.info(f"시그널 생성 완료: {signals_generated}개, {execution_time:.2f}초")
+        # KPI 집계 로그 (노이즈 로깅 절감)
+        total_suppressed = sum(stats['suppressed'].values())
+        blocked_by = {k: v for k, v in stats['suppressed'].items() if v > 0}
+        
+        logger.info(f"📊 신호 생성 완료: processed={stats['processed']}, "
+                   f"generated={stats['signals_generated']}, "
+                   f"suppressed={total_suppressed} {blocked_by}, "
+                   f"llm_calls={stats['llm_calls']}, "
+                   f"time={execution_time:.2f}s")
+        
+        signals_generated = stats['signals_generated']
         
         return {
             "status": "success",

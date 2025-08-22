@@ -233,13 +233,48 @@ class RedisStreams:
             logger.error(f"리스크 업데이트 발행 실패: {e}")
             return None
     
-    def consume_stream(self, stream_key: str, count: int = 10, 
-                      block_ms: int = 1000, last_id: str = "0") -> List[StreamMessage]:
-        """스트림 소비"""
+    def ensure_consumer_group(self, stream_key: str):
+        """컨슈머 그룹 생성 (존재하지 않으면)"""
         try:
-            # XREAD로 메시지 읽기
-            result = self.redis_client.xread(
-                {stream_key: last_id},
+            self.redis_client.xgroup_create(stream_key, self.consumer_group, id='0', mkstream=True)
+            logger.info(f"컨슈머 그룹 생성: {stream_key}/{self.consumer_group}")
+        except redis.exceptions.ResponseError as e:
+            if "BUSYGROUP" not in str(e):
+                logger.error(f"컨슈머 그룹 생성 실패: {e}")
+    
+    def recover_pending(self, stream_key: str, min_idle_ms: int = 300000, count: int = 100):
+        """PEL에서 idle 메시지들을 자동 클레임하여 복구"""
+        try:
+            self.ensure_consumer_group(stream_key)
+            # 0-0부터 자동 클레임
+            res = self.redis_client.xautoclaim(
+                stream_key, 
+                self.consumer_group,
+                self.consumer_name, 
+                min_idle_ms, 
+                start_id='0-0', 
+                count=count
+            )
+            claimed = res[1] if isinstance(res, (list, tuple)) else []
+            if claimed:
+                logger.warning(f"펜딩 복구: {stream_key} {len(claimed)}건 재할당")
+            return claimed
+        except Exception as e:
+            logger.error(f"펜딩 복구 실패: {e}")
+            return []
+
+    def consume_stream(self, stream_key: str, count: int = 10, 
+                      block_ms: int = 1000) -> List[StreamMessage]:
+        """스트림 소비 (XREADGROUP 방식)"""
+        try:
+            # 컨슈머 그룹 확인/생성
+            self.ensure_consumer_group(stream_key)
+            
+            # XREADGROUP으로 메시지 읽기
+            result = self.redis_client.xreadgroup(
+                self.consumer_group,
+                self.consumer_name,
+                {stream_key: '>'},
                 count=count,
                 block=block_ms
             )
@@ -264,6 +299,20 @@ class RedisStreams:
         except Exception as e:
             logger.error(f"스트림 소비 실패 ({stream_key}): {e}")
             return []
+    
+    def ack_message(self, stream_key: str, message_id: str) -> bool:
+        """메시지 처리 완료 승인"""
+        try:
+            ack_count = self.redis_client.xack(stream_key, self.consumer_group, message_id)
+            if ack_count > 0:
+                logger.debug(f"메시지 승인: {stream_key}/{message_id}")
+                return True
+            else:
+                logger.warning(f"메시지 승인 실패: {stream_key}/{message_id}")
+                return False
+        except Exception as e:
+            logger.error(f"메시지 승인 오류: {e}")
+            return False
     
     def consume_quotes(self, ticker: str, mic: str = "XNAS", 
                       count: int = 10, block_ms: int = 1000) -> List[StreamMessage]:
