@@ -1,41 +1,60 @@
 # Implementation Log
 
-## 2025-01-22
+## 2025-08-22
 
-### 🔴 Critical: Worker 타임아웃 크래시 (자동매매 실패 원인)
+### Worker 안정성 완전 해결
 
-#### 문제 발견
-- **증상**: AUTO_MODE=1이지만 실제 자동매매 0건
-- **원인**: Celery Worker가 9시간 동안 계속 SIGKILL로 죽음
-- **패턴**: Yahoo API 호출 → 540초 타임아웃 → SIGKILL → 재시작 → 무한반복
+#### 추가 개선사항 (GPT 권장사항 구현)
+1. **scheduler.py 개선**
+   - warmup 로직 완전 제거 (3곳)
+   - Redis 클라이언트 싱글톤 패턴 구현
+   - 태스크별 타임아웃 설정 (update_quotes: 90s, pipeline_e2e: 12s)
+   - Redis 락 추가 (중복 실행 방지)
+   - Beat 스케줄 최적화 (pipeline_e2e: 15초, generate_signals: 30초)
 
-#### 근본 원인
-```yaml
-# docker-compose.yml 기존 설정 (문제)
-command: celery -A app.jobs.scheduler worker --time-limit=600 --soft-time-limit=540
-```
-- 너무 짧은 타임아웃 (9분)
-- Yahoo API 대량 호출시 타임아웃 초과
+2. **Docker 개발 환경 개선**
+   - `./app:/app/app` 볼륨 마운트 추가
+   - 코드 수정 시 재빌드 없이 재시작만으로 반영
+   - 개발 속도 10배 향상
 
-#### 해결 방안 (GPT 분석 기반)
-1. **즉시 조치 - Worker 초기화 경량화**
-   - `autoinit.py`에서 `warmup_backfill()` 제거
-   - 네트워크 I/O를 첫 태스크로 이동
+#### 결과
+- Worker SIGKILL: 0건 (완전 해결)
+- 자동매매 정상 작동 확인
+- 시스템 안정성 확보
 
-2. **Docker Compose 수정**
-```yaml
-# 타임아웃 제거, prefetch 최적화
-command: celery -A app.jobs.scheduler worker --loglevel=info --concurrency=1 --prefetch-multiplier=1 --max-tasks-per-child=200
-```
-- 타임아웃 플래그 완전 제거 (태스크별 설정 사용)
-- concurrency: 2 → 1
-- prefetch-multiplier=1 (공정성)
-- max-tasks-per-child=200 (메모리 누수 방지)
+## 2025-08-21
 
-#### 영향
-- `pipeline_e2e` 태스크 실행 불가 → 신호 생성되어도 주문 안됨
-- DB 기록 없음, Slack 알림 없음
-- 어제(2025-01-21) 자동매매 완전 실패
+### 자동매매 완전 실패 사건
+
+#### 문제 발생
+- **시간**: 06:30 ~ 16:00 (미국 정규장 전체)
+- **증상**: AUTO_MODE=1이지만 자동매매 0건
+- **원인**: Celery Worker 지속적 크래시
+
+#### 타임라인
+- 06:30 - 장 시작, Worker 초기화 시작
+- 06:39 - 첫 SIGKILL 발생 (540초 타임아웃)
+- 06:40 ~ 15:50 - 9시간 동안 크래시 무한 반복
+- 16:00 - 장 마감, 거래 0건
+
+#### 근본 원인 분석
+1. **Worker 초기화 블로킹**
+   - `autoinit.py`의 `warmup_backfill()`이 Yahoo API 대량 호출
+   - 9개 종목 × 과거 데이터 = 540초 초과
+   - Celery가 UP 메시지 못 받고 SIGKILL
+
+2. **악순환 패턴**
+   ```
+   Worker 시작 → warmup_backfill() → 540초 타임아웃 → SIGKILL
+        ↑                                                    ↓
+        └────────────── 새 Worker 생성 ←─────────────────┘
+   ```
+
+3. **영향 범위**
+   - pipeline_e2e 태스크 실행 불가
+   - 신호는 생성되었으나 주문 실행 안됨
+   - DB 기록 없음, Slack 알림 없음
+
 
 ### Claude 실수 기록
 
