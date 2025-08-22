@@ -104,7 +104,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: trading_bot_worker
-    command: celery -A app.jobs.scheduler worker --loglevel=info --concurrency=2 --time-limit=600 --soft-time-limit=540
+    command: celery -A app.jobs.scheduler worker --loglevel=info --concurrency=1 --prefetch-multiplier=1 --max-tasks-per-child=200
     env_file:
       - .env
     environment:

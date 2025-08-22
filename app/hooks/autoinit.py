@@ -29,13 +29,9 @@ def _build_components():
     comps["redis_streams"] = rs
     comps["stream_consumer"] = StreamConsumer(rs)
 
-    # Quotes ingestor + 쉬운 warmup
+    # Quotes ingestor (warmup 제거 - 첫 태스크에서 처리)
     qi = DelayedQuotesIngestor()
-    try:
-        qi.warmup_backfill()
-        log.info("[autoinit] quotes ingestor warmup_backfill ok")
-    except Exception as e:
-        log.warning("[autoinit] warmup_backfill skip/err: %s", e)
+    log.info("[autoinit] quotes ingestor created (warmup deferred)")
     comps["quotes_ingestor"] = qi
 
     # Engines

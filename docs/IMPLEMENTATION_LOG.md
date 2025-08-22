@@ -17,14 +17,20 @@ command: celery -A app.jobs.scheduler worker --time-limit=600 --soft-time-limit=
 - 너무 짧은 타임아웃 (9분)
 - Yahoo API 대량 호출시 타임아웃 초과
 
-#### 해결 방안
+#### 해결 방안 (GPT 분석 기반)
+1. **즉시 조치 - Worker 초기화 경량화**
+   - `autoinit.py`에서 `warmup_backfill()` 제거
+   - 네트워크 I/O를 첫 태스크로 이동
+
+2. **Docker Compose 수정**
 ```yaml
-# docker-compose.yml 수정
-command: celery -A app.jobs.scheduler worker --loglevel=info --concurrency=1 --time-limit=1800 --soft-time-limit=1700
+# 타임아웃 제거, prefetch 최적화
+command: celery -A app.jobs.scheduler worker --loglevel=info --concurrency=1 --prefetch-multiplier=1 --max-tasks-per-child=200
 ```
-- concurrency: 2 → 1 (동시 처리 감소)
-- time-limit: 600 → 1800 (30분)
-- soft-time-limit: 540 → 1700
+- 타임아웃 플래그 완전 제거 (태스크별 설정 사용)
+- concurrency: 2 → 1
+- prefetch-multiplier=1 (공정성)
+- max-tasks-per-child=200 (메모리 누수 방지)
 
 #### 영향
 - `pipeline_e2e` 태스크 실행 불가 → 신호 생성되어도 주문 안됨
