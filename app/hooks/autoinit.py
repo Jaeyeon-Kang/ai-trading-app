@@ -49,10 +49,9 @@ def _build_components():
     # Slack (있으면)
     try:
         token = os.getenv("SLACK_BOT_TOKEN")
-        ch = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL")
-        if token and ch:
+        ch = os.getenv("SLACK_CHANNEL_ID") or None
+        if token:
             from app.io.slack_bot import SlackBot
-
             comps["slack_bot"] = SlackBot(token, ch)
     except Exception as e:
         log.warning("[autoinit] slack init skip: %s", e)

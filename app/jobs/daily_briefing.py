@@ -205,10 +205,12 @@ class DailyBriefingEngine:
                 logger.warning("Slack bot을 사용할 수 없음")
                 return False
             
-            slack_message = {
-                "text": message,
-                "channel": os.getenv("SLACK_CHANNEL_ID", "#trading-signals")
-            }
+            channel_id = os.getenv("SLACK_CHANNEL_ID")
+            slack_message = {"text": message}
+            if channel_id:
+                slack_message["channel"] = channel_id
+            else:
+                logger.warning("SLACK_CHANNEL_ID 미설정 - SlackBot 기본 채널 사용 시도")
             
             result = slack_bot.send_message(slack_message)
             if result:

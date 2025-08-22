@@ -41,14 +41,16 @@ class SignalNotification:
 class SlackBot:
     """Slack Bot"""
     
-    def __init__(self, token: str, channel: str = "#trading-signals"):
+    def __init__(self, token: str, channel: str | None = None):
         """
         Args:
             token: Slack Bot Token
             channel: 기본 채널
         """
         self.token = token
-        self.default_channel = channel
+        # 기본 채널은 오직 채널 "ID"만 허용 (예: C..., G..., D...)
+        env_channel = os.getenv("SLACK_CHANNEL_ID", "")
+        self.default_channel = (channel or env_channel or "").strip()
         self.base_url = "https://slack.com/api"
         
         # 승인 콜백 저장
@@ -80,7 +82,16 @@ class SlackBot:
             "Content-Type": "application/json; charset=utf-8"
         }
         
-        logger.info(f"Slack Bot 초기화: 채널 {channel}")
+        # 채널 ID 유효성 점검 및 경고
+        if not self.default_channel:
+            logger.warning("Slack 기본 채널 미설정: SLACK_CHANNEL_ID가 비어있음. 메시지에 channel이 없으면 전송이 건너뜀")
+        else:
+            if self.default_channel.startswith("#"):
+                logger.warning(
+                    f"Slack 채널 이름이 감지됨({self.default_channel}). 채널 'ID'를 사용해야 함 (예: C..., G...)."
+                )
+            else:
+                logger.info(f"Slack Bot 초기화: 채널 {self.default_channel}")
     
     def send_message(self, message) -> bool:
         """메시지 전송 (재시도 로직 포함). dict, str 또는 SlackMessage 모두 허용"""
@@ -99,13 +110,18 @@ class SlackBot:
                 channel=self.default_channel,
                 text=message
             )
+        # 채널 결정: 메시지 지정 > 기본 채널
         for attempt in range(self.max_retries):
             try:
                 payload = {
-                    "channel": message.channel,
                     "text": message.text
                 }
-                logger.info(f"SlackBot 전송 시도: 채널={message.channel}, 텍스트={message.text[:50]}...")
+                ch = (message.channel or self.default_channel).strip()
+                if not ch:
+                    logger.error("Slack 전송 불가: 채널 ID가 비어있음 (message.channel/default_channel 모두 없음)")
+                    return False
+                payload["channel"] = ch
+                logger.info(f"SlackBot 전송 시도: 채널={ch}, 텍스트={message.text[:50]}...")
                 
                 if message.blocks:
                     payload["blocks"] = message.blocks

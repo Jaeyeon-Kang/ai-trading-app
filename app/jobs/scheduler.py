@@ -39,11 +39,7 @@ def get_redis_client():
             os.getenv("REDIS_URL", "redis://localhost:6379"),
             decode_responses=False,  # 바이너리 데이터 처리를 위해
             socket_keepalive=True,
-            socket_keepalive_options={
-                1: 1,  # TCP_KEEPIDLE
-                2: 3,  # TCP_KEEPINTVL  
-                3: 5,  # TCP_KEEPCNT
-            }
+            socket_keepalive_options={}  # macOS와 Linux 호환성 문제로 빈 dict 사용
         )
     return _redis_client
 
@@ -400,8 +396,8 @@ def _autoinit_components_if_enabled() -> None:
     # Slack bot (optional)
     try:
         token = os.getenv("SLACK_BOT_TOKEN")
-        channel = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "#trading-signals")
-        logger.info(f"🔍 [DEBUG] SlackBot 환경변수: token={'***' if token else None}, channel_id={os.getenv('SLACK_CHANNEL_ID')}, channel_fallback={os.getenv('SLACK_CHANNEL')}")
+        channel = os.getenv("SLACK_CHANNEL_ID") or None
+        logger.info(f"🔍 [DEBUG] SlackBot 환경변수: token={'***' if token else None}, channel_id={os.getenv('SLACK_CHANNEL_ID')}")
         logger.info(f"🔍 [DEBUG] SlackBot 최종 채널: {channel}")
         if token:
             components["slack_bot"] = SlackBot(token=token, channel=channel)
@@ -2676,7 +2672,10 @@ def get_mock_tech_score(ticker: str):
     )
 
 def format_slack_message(signal) -> Dict:
-    """슬랙 메시지 포맷 (가격/버튼/상태정보 포함)"""
+    """슬랙 메시지 포맷 (가격/버튼/상태정보 포함)
+    채널은 오직 채널 ID(SLACK_CHANNEL_ID)만 사용. 없으면 메시지에 channel 키를 생략해
+    SlackBot 기본 채널을 사용하도록 한다.
+    """
     import os
     import json
     
@@ -2746,14 +2745,14 @@ def format_slack_message(signal) -> Dict:
             ]
         })
     
-    # 첫 번째 채널 우선, 두 번째는 폴백 (channel_not_found 오류 해결)
-    channel = os.getenv("SLACK_CHANNEL_ID") or "C099CQP8CJ3"
-    
-    return {
-        "channel": channel,
-        "text": main_text,
-        "blocks": blocks
-    }
+    # 채널 ID만 사용. 없으면 channel 키 생략
+    channel_id = os.getenv("SLACK_CHANNEL_ID")
+    msg = {"text": main_text, "blocks": blocks}
+    if channel_id:
+        msg["channel"] = channel_id
+    else:
+        logger.warning("SLACK_CHANNEL_ID가 비어있음: SlackBot 기본 채널에 의존합니다")
+    return msg
 
 def format_enhanced_slack_message(signal, llm_insight) -> Dict:
     """LLM 분석이 포함된 향상된 슬랙 메시지 포맷 (Phase 1.5)"""
@@ -2837,14 +2836,17 @@ def format_enhanced_slack_message(signal, llm_insight) -> Dict:
             ]
         })
     
-    # 채널 설정
-    channel = os.getenv("SLACK_CHANNEL_ID", "#trading-signals")
-    
-    return {
-        "channel": channel,
+    # 채널 설정 (ID만). 없으면 channel 키 생략
+    channel_id = os.getenv("SLACK_CHANNEL_ID")
+    msg = {
         "text": f"🤖 AI 추천: {signal.ticker} {action_ko} {signal.score:+.2f}점",
         "blocks": blocks
     }
+    if channel_id:
+        msg["channel"] = channel_id
+    else:
+        logger.warning("SLACK_CHANNEL_ID가 비어있음: SlackBot 기본 채널에 의존합니다")
+    return msg
 
 @celery_app.task(bind=True, name="app.jobs.scheduler.generate_signals",
                  soft_time_limit=20, time_limit=30)
@@ -3901,8 +3903,8 @@ def daily_reset(self):
         if slack_bot:
             message = {
                 "text": "🔄 일일 리셋이 완료되었습니다",
-                "channel": "#trading-signals"
             }
+            # 채널 지정은 SlackBot 기본 채널에 위임
             slack_bot.send_message(message)
         
         logger.info("일일 리셋 완료")

@@ -209,7 +209,7 @@ async def startup_event():
     # Slack 봇 초기화
     try:
         from app.io.slack_bot import SlackBot
-        channel_id = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "#trading-signals")
+        channel_id = os.getenv("SLACK_CHANNEL_ID") or None
         slack_bot = SlackBot(token=os.getenv("SLACK_BOT_TOKEN"), channel=channel_id)
         logger.info(f"Slack 봇 초기화 완료: 채널 {channel_id}")
     except Exception as e:
@@ -278,7 +278,7 @@ async def healthz_check(skip_external: bool = False):
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
     db_dsn = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL", "")
     slack_token = os.getenv("SLACK_BOT_TOKEN", "")
-    slack_channel = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "")
+    slack_channel = os.getenv("SLACK_CHANNEL_ID") or ""
 
     # 개발 편의: 외부 의존성 체크 스킵
     skip_external = skip_external or (os.getenv("HEALTHZ_SKIP_EXTERNAL", "0").lower() in ("1", "true", "yes", "on"))
@@ -545,17 +545,14 @@ async def slack_interactions(request: Request):
                 paper_orders.append({"id": order_id, **order.dict(), "ts": datetime.now().isoformat()})
             # 확인 메시지 전송
             if slack_bot:
-                from app.io.slack_bot import SlackMessage
                 confirm_text = f"✅ 페이퍼 주문 기록: {order.ticker} {order.side.upper()} x{order.qty} @ {order.entry:.2f}"
-                channel_id = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "#trading-signals")
-                slack_bot.send_message(SlackMessage(channel=channel_id, text=confirm_text))
+                # 채널 지정은 SlackBot 기본 채널/환경변수에 위임
+                slack_bot.send_message({"text": confirm_text})
             return {"status": "ok", "order_id": order_id}
         elif action_id == "reject_trade":
             # 거부 알림만 전송
             if slack_bot:
-                from app.io.slack_bot import SlackMessage
-                channel_id = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "#trading-signals")
-                slack_bot.send_message(SlackMessage(channel=channel_id, text="❌ 거래가 거부되었습니다"))
+                slack_bot.send_message({"text": "❌ 거래가 거부되었습니다"})
             return {"status": "ok", "rejected": True}
         return {"status": "ignored"}
     except HTTPException:
@@ -840,18 +837,8 @@ async def send_daily_report_to_slack(report_data: Dict):
             ]
         })
         
-        from app.io.slack_bot import SlackMessage
-        
-        # 채널 ID 사용 (환경변수에서 가져오기)
-        channel_id = os.getenv("SLACK_CHANNEL_ID") or os.getenv("SLACK_CHANNEL", "#trading-signals")
-        
-        message = SlackMessage(
-            channel=channel_id,
-            text=text,
-            blocks=blocks
-        )
-        
-        success = slack_bot.send_message(message)
+        # 채널 ID는 SlackBot 기본 채널을 사용 (환경변수 미설정 시 전송 건너뜀)
+        success = slack_bot.send_message({"text": text, "blocks": blocks})
         if success:
             logger.info("일일 리포트 Slack 전송 완료")
         else:
@@ -958,8 +945,7 @@ async def emergency_stop():
         # Slack 알림 전송
         if slack_bot:
             slack_bot.send_message({
-                "text": "🛑 긴급 중지가 요청되었습니다",
-                "channel": "#trading-signals"
+                "text": "🛑 긴급 중지가 요청되었습니다"
             })
         
         return {
