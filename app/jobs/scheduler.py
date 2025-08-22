@@ -28,6 +28,25 @@ logger = logging.getLogger(__name__)
 from app.config import settings, get_signal_cutoffs, sanitize_cutoffs_in_redis  # noqa: E402
 from app.utils.rate_limiter import get_rate_limiter, TokenTier  # noqa: E402
 
+# Redis 클라이언트 싱글톤
+_redis_client = None
+
+def get_redis_client():
+    """Redis 클라이언트 싱글톤 반환"""
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.Redis.from_url(
+            os.getenv("REDIS_URL", "redis://localhost:6379"),
+            decode_responses=False,  # 바이너리 데이터 처리를 위해
+            socket_keepalive=True,
+            socket_keepalive_options={
+                1: 1,  # TCP_KEEPIDLE
+                2: 3,  # TCP_KEEPINTVL  
+                3: 5,  # TCP_KEEPCNT
+            }
+        )
+    return _redis_client
+
 # GPT-5 리스크 관리 통합
 try:
     from app.engine.risk_manager import get_risk_manager
@@ -161,22 +180,22 @@ celery_app.conf.update(
     ],
 )
 
-# 스케줄 설정
+# 스케줄 설정 (최적화된 주기)
 celery_app.conf.beat_schedule = {
-    # 15초마다 파이프라인 실행 (E2E)
+    # 15초마다 파이프라인 실행 (E2E) - 신호 즉시 집행을 위해 15초 유지
     "pipeline-e2e": {
         "task": "app.jobs.scheduler.pipeline_e2e",
-        "schedule": 15.0,  # 15초
+        "schedule": 15.0,  # 15초 유지 (신호 들어오는 즉시 집행 기회 확보)
     },
-    # 15초마다 시그널 생성
+    # 30초마다 시그널 생성 - 1분봉이면 충분
     "generate-signals": {
         "task": "app.jobs.scheduler.generate_signals",
-        "schedule": 15.0,  # 15초
+        "schedule": 30.0,  # 30초 (기존 15초에서 변경)
     },
-    # 30초마다 시세 업데이트
+    # 30초마다 시세 업데이트 - 가장 무거운 작업
     "update-quotes": {
         "task": "app.jobs.scheduler.update_quotes",
-        "schedule": 30.0,  # 30초
+        "schedule": 30.0,  # 30초 (유지)
     },
     # 1분마다 EDGAR 스캔
     "scan-edgar": {
@@ -338,9 +357,7 @@ def _autoinit_components_if_enabled() -> None:
     # Quotes ingestor
     try:
         components["quotes_ingestor"] = DelayedQuotesIngestor()
-        # 워밍업으로 빈 버퍼 방지
-        components["quotes_ingestor"].warmup_backfill()  # type: ignore
-        logger.info("딜레이드 Quotes 인제스터 워밍업 완료")
+        logger.info("딜레이드 Quotes 인제스터 생성 완료")
     except Exception as e:
         logger.warning(f"Quotes 인제스터 준비 실패: {e}")
 
@@ -1566,7 +1583,7 @@ def place_bracket_order(trading_adapter, symbol: str, side: str, quantity: int, 
                 )
                 
                 # Redis OCO 등록
-                redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+                redis_client = get_redis_client()
                 oco_data = {
                     "symbol": symbol,
                     "quantity": quantity,
@@ -1773,7 +1790,7 @@ def enforce_time_stop(self):
     try:
         from app.adapters.trading_adapter import get_trading_adapter
         trading_adapter = get_trading_adapter()
-        redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+        redis_client = get_redis_client()
         positions = trading_adapter.get_positions() or []
         exited = 0
         for p in positions:
@@ -1828,7 +1845,7 @@ def enforce_trail_stop(self):
     try:
         from app.adapters.trading_adapter import get_trading_adapter
         trading_adapter = get_trading_adapter()
-        redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+        redis_client = get_redis_client()
         positions = trading_adapter.get_positions() or []
         exited = 0
         failed = []
@@ -1914,7 +1931,7 @@ def enforce_regime_flatten_inverse(self):
     try:
         from app.adapters.trading_adapter import get_trading_adapter
         trading_adapter = get_trading_adapter()
-        redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+        redis_client = get_redis_client()
         positions = trading_adapter.get_positions() or []
         flattened = 0
         for p in positions:
@@ -2252,9 +2269,19 @@ def save_signal_to_db(signal_data: Dict, action: str, decision_reason: str) -> O
         logger.error(f"신호 DB 저장 실패: {e}")
         return None
 
-@celery_app.task(bind=True, name="app.jobs.scheduler.pipeline_e2e")
+@celery_app.task(bind=True, name="app.jobs.scheduler.pipeline_e2e",
+                 soft_time_limit=12, time_limit=14)  # 15초 주기에 맞춤
 def pipeline_e2e(self):
     """포지션 관리 기반 E2E 파이프라인: 신호 소비 → 포지션 상태 기반 거래 실행"""
+    # Redis lock to prevent overlap
+    redis_client = get_redis_client()
+    lock_key = "lock:pipeline_e2e"
+    lock_acquired = redis_client.set(lock_key, "1", nx=True, ex=13)  # 13s TTL (15초 주기에 맞춤)
+    
+    if not lock_acquired:
+        logger.debug("pipeline_e2e already running, skip")
+        return {"status": "skipped", "reason": "already_running"}
+    
     try:
         start_time = time.time()
         logger.info("🚀 포지션 관리 E2E 파이프라인 시작")
@@ -2277,7 +2304,7 @@ def pipeline_e2e(self):
         # 거래 어댑터 초기화
         from app.adapters.trading_adapter import get_trading_adapter
         trading_adapter = get_trading_adapter()
-        redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+        # redis_client already initialized at the beginning for lock
         
         # 계좌 정보 조회
         account_info = trading_adapter.get_portfolio_summary()
@@ -2603,6 +2630,11 @@ def pipeline_e2e(self):
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
+    finally:
+        # Always release the lock
+        if lock_acquired:
+            redis_client.delete(lock_key)
+            logger.debug(f"Released lock: {lock_key}")
 
 def get_mock_candles(ticker: str) -> List:
     """모의 캔들 데이터"""
@@ -2814,7 +2846,8 @@ def format_enhanced_slack_message(signal, llm_insight) -> Dict:
         "blocks": blocks
     }
 
-@celery_app.task(bind=True, name="app.jobs.scheduler.generate_signals")
+@celery_app.task(bind=True, name="app.jobs.scheduler.generate_signals",
+                 soft_time_limit=20, time_limit=30)
 def generate_signals(self):
     """시그널 생성 작업"""
     try:
@@ -2828,10 +2861,7 @@ def generate_signals(self):
             try:
                 from app.io.quotes_delayed import DelayedQuotesIngestor
                 trading_components["quotes_ingestor"] = DelayedQuotesIngestor()
-                try:
-                    trading_components["quotes_ingestor"].warmup_backfill()  # type: ignore
-                except Exception:
-                    pass
+                logger.info("quotes_ingestor 생성 완료")
             except Exception as e:
                 logger.warning(f"quotes_ingestor 생성 실패: {e}")
         if not trading_components.get("quotes_ingestor"):
@@ -3634,9 +3664,19 @@ def generate_signals(self):
             "timestamp": datetime.now().isoformat()
         }
 
-@celery_app.task(bind=True, name="app.jobs.scheduler.update_quotes")
+@celery_app.task(bind=True, name="app.jobs.scheduler.update_quotes", 
+                 soft_time_limit=90, time_limit=120)
 def update_quotes(self):
     """시세 업데이트 작업"""
+    # Redis 락으로 중복 실행 방지
+    redis_client = get_redis_client()
+    lock_key = "lock:update_quotes"
+    lock_acquired = redis_client.set(lock_key, "1", nx=True, ex=55)  # 55초 TTL
+    
+    if not lock_acquired:
+        logger.debug("update_quotes 이미 실행 중, 스킵")
+        return {"status": "skipped", "reason": "already_running"}
+    
     try:
         start_time = time.time()
         logger.debug("시세 업데이트 시작")
@@ -3691,8 +3731,14 @@ def update_quotes(self):
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
+    finally:
+        # 항상 락 해제
+        if lock_acquired:
+            redis_client.delete(lock_key)
+            logger.debug(f"Released lock: {lock_key}")
 
-@celery_app.task(bind=True, name="app.jobs.scheduler.scan_edgar")
+@celery_app.task(bind=True, name="app.jobs.scheduler.scan_edgar", 
+                 soft_time_limit=30, time_limit=60)
 def scan_edgar(self):
     """EDGAR 스캔 작업"""
     try:
@@ -3776,7 +3822,8 @@ def scan_edgar(self):
             "timestamp": datetime.now().isoformat()
         }
 
-@celery_app.task(bind=True, name="app.jobs.scheduler.check_risk")
+@celery_app.task(bind=True, name="app.jobs.scheduler.check_risk",
+                 soft_time_limit=15, time_limit=30)
 def check_risk(self):
     """리스크 체크 작업"""
     try:
@@ -3831,7 +3878,8 @@ def check_risk(self):
             "timestamp": datetime.now().isoformat()
         }
 
-@celery_app.task(bind=True, name="app.jobs.scheduler.daily_reset")
+@celery_app.task(bind=True, name="app.jobs.scheduler.daily_reset",
+                 soft_time_limit=30, time_limit=60)
 def daily_reset(self):
     """일일 리셋 작업"""
     try:
