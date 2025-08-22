@@ -1,5 +1,77 @@
 # Implementation Log
 
+## 2025-01-22
+
+### 🔴 Critical: Worker 타임아웃 크래시 (자동매매 실패 원인)
+
+#### 문제 발견
+- **증상**: AUTO_MODE=1이지만 실제 자동매매 0건
+- **원인**: Celery Worker가 9시간 동안 계속 SIGKILL로 죽음
+- **패턴**: Yahoo API 호출 → 540초 타임아웃 → SIGKILL → 재시작 → 무한반복
+
+#### 근본 원인
+```yaml
+# docker-compose.yml 기존 설정 (문제)
+command: celery -A app.jobs.scheduler worker --time-limit=600 --soft-time-limit=540
+```
+- 너무 짧은 타임아웃 (9분)
+- Yahoo API 대량 호출시 타임아웃 초과
+
+#### 해결 방안
+```yaml
+# docker-compose.yml 수정
+command: celery -A app.jobs.scheduler worker --loglevel=info --concurrency=1 --time-limit=1800 --soft-time-limit=1700
+```
+- concurrency: 2 → 1 (동시 처리 감소)
+- time-limit: 600 → 1800 (30분)
+- soft-time-limit: 540 → 1700
+
+#### 영향
+- `pipeline_e2e` 태스크 실행 불가 → 신호 생성되어도 주문 안됨
+- DB 기록 없음, Slack 알림 없음
+- 어제(2025-01-21) 자동매매 완전 실패
+
+### Claude 실수 기록
+
+#### 1. 테스트 접근 방식 실수
+- **문제**: 정규장 자동매매 검증 실패 - AUTO_MODE 테스트 시 수동으로 API 호출해버림
+- **영향**: 시스템 자율 신호생성→알파카 주문→DB 저장 전체 사이클 미검증
+- **교훈**: 자동화 테스트는 시스템이 스스로 동작하도록 놔둬야 함
+
+#### 2. Replay 모드 설계 실수  
+- **문제**: API 의존성 간과 - Redis에 가짜 데이터 주입해도 시스템은 여전히 실제 API 호출
+- **잘못된 접근**: `replay_quotes.py` 작성했지만 아키텍처 이해 부족으로 작동 불가
+- **올바른 접근**: Mock API 레이어 또는 Extended Hours 활용 필요
+
+#### 3. DB 사용자 확인 실수
+- **문제**: `psql -U postgres` → role does not exist
+- **해결**: `docker-compose.yml` 확인 후 `psql -U trading_bot_user` 사용
+
+#### 4. 성급한 해결책 제시
+- "시간 조작하면 된다" → API는 실시간 데이터만 제공
+- "Redis에 넣으면 된다" → 시스템이 API 직접 호출함
+- **교훈**: Quick fix보다 시스템 아키텍처 전체 고려한 솔루션 필요
+
+### YOLO 오류 스캔 결과
+
+#### 🔴 DB 관련 오류 (심각)
+- `app/api/main.py:174-175` - DB 연결 리소스 누수: 예외 발생시 `conn.close()` 안됨
+- `app/api/main.py:475-476` - 동일한 패턴의 DB 연결 리소스 누수
+- `app/jobs/scheduler.py:1332-1333` - DB 연결 정리가 있지만 예외 처리 불확실
+
+#### 🔴 Import 오류 (심각)  
+- `app/api/main.py:922` - `from utils.spark import to_sparkline` - 모듈 존재하지 않을 가능성
+
+#### 🟡 로직 오류 (중간)
+- `app/jobs/paper_trading_manager.py:95` - Dead code: 계산 결과 사용 안함
+- `app/adapters/trading_adapter.py:167` - `locals()` 체크로 인한 잠재적 오류
+- `app/adapters/paper_ledger.py:134-135` - 삭제된 객체 접근 가능성
+
+#### ⚠️ 우선순위
+1. DB 연결 리소스 누수 - 운영환경 연결 풀 고갈 위험
+2. Import 오류 - 런타임 ImportError 발생 가능
+3. 로직 오류 - 예상치 못한 동작/크래시 가능
+
 ## 2025-08-17
 
 ### Issue: Celery Worker/Beat Containers in Restart Loop
