@@ -91,6 +91,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     volumes:
+      - ./app:/app/app  # 코드 실시간 마운트 (개발 편의)
       - ./logs:/app/logs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -149,6 +150,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     volumes:
+      - ./app:/app/app  # 코드 실시간 마운트 (개발 편의)
       - ./logs:/app/logs
 
   # Celery Beat (스케줄러)
@@ -201,6 +203,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     volumes:
+      - ./app:/app/app  # 코드 실시간 마운트 (개발 편의)
       - ./logs:/app/logs
 
   # Grafana (모니터링 대시보드)
