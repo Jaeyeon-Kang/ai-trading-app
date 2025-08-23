@@ -726,6 +726,11 @@ def should_call_llm_for_event(ticker: str, event_type: str, signal_score: float 
             
             cache_key = f"llm_cache:vol_spike:{ticker}"
             
+        elif event_type == "basket_inverse_entry":
+            # 인버스 진입은 무조건 LLM 필수 (일일 한도/캐시만 체크)
+            logger.info(f"🤖 LLM gate: required inverse entry {ticker} - mandatory analysis")
+            cache_key = f"llm_cache:inv_entry:{ticker}"
+            
         else:
             return False, f"unknown_event_type: {event_type}"
         
@@ -2176,7 +2181,7 @@ def check_short_etf_exit_conditions(symbol: str, current_score: float, current_p
             return None
         
         # 반대 신호 체크 (롱 신호 = 숏 ETF 청산 신호)
-        buy_threshold = float(os.getenv("BUY_THRESHOLD", "0.15"))
+        buy_threshold = settings.BUY_THRESHOLD  # 단일 소스 통일
         if current_score >= buy_threshold:
             # 볼륨 스파이크 확인
             if not check_volume_spike(symbol, current_volume):
