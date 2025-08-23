@@ -17,8 +17,8 @@ class Settings:
         self.SIGNAL_CUTOFF_RTH = float(os.getenv("SIGNAL_CUTOFF_RTH", "0.18"))
         self.SIGNAL_CUTOFF_EXT = float(os.getenv("SIGNAL_CUTOFF_EXT", "0.28"))
 
-        # 믹서 최소 임계(노이즈 컷). 스케줄러 컷과 역할 다름
-        self.MIXER_THRESHOLD = float(os.getenv("MIXER_THRESHOLD", "0.15"))  # 원래 기획 톤으로 복원
+        # 기획 개선: 임계값 단일 소스 통일 - 모든 임계값의 기준선
+        self.MIXER_THRESHOLD = float(os.getenv("MIXER_THRESHOLD", "0.20"))  # 단일 소스 기준선
 
         self.EDGAR_BONUS = float(os.getenv("EDGAR_BONUS", "0.10"))
         self.COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "180"))  # 원래 기획: 3분
@@ -39,9 +39,10 @@ class Settings:
         }
 
         # --- Universe Expansion & Tier System ---
-        self.TIER_A_TICKERS = os.getenv("TIER_A_TICKERS", "NVDA,TSLA,AAPL,MSFT").split(",")
-        self.TIER_B_TICKERS = os.getenv("TIER_B_TICKERS", "MSFT,AMZN,META").split(",")
-        self.BENCH_TICKERS = os.getenv("BENCH_TICKERS", "GOOGL,AMD,AVGO").split(",")
+        # 기획 개선: 정상 주식 중심으로 재구성, 인버스 ETF는 소수만 유지
+        self.TIER_A_TICKERS = os.getenv("TIER_A_TICKERS", "NVDA,AAPL,MSFT,TSLA").split(",")
+        self.TIER_B_TICKERS = os.getenv("TIER_B_TICKERS", "AMZN,GOOGL,META,SQQQ").split(",") 
+        self.BENCH_TICKERS = os.getenv("BENCH_TICKERS", "AMD,AVGO,NFLX,SOXS").split(",")
         
         self.TIER_A_INTERVAL_SEC = int(os.getenv("TIER_A_INTERVAL_SEC", "30"))
         self.TIER_B_INTERVAL_SEC = int(os.getenv("TIER_B_INTERVAL_SEC", "60"))
@@ -57,10 +58,11 @@ class Settings:
         self.LLM_CALL_COST_KRW = int(os.getenv("LLM_CALL_COST_KRW", "667"))
         self.LLM_GATING_ENABLED = os.getenv("LLM_GATING_ENABLED", "true").lower() in ("true", "1", "yes", "on")
         
-        self.LLM_MIN_SIGNAL_SCORE = float(os.getenv("LLM_MIN_SIGNAL_SCORE", "0.7"))
+        # 기획 개선: LLM 점수 기준을 단일 소스 기준으로 통일
+        self.LLM_MIN_SIGNAL_SCORE = float(os.getenv("LLM_MIN_SIGNAL_SCORE", "0.25"))
         
-        # 이벤트별 LLM 필수 정책 (중요 이벤트는 점수 무관하게 분석)
-        self.LLM_REQUIRED_EVENTS = set(os.getenv("LLM_REQUIRED_EVENTS", "edgar,vol_spike").split(","))
+        # 기획 개선: 인버스 진입 시 LLM 필수화 + 기존 이벤트 확장  
+        self.LLM_REQUIRED_EVENTS = set(os.getenv("LLM_REQUIRED_EVENTS", "edgar,vol_spike,fed_speech,rate_decision,market_news,tech_earnings,basket_inverse_entry,macro_risk_on_off").split(","))
         self.LLM_CACHE_DURATION_MIN = int(os.getenv("LLM_CACHE_DURATION_MIN", "30"))
 
         # --- Position Sizing Enhancement ---
@@ -79,6 +81,36 @@ class Settings:
         # --- 가격 상한/분할매수 설정 ---
         self.FRACTIONAL_ENABLED = os.getenv("FRACTIONAL_ENABLED", "true").lower() in ("true", "1", "yes", "on")
         self.MAX_PRICE_PER_SHARE = float(os.getenv("MAX_PRICE_PER_SHARE_USD", "120"))
+        
+        # --- 테스트/개발 모드 설정 ---
+        self.TEST_MODE_ENABLED = os.getenv("TEST_MODE_ENABLED", "false").lower() in ("true", "1", "yes", "on")
+        self.DISABLE_REAL_TRADING = os.getenv("DISABLE_REAL_TRADING", "false").lower() in ("true", "1", "yes", "on")  
+        self.DISABLE_SLACK_ALERTS = os.getenv("DISABLE_SLACK_ALERTS", "false").lower() in ("true", "1", "yes", "on")
+        
+        # --- 비대칭 임계값 설계 (기획 개선) ---
+        # 롱 진입은 상대적으로 완화, 인버스 진입은 엄격
+        self.BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "0.20"))  # 롱 진입
+        self.SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "-0.20"))  # 롱 청산
+        self.INVERSE_ENTRY_MIN_SCORE = float(os.getenv("INVERSE_ENTRY_MIN_SCORE", "0.30"))  # 인버스 진입 최소 절대값
+        
+        # --- 인버스 전용 가드레일 (기획 조정: 너무 보수적이면 안됨) ---
+        self.COOLDOWN_INVERSE_SEC = int(os.getenv("COOLDOWN_INVERSE_SEC", "300"))  # 인버스 쿨다운 5분 (10분은 너무 길어)
+        self.DIRECTION_LOCK_INVERSE_SEC = int(os.getenv("DIRECTION_LOCK_INVERSE_SEC", "300"))  # 인버스 방향락 5분  
+        self.STOP_LOSS_PCT_INVERSE = float(os.getenv("STOP_LOSS_PCT_INVERSE", "0.03"))  # 인버스 스탑로스 3%
+        
+        # --- 바스켓 라우팅 잡음 방지 (기획 조정: 0.60은 너무 극단적) ---
+        self.BASKET_WINDOW_SEC = int(os.getenv("BASKET_WINDOW_SEC", "300"))  # 5분 윈도우 (좋음)
+        self.BASKET_MIN_SIGNALS = int(os.getenv("BASKET_MIN_SIGNALS", "3"))  # 최소 신호 개수 (좋음)
+        self.BASKET_NEG_FRACTION = float(os.getenv("BASKET_NEG_FRACTION", "0.45"))  # 네거티브 비율 45% (0.60은 너무 극단)
+        self.BASKET_MEAN_THRESHOLD = float(os.getenv("BASKET_MEAN_THRESHOLD", "-0.12"))  # 평균 임계값 (적절)
+        
+        # --- 예산 일원화 (한화 100만원 기준) ---
+        self.SIZING_EQUITY_MODE = os.getenv("SIZING_EQUITY_MODE", "override")  # 예산 기준 강제
+        self.SIZING_EQUITY_KRW = int(os.getenv("SIZING_EQUITY_KRW", "1000000"))  # 100만원 예산
+        self.USD_KRW_RATE = float(os.getenv("USD_KRW_RATE", "1350"))  # 환율 (동적 업데이트 필요)
+        self.RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.008"))  # 거래당 0.8% 위험
+        self.MAX_CONCURRENT_RISK = float(os.getenv("MAX_CONCURRENT_RISK", "0.04"))  # 최대 동시 위험 4%
+        self.MAX_NOTIONAL_PER_TRADE_KRW = int(os.getenv("MAX_NOTIONAL_PER_TRADE_KRW", "250000"))  # 거래당 최대 25만원
 
 settings = Settings()
 

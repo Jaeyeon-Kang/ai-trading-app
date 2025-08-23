@@ -1102,18 +1102,24 @@ def route_signal_symbol(original_symbol: str, base_score: float) -> Dict[str, st
     Returns:
         라우팅 결과 딕셔너리
     """
-    # 인버스 ETF 처리: 믹서에서 이미 반전된 점수 해석
+    # 인버스 ETF 처리: 믹서에서 이미 반전된 점수 해석 + 기획 개선: 비대칭 임계값
     if original_symbol in INVERSE_ETFS:
         effective_score = base_score  # 믹서에서 이미 반전 적용된 점수
-        cutoff_rth, cutoff_ext = get_signal_cutoffs()
-        buy_cutoff = cutoff_rth  # 기본적으로 RTH 사용
-        sell_cutoff = -cutoff_rth
         
-        if effective_score >= buy_cutoff:
+        # 기획 개선: 인버스 진입은 더 엄격한 임계값 적용
+        inverse_entry_threshold = settings.INVERSE_ENTRY_MIN_SCORE
+        sell_cutoff = settings.SELL_THRESHOLD  # 청산 임계값
+        
+        if effective_score >= inverse_entry_threshold:
+            # 기획 개선: 인버스 진입 시 LLM 필수 분석 트리거
+            if "basket_inverse_entry" in settings.LLM_REQUIRED_EVENTS:
+                logger.info(f"🤖 인버스 진입 트리거: {original_symbol} LLM 분석 필요 (score={effective_score:.3f})")
+            
             return {
                 "exec_symbol": original_symbol,
-                "intent": "enter_long",
-                "route_reason": "inverse_etf_enter"
+                "intent": "enter_long", 
+                "route_reason": "inverse_etf_enter",
+                "llm_required_event": "basket_inverse_entry"  # LLM 이벤트 태그
             }
         elif effective_score <= sell_cutoff:
             # 보유 포지션 확인 후 exit
@@ -1158,12 +1164,16 @@ def route_signal_symbol(original_symbol: str, base_score: float) -> Dict[str, st
     basket_state = get_basket_state(basket_name)
     basket_info = BASKETS[basket_name]
     
-    # 바스켓 조건 체크 (테스트용 극도 완화)
+    # 기획 개선: 바스켓 조건 강화 (잡음 방지)
+    min_signals = settings.BASKET_MIN_SIGNALS  # 3개
+    neg_fraction_threshold = settings.BASKET_NEG_FRACTION  # 0.45
+    mean_threshold = settings.BASKET_MEAN_THRESHOLD  # -0.12
+    
     conditions_met = (
-        basket_state["total_count"] >= basket_info.get("min_signals", 1) and
-        basket_state["neg_fraction"] >= basket_info.get("neg_fraction", 0.0) and
-        basket_state["mean_score"] <= basket_info.get("mean_threshold", 0.5)
-        # 2틱 및 slope 조건 제거 - 너무 까다로움
+        basket_state["total_count"] >= min_signals and
+        basket_state["neg_fraction"] >= neg_fraction_threshold and
+        basket_state["mean_score"] <= mean_threshold
+        # slope 조건은 추후 추가 검토 필요
     )
     
     if not conditions_met:
@@ -3900,6 +3910,111 @@ def scan_edgar(self):
         
     except Exception as e:
         logger.error(f"EDGAR 스캔 작업 실패: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+@celery_app.task(bind=True, name="app.jobs.scheduler.scan_news", 
+                 soft_time_limit=45, time_limit=90)
+def scan_news(self):
+    """실시간 뉴스 스캔 작업 - 기획 개선: Fed 발언, 기술주 뉴스 실시간 반영"""
+    try:
+        start_time = time.time()
+        logger.debug("실시간 뉴스 스캔 시작")
+        
+        # 뉴스 스캐너 준비
+        try:
+            from app.io.news_scanner import get_news_scanner
+        except Exception:
+            logger.warning("뉴스 스캐너 모듈 로드 실패")
+            return {"status": "skipped", "reason": "news_scanner_unavailable"}
+            
+        news_scanner = get_news_scanner()
+        redis_streams = trading_components.get("redis_streams")
+        
+        if not redis_streams:
+            return {"status": "skipped", "reason": "components_not_ready"}
+        
+        # 전체 뉴스 스캔 실행
+        scan_results = news_scanner.run_full_scan()
+        
+        # Redis 스트림에 뉴스 발행
+        published = 0
+        
+        # Fed 뉴스 우선 처리 (고우선순위)
+        for news_item in scan_results.get("fed_news", []):
+            news_payload = {
+                "title": news_item["title"],
+                "summary": news_item["summary"],
+                "url": news_item["url"],
+                "source": news_item["source"],
+                "sentiment_score": news_item["sentiment_score"],
+                "sentiment_label": news_item["sentiment_label"],
+                "event_type": news_item["event_type"],
+                "priority": news_item["priority"],
+                "tickers": ",".join(news_item["tickers"]) if news_item["tickers"] else "",
+                "published_at": news_item["published_at"],
+                "relevance_score": news_item["relevance_score"]
+            }
+            redis_streams.publish_news(news_payload)
+            published += 1
+            
+            # 고우선순위 Fed 뉴스는 LLM 즉시 분석
+            llm_engine = trading_components.get("llm_engine")
+            if news_item["priority"] == "high" and llm_engine:
+                try:
+                    llm_insight = llm_engine.analyze_news_item(news_item)
+                    if llm_insight:
+                        insight_data = {
+                            "source": "news",
+                            "event_type": news_item["event_type"],
+                            "sentiment": llm_insight.sentiment,
+                            "trigger": llm_insight.trigger,
+                            "horizon_minutes": llm_insight.horizon_minutes,
+                            "summary": llm_insight.summary,
+                            "tickers": ",".join(news_item["tickers"]) if news_item["tickers"] else "",
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        redis_streams.publish_news(insight_data)
+                        logger.info(f"🤖 LLM Fed 뉴스 분석 완료: {news_item['title'][:50]}...")
+                except Exception as e:
+                    logger.warning(f"LLM Fed 뉴스 분석 실패: {e}")
+        
+        # 일반 시장 뉴스 처리
+        for news_item in scan_results.get("market_news", []):
+            if news_item["relevance_score"] > 0.5:  # 고관련성 뉴스만
+                news_payload = {
+                    "title": news_item["title"],
+                    "summary": news_item["summary"],
+                    "url": news_item["url"],
+                    "source": news_item["source"],
+                    "sentiment_score": news_item["sentiment_score"],
+                    "sentiment_label": news_item["sentiment_label"],
+                    "event_type": news_item["event_type"],
+                    "priority": news_item["priority"],
+                    "tickers": ",".join(news_item["tickers"]) if news_item["tickers"] else "",
+                    "published_at": news_item["published_at"],
+                    "relevance_score": news_item["relevance_score"]
+                }
+                redis_streams.publish_news(news_payload)
+                published += 1
+        
+        execution_time = time.time() - start_time
+        logger.debug(f"뉴스 스캔 완료: {published}개 발행, {execution_time:.2f}초")
+        
+        return {
+            "status": "success",
+            "published": published,
+            "fed_news_count": len(scan_results.get("fed_news", [])),
+            "market_news_count": len(scan_results.get("market_news", [])),
+            "execution_time": execution_time,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"뉴스 스캔 작업 실패: {e}")
         return {
             "status": "error",
             "error": str(e),
