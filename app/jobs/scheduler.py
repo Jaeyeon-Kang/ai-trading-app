@@ -208,10 +208,10 @@ celery_app.conf.beat_schedule = {
         "task": "app.jobs.scheduler.daily_reset",
         "schedule": crontab(hour=0, minute=0),  # 매일 00:00
     },
-    # 매일 06:10 KST에 일일 리포트 (KST = UTC+9, 06:10 KST = 21:10 UTC 전날)
+    # 매일 06:10 KST에 일일 리포트
     "daily-report": {
-        "task": "app.jobs.scheduler.daily_report",
-        "schedule": crontab(hour=21, minute=10),  # 매일 21:10 UTC = 06:10 KST
+        "task": "app.jobs.scheduler.daily_report", 
+        "schedule": crontab(hour=6, minute=10, timezone='Asia/Seoul'),
         "args": [False, True],  # force=False, post=True (슬랙으로 보내기)
     },
     # 5초마다 EDGAR 스트림 수집 → DB 적재 (dedupe는 DB UNIQUE와 ON CONFLICT로 보강)
@@ -227,31 +227,31 @@ celery_app.conf.beat_schedule = {
     # 매일 05:55 KST 적응형 컷오프 갱신 (리포트 직전)
     "adaptive-cutoff": {
         "task": "app.jobs.scheduler.adaptive_cutoff",
-        "schedule": crontab(hour=20, minute=55),  # 05:55 KST = 20:55 UTC 전날
+        "schedule": crontab(hour=5, minute=55, timezone='Asia/Seoul'),
     },
     
     # =============================================================================
     # Phase 1.5: 일일 브리핑 시스템 (답답함 해소!)
     # =============================================================================
     
-    # 아침 브리핑 (09:00 KST = 00:00 UTC)
+    # 아침 브리핑 (09:00 KST)
     "morning-briefing": {
         "task": "app.jobs.daily_briefing.send_scheduled_briefing",
-        "schedule": crontab(hour=0, minute=0),  # 09:00 KST
+        "schedule": crontab(hour=9, minute=0, timezone='Asia/Seoul'),
         "args": ["morning"],
     },
     
-    # 점심 브리핑 (12:30 KST = 03:30 UTC)  
+    # 점심 브리핑 (12:30 KST)  
     "midday-briefing": {
         "task": "app.jobs.daily_briefing.send_scheduled_briefing",
-        "schedule": crontab(hour=3, minute=30),  # 12:30 KST
+        "schedule": crontab(hour=12, minute=30, timezone='Asia/Seoul'),
         "args": ["midday"],
     },
     
-    # 저녁 브리핑 (18:00 KST = 09:00 UTC)
+    # 저녁 브리핑 (18:00 KST)
     "evening-briefing": {
         "task": "app.jobs.daily_briefing.send_scheduled_briefing",
-        "schedule": crontab(hour=9, minute=0),  # 18:00 KST
+        "schedule": crontab(hour=18, minute=0, timezone='Asia/Seoul'),
         "args": ["evening"],
     },
     
@@ -279,7 +279,7 @@ celery_app.conf.beat_schedule = {
     # 마감 전 사전 예약 청산 (미 동부시간 15:48)
     "queue-preclose-liquidation": {
         "task": "app.jobs.scheduler.queue_preclose_liquidation",
-        "schedule": crontab(hour=15, minute=48),
+        "schedule": crontab(hour=15, minute=48, timezone='America/New_York'),
         "options": {"queue": "celery", "expires": 50},
     },
     # 타임 스톱 가드레일 (1분마다)
@@ -824,17 +824,17 @@ def get_llm_usage_stats() -> Dict[str, int]:
 # 포지션 관리 및 리스크 계산 헬퍼 함수들
 # ============================================================================
 
-# 거래 파라미터 (환경변수에서 로드)
-BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "0.15"))
-SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "-0.15")) 
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "120"))
-DIRECTION_LOCK_SECONDS = int(os.getenv("DIRECTION_LOCK_SECONDS", "90"))
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.005"))  # 0.5%
-MAX_CONCURRENT_RISK = float(os.getenv("MAX_CONCURRENT_RISK", "0.02"))  # 2%
+# 거래 파라미터 (단일 소스: settings 통일)
+BUY_THRESHOLD = settings.BUY_THRESHOLD
+SELL_THRESHOLD = settings.SELL_THRESHOLD
+COOLDOWN_SECONDS = settings.COOLDOWN_SECONDS
+DIRECTION_LOCK_SECONDS = int(os.getenv("DIRECTION_LOCK_SECONDS", "90"))  # 공통용만 유지
+RISK_PER_TRADE = settings.RISK_PER_TRADE
+MAX_CONCURRENT_RISK = settings.MAX_CONCURRENT_RISK
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.015"))  # 1.5%
 TAKE_PROFIT_RR = float(os.getenv("TAKE_PROFIT_RR", "1.5"))  # 1.5R
 EOD_FLATTEN_MINUTES = int(os.getenv("EOD_FLATTEN_MINUTES", "10"))  # 기본 10분 전으로 확대
-FRACTIONAL_ENABLED = os.getenv("FRACTIONAL_ENABLED", "0") == "1"
+FRACTIONAL_ENABLED = settings.FRACTIONAL_ENABLED
 
 # 가드레일 플래그/파라미터
 ENABLE_TIME_STOP = os.getenv("ENABLE_TIME_STOP", "1") in ("1", "true", "True")
@@ -846,8 +846,9 @@ TRAIL_RET_PCT = float(os.getenv("TRAIL_RET_PCT", "0.005"))
 TRAIL_MIN_HOLD_MIN = int(os.getenv("TRAIL_MIN_HOLD_MIN", "5"))
 
 ENABLE_REGIME_FLATTEN_INVERSE = os.getenv("ENABLE_REGIME_FLATTEN_INVERSE", "1") in ("1", "true", "True")
-INVERSE_TICKERS_ENV = os.getenv("INVERSE_TICKERS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS,DRV,SARK")
-INVERSE_TICKERS_SET = set(t.strip().upper() for t in INVERSE_TICKERS_ENV.split(",") if t.strip())
+# 인버스 ETF 단일 소스 통일
+INVERSE_ETFS = set(settings.INVERSE_ETFS)
+INVERSE_TICKERS_SET = INVERSE_ETFS  # 중복 제거
 
 # EOD 재시도 파라미터
 EOD_MAX_RETRIES = int(os.getenv("EOD_MAX_RETRIES", "2"))
@@ -871,7 +872,7 @@ INSTRUMENT_META = {
     "TZA": {"underlying": "IWM", "exposure_sign": -1, "min_qty": 1},
     "SDOW": {"underlying": "DIA", "exposure_sign": -1, "min_qty": 1},
     "TECS": {"underlying": "XLK", "exposure_sign": -1, "min_qty": 1},
-    "DRV": {"underlying": "XLE", "exposure_sign": -1, "min_qty": 1},
+    "DRV": {"underlying": "XLRE", "exposure_sign": -1, "min_qty": 1},  # 리츠 섹터 인버스
     "SARK": {"underlying": "ARKK", "exposure_sign": -1, "min_qty": 1},
 }
 
@@ -880,21 +881,18 @@ BASKETS = {
     "MEGATECH": {
         "tickers": {"AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA"},
         "etf": "SQQQ",  # NASDAQ-100 인버스
-        "min_signals": 1,  # 최소 1개 종목에서 신호 
-        "neg_fraction": 0.20,  # 20% 이상 음수 (적당히 완화)
-        "mean_threshold": -0.05  # 평균 스코어 -0.05 이하
+        # 임계값은 settings에서 단일 소스로 관리 (아래 필드들 미사용)
+        # "min_signals": 1, "neg_fraction": 0.20, "mean_threshold": -0.05
     },
     "SEMIS": {
         "tickers": {"NVDA", "AMD", "AVGO"},
         "etf": "SOXS",  # 반도체 인버스
-        "min_signals": 1,  # 완화
-        "neg_fraction": 0.25,  # 25% 이상 음수
-        "mean_threshold": -0.05  # 평균 스코어 -0.05 이하
+        # 임계값은 settings에서 단일 소스로 관리 (아래 필드들 미사용)
+        # "min_signals": 1, "neg_fraction": 0.25, "mean_threshold": -0.05
     }
 }
 
-# 인버스 ETF 목록 (단일 소스: config.py)
-INVERSE_ETFS = set(settings.INVERSE_ETFS)
+# 인버스 ETF 목록 중복 제거 (위에서 이미 정의됨)
 
 # 상충 포지션 맵
 CONFLICT_MAP = {
@@ -921,8 +919,8 @@ def get_basket_state(basket_name: str, window_seconds: int = None) -> Dict[str, 
          "neg_fraction": float, "two_tick": bool, "slope": float}
     """
     try:
-        # 파라미터 명확화
-        WINDOW_SEC = int(os.getenv("BASKET_WINDOW_SEC", "120"))
+        # 바스켓 파라미터 단일 소스 통일
+        WINDOW_SEC = settings.BASKET_WINDOW_SEC
         SAMPLE_N = int(os.getenv("BASKET_SAMPLE_N", "200"))
         
         if window_seconds is None:
@@ -2488,6 +2486,17 @@ def pipeline_e2e(self):
                 route_reason = route_result["route_reason"]
                 route_intent = route_result.get("intent", "")
                 
+                # LLM 필수 이벤트 게이팅 체크
+                llm_evt = route_result.get("llm_required_event")
+                if llm_evt and exec_symbol:
+                    should_call, call_reason = should_call_llm_for_event(exec_symbol, llm_evt, signal_score=base_score)
+                    if not should_call:
+                        log_signal_decision(signal_data, symbol, "suppress", f"llm_gate:{call_reason}")
+                        signals_suppressed["below_cutoff"] += 1
+                        continue
+                    # LLM 쿼터 소비
+                    consume_llm_call_quota(exec_symbol, llm_evt)
+                
                 # 라우팅 결과에 따른 처리
                 if exec_symbol is None:
                     # skip, suppress, block 등의 경우
@@ -2569,8 +2578,13 @@ def pipeline_e2e(self):
                             quantity = calc_add_quantity(trading_adapter, exec_symbol, current_position, equity, stop_distance)
                             if quantity > 0:
                                 trade = place_bracket_order(trading_adapter, exec_symbol, "buy", quantity, stop_distance)
-                                set_cooldown(redis_client, exec_symbol, COOLDOWN_SECONDS)
-                                set_direction_lock(redis_client, exec_symbol, "long", DIRECTION_LOCK_SECONDS)
+                                # 인버스 전용 가드레일 적용
+                                is_inverse = exec_symbol in settings.INVERSE_ETFS
+                                cool = settings.COOLDOWN_INVERSE_SEC if is_inverse else COOLDOWN_SECONDS
+                                lock = settings.DIRECTION_LOCK_INVERSE_SEC if is_inverse else DIRECTION_LOCK_SECONDS
+                                
+                                set_cooldown(redis_client, exec_symbol, cool)
+                                set_direction_lock(redis_client, exec_symbol, "long", lock)
                                 count_daily_cap(redis_client, exec_symbol)
                                 orders_executed += 1
                                 log_signal_decision(signal_data, symbol, "add", f"exec_symbol={exec_symbol},qty={quantity}")
@@ -2598,8 +2612,13 @@ def pipeline_e2e(self):
                         quantity = calc_entry_quantity(trading_adapter, exec_symbol, equity, stop_distance)
                         if quantity > 0:
                             trade = place_bracket_order(trading_adapter, exec_symbol, "buy", quantity, stop_distance)
-                            set_cooldown(redis_client, exec_symbol, COOLDOWN_SECONDS)
-                            set_direction_lock(redis_client, exec_symbol, "long", DIRECTION_LOCK_SECONDS)
+                            # 인버스 전용 가드레일 적용
+                            is_inverse = exec_symbol in settings.INVERSE_ETFS
+                            cool = settings.COOLDOWN_INVERSE_SEC if is_inverse else COOLDOWN_SECONDS
+                            lock = settings.DIRECTION_LOCK_INVERSE_SEC if is_inverse else DIRECTION_LOCK_SECONDS
+                            
+                            set_cooldown(redis_client, exec_symbol, cool)
+                            set_direction_lock(redis_client, exec_symbol, "long", lock)
                             count_daily_cap(redis_client, exec_symbol)
                             risk_budget_left -= (equity * RISK_PER_TRADE)
                             
@@ -2633,7 +2652,10 @@ def pipeline_e2e(self):
                             signal_id=f"exit_{exec_symbol}_{int(time.time())}"
                         )
                         clear_direction_lock(redis_client, exec_symbol)
-                        set_cooldown(redis_client, exec_symbol, COOLDOWN_SECONDS // 2)  # 청산 후 짧은 쿨다운
+                        # 인버스 전용 가드레일: 청산 후 쿨다운도 구분
+                        is_inverse = exec_symbol in settings.INVERSE_ETFS
+                        cool = (settings.COOLDOWN_INVERSE_SEC // 2) if is_inverse else (COOLDOWN_SECONDS // 2)
+                        set_cooldown(redis_client, exec_symbol, cool)  # 청산 후 짧은 쿨다운
                         count_daily_cap(redis_client, exec_symbol)
                         orders_executed += 1
                         log_signal_decision(signal_data, symbol, "exit", f"exec_symbol={exec_symbol},qty={quantity}")

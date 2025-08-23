@@ -75,7 +75,7 @@ class Settings:
         self.REGULATORY_BLOCK_WORDS = os.getenv("REGULATORY_BLOCK_WORDS", "regulatory,litigation,FTC,DoJ,antitrust").split(",")
         
         # --- Inverse ETF Support ---
-        self.INVERSE_ETFS = os.getenv("INVERSE_ETFS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS,DRV,SARK,UVXY").split(",")
+        self.INVERSE_ETFS = os.getenv("INVERSE_ETFS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS,DRV,SARK").split(",")
         self.LEVERAGED_ETFS = os.getenv("LEVERAGED_ETFS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS,DRV").split(",")
         
         # --- 가격 상한/분할매수 설정 ---
