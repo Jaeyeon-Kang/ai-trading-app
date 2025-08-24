@@ -43,6 +43,47 @@ def get_redis_client():
         )
     return _redis_client
 
+# ============================================================================
+# 시간 처리 헬퍼 함수들 (DST 처리 개선)
+# ============================================================================
+
+def now_et():
+    """현재 ET 시간 반환 (DST 자동 처리)"""
+    return datetime.now(ZoneInfo("America/New_York"))
+
+def et_midnight_tomorrow(dt=None):
+    """ET 기준 다음날 자정 반환"""
+    et = now_et() if dt is None else dt.astimezone(ZoneInfo("America/New_York"))
+    return (et + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+# ============================================================================
+# Redis 헬퍼 함수들 (bytes 디코딩 일관화)
+# ============================================================================
+
+def _b2s(x, encoding="utf-8"):
+    """bytes를 string으로 안전 변환"""
+    return x.decode(encoding) if isinstance(x, (bytes, bytearray)) else x
+
+def rget_float(r, key, default=0.0):
+    """Redis에서 float 값을 안전하게 가져오기"""
+    v = r.get(key)
+    if v is None: 
+        return default
+    try: 
+        return float(_b2s(v))
+    except Exception: 
+        return default
+
+def rget_int(r, key, default=0):
+    """Redis에서 int 값을 안전하게 가져오기"""
+    v = r.get(key)
+    if v is None: 
+        return default
+    try: 
+        return int(_b2s(v))
+    except Exception: 
+        return default
+
 # GPT-5 리스크 관리 통합
 try:
     from app.engine.risk_manager import get_risk_manager
@@ -258,7 +299,7 @@ celery_app.conf.beat_schedule = {
     # 조용한 시장 체크 (1시간마다, 9-18시 KST만)
     "quiet-market-check": {
         "task": "app.jobs.daily_briefing.check_and_send_quiet_message",
-        "schedule": crontab(minute=0),  # 매 정시마다
+        "schedule": crontab(minute=0, hour="9-18", timezone='Asia/Seoul'),  # 9-18시 KST만
     },
     
     # =============================================================================
@@ -695,14 +736,9 @@ def should_call_llm_for_event(ticker: str, event_type: str, signal_score: float 
         if rurl:
             r = redis.from_url(rurl)
             
-            # ET 기준 날짜 키
-            et_tz = timezone(timedelta(hours=-5))
-            now_et = datetime.now(et_tz)
-            if 3 <= now_et.month <= 11:  # DST 간이 적용
-                et_tz = timezone(timedelta(hours=-4))
-                now_et = datetime.now(et_tz)
-            
-            daily_key = f"llm_calls:{now_et:%Y%m%d}"
+            # ET 기준 날짜 키 (ZoneInfo로 정확한 DST 처리)
+            et_now = now_et()
+            daily_key = f"llm_calls:{et_now:%Y%m%d}"
             current_calls = int(r.get(daily_key) or 0)
             
             if current_calls >= settings.LLM_DAILY_CALL_LIMIT:
@@ -766,22 +802,21 @@ def consume_llm_call_quota(ticker: str, event_type: str, edgar_filing: Dict = No
         
         r = redis.from_url(rurl)
         
-        # 일일 카운터 증가
-        et_tz = timezone(timedelta(hours=-5))
-        now_et = datetime.now(et_tz)
-        if 3 <= now_et.month <= 11:
-            et_tz = timezone(timedelta(hours=-4))
-            now_et = datetime.now(et_tz)
-        
-        daily_key = f"llm_calls:{now_et:%Y%m%d}"
+        # 일일 카운터 증가 (ZoneInfo로 정확한 DST 처리)
+        et_now = now_et()
+        daily_key = f"llm_calls:{et_now:%Y%m%d}"
         r.incr(daily_key)
-        r.expire(daily_key, 86400)  # 24시간 TTL
+        # ET 자정 기준으로 만료 시간 설정
+        r.expireat(daily_key, int(et_midnight_tomorrow(et_now).timestamp()))
         
-        # 캐시 마킹
+        # 캐시 마킹 - 이벤트 타입별 키 일관성
         if event_type == "edgar":
             cache_key = f"llm_cache:edgar:{ticker}:{edgar_filing.get('form_type', 'unknown')}"
-        else:
+        elif event_type == "vol_spike":
             cache_key = f"llm_cache:vol_spike:{ticker}"
+        else:
+            # 기타 이벤트 (basket_inverse_entry 등)
+            cache_key = f"llm_cache:{event_type}:{ticker}"
         
         r.setex(cache_key, settings.LLM_CACHE_DURATION_MIN * 60, 1)
         
@@ -805,13 +840,9 @@ def get_llm_usage_stats() -> Dict[str, int]:
         
         r = redis.from_url(rurl)
         
-        et_tz = timezone(timedelta(hours=-5))
-        now_et = datetime.now(et_tz)
-        if 3 <= now_et.month <= 11:
-            et_tz = timezone(timedelta(hours=-4))
-            now_et = datetime.now(et_tz)
-        
-        daily_key = f"llm_calls:{now_et:%Y%m%d}"
+        # ET 기준 일일 사용량 조회 (ZoneInfo로 정확한 DST 처리)
+        et_now = now_et()
+        daily_key = f"llm_calls:{et_now:%Y%m%d}"
         daily_used = int(r.get(daily_key) or 0)
         
         return {
@@ -1295,19 +1326,10 @@ def get_daily_key(prefix: str, symbol: str) -> str:
     return f"{prefix}:{symbol}:{date_str}"
 
 def get_next_rth_reset_timestamp() -> datetime:
-    """다음 RTH 리셋 시간 (미 동부시간 자정 기준)"""
-    import pytz
-    
-    # 미 동부시간 자정으로 설정
-    et = pytz.timezone("America/New_York")
+    """다음 RTH 리셋 시간 (미 동부시간 자정 기준) - ZoneInfo 사용"""
+    et = ZoneInfo("America/New_York")
     now_et = datetime.now(et)
-    
-    # 다음 자정 계산
-    next_midnight = (now_et + timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    
-    # UTC로 변환하여 반환
+    next_midnight = (now_et + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     return next_midnight.astimezone(timezone.utc)
 
 def get_open_position(trading_adapter, symbol: str) -> Optional[Dict]:
@@ -1920,10 +1942,8 @@ def enforce_trail_stop(self):
                 if price <= 0:
                     continue
                 peak_key = f"trail:{sym}:peak"
-                try:
-                    prev_peak = float(redis_client.get(peak_key) or 0)
-                except Exception:
-                    prev_peak = 0.0
+                # bytes 디코딩 일관화
+                prev_peak = rget_float(redis_client, peak_key, 0.0)
                 # 롱 기준 (숏은 추후 확장)
                 peak = max(prev_peak, price)
                 redis_client.setex(peak_key, 86400, str(peak))
@@ -2094,14 +2114,8 @@ def get_position_entry_time(symbol: str) -> Optional[float]:
         r = redis.from_url(os.getenv("REDIS_URL"), socket_timeout=2.0, socket_connect_timeout=2.0)
         entry_key = f"position_entry_time:{symbol}"
         
-        # 짧은 타임아웃으로 조회
-        entry_time_str = r.get(entry_key)
-        
-        if entry_time_str:
-            return float(entry_time_str)
-        else:
-            # 포지션 진입 시간이 없으면 현재 시간 반환 (Redis 설정 생략)
-            return time.time()
+        # 짧은 타임아웃으로 조회 - bytes 디코딩 일관화
+        return rget_float(r, entry_key, time.time())
             
     except Exception as e:
         logger.error(f"포지션 진입 시간 조회 실패 {symbol}: {e}")
@@ -2679,15 +2693,18 @@ def pipeline_e2e(self):
                     else:
                         log_signal_decision(signal_data, symbol, "suppress", f"no_position_to_exit:{exec_symbol}")
                 
-                # 메시지 ACK (XREADGROUP 방식)
-                redis_streams.ack_message("signals.raw", signal_event.message_id)
                 signals_processed += 1
                 
             except Exception as sig_e:
                 logger.error(f"신호 처리 실패 {signal_event.message_id}: {sig_e}")
                 import traceback
                 traceback.print_exc()
-                continue
+            finally:
+                # 모든 경로에서 ACK 보장 (PEL 누적 방지)
+                try:
+                    redis_streams.ack_message("signals.raw", signal_event.message_id)
+                except Exception as ack_e:
+                    logger.warning(f"ACK 실패 {signal_event.message_id}: {ack_e}")
         
         execution_time = time.time() - start_time
         
