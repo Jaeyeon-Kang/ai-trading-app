@@ -1130,9 +1130,22 @@ def can_open_etf_position(etf_symbol: str) -> Tuple[bool, str]:
 def has_open_long(symbol: str) -> bool:
     """포지션이 있는지 확인"""
     try:
-        pos = get_current_position(symbol) if 'get_current_position' in globals() else None
-        if not pos and 'trading_adapter' in globals() and trading_adapter:
-            pos = trading_adapter.get_position(symbol)
+        # trading_adapter가 전역 등록되었다면 우선 사용
+        ta = globals().get('trading_adapter')
+        pos = None
+        if ta:
+            try:
+                pos = ta.get_position(symbol)
+            except Exception:
+                pos = None
+        # 보조 함수가 있으면 사용
+        if pos is None:
+            getter = globals().get('get_current_position')
+            if callable(getter):
+                try:
+                    pos = getter(symbol)
+                except Exception:
+                    pos = None
         qty = float(getattr(pos, "quantity", 0) or 0)
         return qty > 0
     except Exception:
@@ -3124,12 +3137,12 @@ def generate_signals(self):
                 
                 # 고가 종목 프리필터 (신호 생성 단계에서 사전 차단)
                 try:
-                    if 'trading_adapter' in globals() and trading_adapter:
-                        current_price = trading_adapter.get_current_price(ticker)
+                    ta = globals().get('trading_adapter')
+                    if ta:
+                        current_price = ta.get_current_price(ticker)
                         if current_price:
                             max_price_per_share = float(os.getenv("MAX_PRICE_PER_SHARE_USD", "120"))
                             fractional_enabled = os.getenv("FRACTIONAL_ENABLED", "false").lower() in ("true", "1", "yes", "on")
-                            
                             if current_price > max_price_per_share and not fractional_enabled:
                                 stats['suppressed']['price_cap'] += 1
                                 continue
@@ -3141,7 +3154,14 @@ def generate_signals(self):
                 
                 # 1. 시세 데이터 가져오기
                 candles = quotes_ingestor.get_latest_candles(ticker, 50)
-                if len(candles) < 20:
+                # 공격/지연 소스일 때 초기 워밍업 바 완화 (env로 조정)
+                try:
+                    qp = (os.getenv("QUOTES_PROVIDER", "") or "").lower()
+                    default_min = "12" if qp == "delayed" else "20"
+                    min_candles = int(os.getenv("MIN_CANDLES_FOR_TECH", default_min))
+                except Exception:
+                    min_candles = 20
+                if len(candles) < min_candles:
                     stats['suppressed']['insufficient_data'] += 1
                     continue
                 
@@ -4336,7 +4356,16 @@ def ingest_edgar_stream(self):
             conn.autocommit = True
             trading_components["db_connection"] = conn
 
-        messages = consumer.consume_edgar_events(count=20, block_ms=100)
+        # Celery soft timeouts 회피: 배치·블록 시간 축소 (환경변수로 조정 가능)
+        try:
+            edgar_batch = int(os.getenv("EDGAR_CONSUME_BATCH", "10"))
+        except Exception:
+            edgar_batch = 10
+        try:
+            edgar_block_ms = int(os.getenv("EDGAR_CONSUME_BLOCK_MS", "50"))
+        except Exception:
+            edgar_block_ms = 50
+        messages = consumer.consume_edgar_events(count=edgar_batch, block_ms=edgar_block_ms)
         inserted = 0
         with conn.cursor() as cur:
             for msg in messages:

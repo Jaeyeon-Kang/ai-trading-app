@@ -297,7 +297,15 @@ class RedisStreams:
             return messages
             
         except Exception as e:
-            logger.error(f"스트림 소비 실패 ({stream_key}): {e}")
+            # SoftTimeLimitExceeded 등 간헐적 시간 초과는 경고로 강등하여 소음 축소
+            try:
+                from celery.exceptions import SoftTimeLimitExceeded  # type: ignore
+                if isinstance(e, SoftTimeLimitExceeded):
+                    logger.warning(f"스트림 소비 지연 ({stream_key}): SoftTimeLimitExceeded")
+                else:
+                    logger.error(f"스트림 소비 실패 ({stream_key}): {e}")
+            except Exception:
+                logger.error(f"스트림 소비 실패 ({stream_key}): {e}")
             return []
     
     def ack_message(self, stream_key: str, message_id: str) -> bool:
@@ -538,7 +546,7 @@ class StreamConsumer:
         # 동적 스트림의 경우 컨슈머 그룹 생성 시도
         try:
             self.redis_streams.create_consumer_group(stream_key, self.group_name)
-        except:
+        except Exception:
             pass  # 이미 존재하거나 실패해도 계속 진행
         
         return self.redis_streams.read_from_group(

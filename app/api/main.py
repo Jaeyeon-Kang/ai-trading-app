@@ -309,19 +309,29 @@ async def healthz_check(skip_external: bool = False):
 async def system_status():
     """시스템 상태 상세"""
     try:
-        # Redis 상태 (health_check 실패 시에도 ping 폴백)
+        # Redis 상태 (redis_streams 미초기화 시에도 ping 통해 판별)
         redis_connected = False
         try:
             if redis_streams:
                 health = redis_streams.health_check()
-                redis_connected = health.get("redis_connected", False)
-                if not redis_connected:
-                    # 폴백 ping 시도
-                    import redis as _r
-                    r = _r.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
-                    redis_connected = bool(r.ping())
+                redis_connected = bool(
+                    health.get("redis_connected")
+                    or health.get("connected")
+                    or (health.get("status") == "healthy")
+                )
+            if not redis_connected:
+                # 폴백: 전역 redis_client 우선, 없으면 새 커넥션으로 ping
+                try:
+                    if redis_client:
+                        redis_connected = bool(redis_client.ping())
+                    else:
+                        import redis as _r
+                        r = _r.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+                        redis_connected = bool(r.ping())
+                except Exception:
+                    redis_connected = False
         except Exception:
-            pass
+            redis_connected = False
         
         # LLM 상태
         llm_status = "unknown"
