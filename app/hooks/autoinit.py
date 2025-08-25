@@ -29,14 +29,18 @@ def _build_components():
     comps["redis_streams"] = rs
     comps["stream_consumer"] = StreamConsumer(rs)
 
-    # Quotes ingestor (warmup 제거 - 첫 태스크에서 처리)
-    quotes_provider = os.getenv("QUOTES_PROVIDER", "delayed")
-    if quotes_provider == "alpaca":
-        log.warning("[autoinit] QUOTES_PROVIDER=alpaca 설정됨, 하지만 Alpaca 실시간 시세 모듈 미구현. delayed로 fallback")
-        quotes_provider = "delayed"
+    # Quotes ingestor (provider에 따라 선택)
+    quotes_provider = os.getenv("QUOTES_PROVIDER", "delayed").lower()
     
-    qi = DelayedQuotesIngestor()
-    log.info(f"[autoinit] quotes ingestor created (provider: {quotes_provider}, warmup deferred)")
+    if quotes_provider == "alpaca":
+        from app.io.quotes_alpaca import AlpacaQuotesIngestor
+        qi = AlpacaQuotesIngestor()
+        log.info("[autoinit] provider=alpaca, AlpacaQuotesIngestor 생성")
+    else:
+        from app.io.quotes_delayed import DelayedQuotesIngestor
+        qi = DelayedQuotesIngestor()
+        log.info(f"[autoinit] provider={quotes_provider}, DelayedQuotesIngestor 생성")
+    
     comps["quotes_ingestor"] = qi
 
     # Engines

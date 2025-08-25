@@ -389,7 +389,13 @@ def _autoinit_components_if_enabled() -> None:
     if os.getenv("AUTO_INIT_COMPONENTS", "true").lower() not in ("1","true","yes","on"):  # opt-out
         return
     try:
-        from app.io.quotes_delayed import DelayedQuotesIngestor
+        # Provider에 따라 Quotes Ingestor 선택
+        quotes_provider = os.getenv("QUOTES_PROVIDER", "delayed").lower()
+        if quotes_provider == "alpaca":
+            from app.io.quotes_alpaca import AlpacaQuotesIngestor as QuotesIngestor
+        else:
+            from app.io.quotes_delayed import DelayedQuotesIngestor as QuotesIngestor
+            
         from app.engine.regime import RegimeDetector
         from app.engine.techscore import TechScoreEngine
         from app.engine.mixer import SignalMixer
@@ -406,8 +412,8 @@ def _autoinit_components_if_enabled() -> None:
 
     # Quotes ingestor
     try:
-        components["quotes_ingestor"] = DelayedQuotesIngestor()
-        logger.info("딜레이드 Quotes 인제스터 생성 완료")
+        components["quotes_ingestor"] = QuotesIngestor()
+        logger.info(f"Quotes 인제스터 생성 완료 (provider: {quotes_provider})")
     except Exception as e:
         logger.warning(f"Quotes 인제스터 준비 실패: {e}")
 
@@ -2525,11 +2531,17 @@ def pipeline_e2e(self):
                     log_signal_decision(signal_data, symbol or "unknown", "suppress", "unknown_symbol")
                     continue
                 
-                # 🔄 심볼 라우팅 (바스켓 기반)
-                route_result = route_signal_symbol(symbol, base_score)
-                exec_symbol = route_result["exec_symbol"]
-                route_reason = route_result["route_reason"]
-                route_intent = route_result.get("intent", "")
+                # 🔄 심볼 라우팅 (바스켓 기반) — debug 트리거는 직접 실행 심볼로 우회
+                debug_direct = str(signal_data.get("trigger", "")).lower() == "debug" or bool(signal_data.get("debug_direct"))
+                if debug_direct:
+                    exec_symbol = symbol
+                    route_reason = "debug_direct"
+                    route_intent = "entry_or_exit"
+                else:
+                    route_result = route_signal_symbol(symbol, base_score)
+                    exec_symbol = route_result["exec_symbol"]
+                    route_reason = route_result["route_reason"]
+                    route_intent = route_result.get("intent", "")
                 
                 # LLM 필수 이벤트 게이팅 체크
                 llm_evt = route_result.get("llm_required_event")
@@ -3008,8 +3020,13 @@ def generate_signals(self):
         if not trading_components.get("quotes_ingestor"):
             logger.warning("필수 컴포넌트 미준비: ['quotes_ingestor'] → 로컬 생성 시도")
             try:
-                from app.io.quotes_delayed import DelayedQuotesIngestor
-                trading_components["quotes_ingestor"] = DelayedQuotesIngestor()
+                quotes_provider = os.getenv("QUOTES_PROVIDER", "delayed").lower()
+                if quotes_provider == "alpaca":
+                    from app.io.quotes_alpaca import AlpacaQuotesIngestor
+                    trading_components["quotes_ingestor"] = AlpacaQuotesIngestor()
+                else:
+                    from app.io.quotes_delayed import DelayedQuotesIngestor
+                    trading_components["quotes_ingestor"] = DelayedQuotesIngestor()
                 logger.info("quotes_ingestor 생성 완료")
             except Exception as e:
                 logger.warning(f"quotes_ingestor 생성 실패: {e}")
@@ -4317,10 +4334,16 @@ def initialize_components(components: Dict):
 
     # Quotes ingestor 기본 주입(딜레이드)
     try:
-        from app.io.quotes_delayed import DelayedQuotesIngestor
         if trading_components.get("quotes_ingestor") is None:
-            trading_components["quotes_ingestor"] = DelayedQuotesIngestor()
-            logger.info("딜레이드 Quotes 인제스터 초기화")
+            quotes_provider = os.getenv("QUOTES_PROVIDER", "delayed").lower()
+            if quotes_provider == "alpaca":
+                from app.io.quotes_alpaca import AlpacaQuotesIngestor
+                trading_components["quotes_ingestor"] = AlpacaQuotesIngestor()
+                logger.info("Alpaca Quotes 인제스터 초기화")
+            else:
+                from app.io.quotes_delayed import DelayedQuotesIngestor
+                trading_components["quotes_ingestor"] = DelayedQuotesIngestor()
+                logger.info("딜레이드 Quotes 인제스터 초기화")
     except Exception as e:
         logger.warning(f"Quotes 인제스터 초기화 실패: {e}")
 

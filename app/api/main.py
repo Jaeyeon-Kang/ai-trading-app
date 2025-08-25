@@ -119,6 +119,17 @@ class ReportResponse(BaseModel):
     suppressed_reasons: Optional[Dict[str, int]] = None
     universe_size: Optional[int] = None
 
+class DebugEmitSignalRequest(BaseModel):
+    ticker: str
+    signal_type: str = "long"  # long/short
+    score: float = 0.9
+    confidence: float = 0.9
+    trigger: str = "debug"
+    summary: str = "synthetic debug signal"
+    entry_price: float = 0.0
+    stop_loss: float = 0.0
+    take_profit: float = 0.0
+
 class SystemStatusResponse(BaseModel):
     status: str
     redis_connected: bool
