@@ -336,6 +336,12 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(hour=15, minute=48),
         "options": {"queue": "celery", "expires": 50},
     },
+    # 개장 전 잔여 포지션 정리(09:25~09:30 ET 윈도우에서만 내부 조건으로 실행)
+    "queue-open-opg-cleanup": {
+        "task": "app.jobs.scheduler.queue_open_opg_cleanup",
+        "schedule": 60.0,
+        "options": {"queue": "celery", "expires": 50},
+    },
     # 타임 스톱 가드레일 (1분마다)
     "enforce-time-stop": {
         "task": "app.jobs.scheduler.enforce_time_stop",
@@ -1882,6 +1888,52 @@ def queue_preclose_liquidation(self):
         return {"scheduled": scheduled}
     except Exception as e:
         logger.error(f"사전 청산 태스크 실패: {e}")
+        return {"error": str(e)}
+
+@celery_app.task(bind=True, name="app.jobs.scheduler.queue_open_opg_cleanup")
+def queue_open_opg_cleanup(self):
+    """개장 직전/직후 잔여 포지션 OPG 청산 예약
+
+    - 장 마감 전에 이미 EOD 예약을 걸지만, 혹시 잔존 시 개장 시점 OPG로 정리
+    - 실행 윈도우: NY 09:25~09:35
+    """
+    try:
+        ny = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+        ny_time = ny.time()
+        in_window = (ny_time >= time(9,25)) and (ny_time <= time(9,35))
+        if not in_window:
+            return {"status": "outside_window"}
+
+        from app.adapters.trading_adapter import get_trading_adapter
+        trading_adapter = get_trading_adapter()
+        positions = trading_adapter.get_positions() or []
+        scheduled = 0
+        for p in positions:
+            qty_raw = float(getattr(p, 'quantity', 0))
+            quantity = abs(qty_raw if FRACTIONAL_ENABLED else int(qty_raw))
+            if quantity <= 0:
+                continue
+            sym = getattr(p, 'ticker', '')
+            side = "sell" if qty_raw > 0 else "buy"
+            try:
+                if hasattr(trading_adapter, "submit_eod_exit"):
+                    # 개장 예약은 OPG 사용을 기대
+                    trade = trading_adapter.submit_eod_exit(sym, quantity, side)
+                else:
+                    trade = trading_adapter.submit_market_order(
+                        ticker=sym,
+                        side=side,
+                        quantity=quantity,
+                        signal_id=f"open_opg_cleanup_{sym}"
+                    )
+                scheduled += 1
+                tif_used = (getattr(trade, 'meta', {}) or {}).get('tif', 'opg')
+                _log_exit_decision(sym, side, quantity, policy="OPEN_CLEANUP", reason="open_opg_cleanup", tif=tif_used, attempt=1, market_state="OPEN")
+            except Exception as e:
+                logger.warning(f"개장 OPG 청산 예약 실패: {sym} - {e}")
+        return {"scheduled": scheduled}
+    except Exception as e:
+        logger.error(f"개장 OPG 청산 태스크 실패: {e}")
         return {"error": str(e)}
 
 @celery_app.task(bind=True, name="app.jobs.scheduler.enforce_time_stop")
