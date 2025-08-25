@@ -5,12 +5,9 @@ Alpaca Data API를 통한 1분봉 데이터 수집
 import os
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 from dataclasses import dataclass
-
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+import importlib
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +26,18 @@ class AlpacaQuotesIngestor:
     
     def __init__(self):
         """초기화"""
-        self.client = StockHistoricalDataClient(
+        try:
+            mod_hist = importlib.import_module("alpaca.data.historical")
+            mod_req = importlib.import_module("alpaca.data.requests")
+            mod_tf = importlib.import_module("alpaca.data.timeframe")
+            client_cls = getattr(mod_hist, "StockHistoricalDataClient")
+            self._StockBarsRequest = getattr(mod_req, "StockBarsRequest")
+            self._TimeFrame = getattr(mod_tf, "TimeFrame")
+        except Exception as e:  # noqa: BLE001
+            logger.error("Alpaca SDK import 실패: %s", e)
+            raise
+
+        self.client = client_cls(
             api_key=os.getenv("ALPACA_API_KEY"),
             secret_key=os.getenv("ALPACA_API_SECRET")
         )
@@ -41,9 +49,9 @@ class AlpacaQuotesIngestor:
         """최근 n개 캔들 조회"""
         try:
             # 1분봉 요청
-            request = StockBarsRequest(
+            request = self._StockBarsRequest(
                 symbol_or_symbols=[ticker],
-                timeframe=TimeFrame.Minute,
+                timeframe=self._TimeFrame.Minute,
                 start=datetime.now() - timedelta(days=5),  # 5일 전부터
                 limit=n
             )
@@ -68,24 +76,25 @@ class AlpacaQuotesIngestor:
                 elif hasattr(bars, "df"):
                     df = getattr(bars, "df")
                     if df is not None and len(df) > 0:
-                        try:
-                            import pandas as pd  # noqa: F401
-                            df_t = df[df.get("symbol", "").str.upper() == ticker.upper()]
-                            for _, row in df_t.tail(n).iterrows():
+                        df_t = df[df.get("symbol", "").str.upper() == ticker.upper()]
+                        for _, row in df_t.tail(n).iterrows():
+                            try:
+                                ts_val = row.get("timestamp")
+                                ts_parsed = ts_val if isinstance(ts_val, datetime) else datetime.fromisoformat(str(ts_val))
                                 candles.append(Candle(
                                     o=float(row["open"]),
                                     h=float(row["high"]),
                                     l=float(row["low"]),
                                     c=float(row["close"]),
                                     v=int(row.get("volume", 0) or 0),
-                                    ts=row.get("timestamp") if isinstance(row.get("timestamp"), datetime) else datetime.fromisoformat(str(row.get("timestamp")))
+                                    ts=ts_parsed
                                 ))
-                        except Exception:
-                            pass
+                            except Exception:  # noqa: BLE001
+                                continue
                 else:
                     # 마지막 폴백: iterable로 간주
                     series = list(bars) if bars is not None else []
-            except Exception:
+            except Exception:  # noqa: BLE001
                 series = []
 
             # Bar 객체 리스트 파싱
@@ -103,16 +112,16 @@ class AlpacaQuotesIngestor:
                             v=int(getattr(bar, "volume", 0) or 0),
                             ts=ts or datetime.utcnow()
                         ))
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         continue
             
             # 캐시 업데이트
             self.cache[ticker] = candles
-            logger.debug(f"Alpaca {ticker}: {len(candles)}개 캔들 조회")
+            logger.debug("Alpaca %s: %d개 캔들 조회", ticker, len(candles))
             return candles
             
-        except Exception as e:
-            logger.error(f"Alpaca {ticker} 캔들 조회 실패: {e}")
+        except Exception as e:  # noqa: BLE001
+            logger.error("Alpaca %s 캔들 조회 실패: %s", ticker, e)
             return self.cache.get(ticker, [])
     
     def update_all_tickers(self, tickers: List[str] = None):
@@ -121,13 +130,13 @@ class AlpacaQuotesIngestor:
             tickers = self.tickers
         
         self.tickers = tickers  # 티커 리스트 저장
-        logger.info(f"Alpaca 전체 티커 업데이트: {len(tickers)}개")
+        logger.info("Alpaca 전체 티커 업데이트: %d개", len(tickers))
         
         for ticker in tickers:
             try:
                 self.get_latest_candles(ticker, 200)
-            except Exception as e:
-                logger.error(f"Alpaca {ticker} 업데이트 실패: {e}")
+            except Exception as e:  # noqa: BLE001
+                logger.error("Alpaca %s 업데이트 실패: %s", ticker, e)
     
     def _compute_indicators_from_candles(self, candles: List[Candle]) -> Dict:
         """지표 계산 (delayed 인제스터와 호환)"""
@@ -150,7 +159,7 @@ class AlpacaQuotesIngestor:
         if not candles:
             try:
                 candles = self.get_latest_candles(ticker, 50)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 candles = []
         current_price = candles[-1].c if candles else 0.0
         indicators = self._compute_indicators_from_candles(candles)
@@ -170,12 +179,12 @@ class AlpacaQuotesIngestor:
     
     def warmup_backfill(self, tickers: List[str], days_back: int = 5):
         """워밍업 백필"""
-        logger.info(f"Alpaca 워밍업 백필: {len(tickers)}개 티커, {days_back}일")
+        logger.info("Alpaca 워밍업 백필: %d개 티커, %d일", len(tickers), days_back)
         for ticker in tickers:
             try:
                 self.get_latest_candles(ticker, days_back * 390)  # 6.5시간 * 60분
-            except Exception as e:
-                logger.error(f"Alpaca {ticker} 워밍업 실패: {e}")
+            except Exception as e:  # noqa: BLE001
+                logger.error("Alpaca %s 워밍업 실패: %s", ticker, e)
     
     def get_cached_candles(self, ticker: str) -> List[Candle]:
         """캐시된 캔들 조회"""
