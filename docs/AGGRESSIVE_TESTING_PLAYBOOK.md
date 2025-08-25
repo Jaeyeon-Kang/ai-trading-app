@@ -127,6 +127,11 @@ QUOTES_PROVIDER가 alpaca일 때 update_quotes 파이프라인이 실제 시세�
 - MAE/MFE 중앙값 개선, EOD 전량 청산 로그 확인
 - LLM 호출: 강신호/스파이크에서만 증가, 월 한도 내
 
+### EOD/개장 청소 점검
+- ET 15:48 사전 예약 청산(queue_preclose_liquidation) 로그 존재
+- ET 16:05 EOD 보고서 생성 확인
+- ET 09:25~09:35 queue_open_opg_cleanup 스케줄 로그 존재, 잔여 포지션 OPG 예약
+
 ## 롤백 계획
 - `RISK_PER_TRADE=0.005`, `MAX_CONCURRENT_RISK=0.02`, `MIXER_THRESHOLD=0.12`, `SIGNAL_CUTOFF_RTH=0.12`
 - `COOLDOWN_SECONDS=180`, `DIRECTION_LOCK_SECONDS=180`, `ENABLE_TRAIL_STOP=0`

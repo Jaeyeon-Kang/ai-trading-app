@@ -10,7 +10,7 @@
 - 🗺️ [Roadmap & Universe](ROADMAP.md) — Evolution 계획 + 유니버스 확장 요약
 - 🛠️ [Development Overview](DEVELOPMENT_OVERVIEW.md) — 디버깅 여정 + 최신 튜닝 요약
 - 🧪 [찹장 테스트 운영 플레이북](TEST_PLAYBOOK_CHOPPY.md) — 1–2일 임시 완화·롤백 기준
-- ⚡ [Aggressive Testing Playbook](AGGRESSIVE_TESTING_PLAYBOOK.md) — 스캘핑/공격적 튜닝용 .env/프롬프트
+- ⚡ [Aggressive Testing Playbook](AGGRESSIVE_TESTING_PLAYBOOK.md) — 스캘핑/공격적 튜닝용 .env/프롬프트 (EOD/OPG 청산 포함)
 
 ### 🏗️ [시스템 아키텍처](SYSTEM_ARCHITECTURE.md)
 **Docker 마이크로서비스 아키텍처와 내부 동작 원리**

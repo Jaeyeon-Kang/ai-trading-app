@@ -20,7 +20,7 @@
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
 │   Data Sources  │    │   Engine Layer  │    │  Execution      │
 │                 │    │                 │    │                 │
-│ • Yahoo Finance │───▶│ • Regime Detect │───▶│ • KIS API       │
+│ • Alpaca Data   │───▶│ • Regime Detect │───▶│ • Alpaca/KIS    │
 │ • SEC EDGAR     │    │ • Tech Score    │    │ • Paper Trading │
 │ • News APIs     │    │ • LLM Insight   │    │ • Risk Engine   │
 └─────────────────┘    │ • Signal Mixer  │    └─────────────────┘
@@ -96,12 +96,17 @@ curl -s http://localhost:8000/status | jq
 # 최근 24시간 신호(KST 타임스탬프 포함, 억제 신호 포함)
 curl -s "http://localhost:8000/signals/recent?hours=24&include_suppressed=1" | jq '.[0:50]'
 
-# EOD 요약 (자동)
-# - 미국 정규장 마감 직후(ET 16:05): EOD 보고서 생성 (Redis+파일)
-# - 한국시간 아침 08:05: 워커 로그에 마지막 EOD 요약을 출력
+# EOD 운영 정책 (자동)
+# - ET 15:48: 마감 전 사전 예약 청산(queue_preclose_liquidation, CLS/OPG)
+# - ET 16:05: EOD 보고서 생성 (Redis+파일)
+# - ET 09:25~09:35: 개장 OPG 잔여 청산(queue_open_opg_cleanup)
+# - KST 08:05: 워커 로그에 마지막 EOD 요약 출력
 
 # 컨테이너 로그로 확인
 docker logs --since 12h trading_bot_worker | grep -E "EOD 보고서 생성 완료|KST 아침 요약"
+
+# 청산 예약/개장 청소 확인
+docker logs --since 12h trading_bot_worker | egrep -i "EOD 청산|preclose|OPEN_CLEANUP|opg|cls" | tail -n 200
 
 # 파일 저장 위치 (컨테이너 내부)
 # /app/logs/eod/YYYYMMDD.json

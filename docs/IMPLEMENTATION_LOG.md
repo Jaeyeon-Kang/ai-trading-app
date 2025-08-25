@@ -88,6 +88,17 @@ TEST_MODE_ENABLED, DISABLE_REAL_TRADING, DISABLE_SLACK_ALERTS
 
 **🔥 기획자 종합 평가: 시스템의 근본적 개선 완료**
 
+### 2025-08-25 — 실행/모니터링 정합성 고도화
+
+- Quotes: Yahoo(delayed) → Alpaca(Data API) 전환. `app/io/quotes_alpaca.py` 지표/가격 인터페이스 추가.
+- Mixer/LLM: `LLM_MIN_SIGNAL_SCORE` 환경 연동, 믹서 임계 BUY/SELL 통일.
+- API: `/positions` 더미(AAPL 10주) 제거 → `trading_adapter.get_positions()` 연동.
+- EOD/개장 정책: 
+  - ET 15:48 `queue_preclose_liquidation`(CLS/OPG) 유지
+  - ET 09:25~09:35 `queue_open_opg_cleanup` 신설(잔여 포지션 OPG 청소)
+  - EOD 리포트 생성 + KST 08:05 로그 출력
+- 상태: TSLA/NVDA 실 매수 체결 확인, `/positions`·`/portfolio/positions` 일치.
+
 ---
 
 ## 2025-08-22 (오전)
