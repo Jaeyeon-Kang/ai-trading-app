@@ -16,13 +16,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Candle:
-    """캔들 데이터"""
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: int
-    timestamp: datetime
+    """캔들 데이터 (기존 코드 호환: o/h/l/c/v, ts)"""
+    o: float
+    h: float
+    l: float
+    c: float
+    v: int
+    ts: datetime
 
 class AlpacaQuotesIngestor:
     """Alpaca 시세 인제스터"""
@@ -49,19 +49,62 @@ class AlpacaQuotesIngestor:
             )
             
             bars = self.client.get_stock_bars(request)
-            candles = []
-            
-            if ticker in bars:
-                for bar in bars[ticker]:
-                    candle = Candle(
-                        open=float(bar.open),
-                        high=float(bar.high),
-                        low=float(bar.low),
-                        close=float(bar.close),
-                        volume=int(bar.volume),
-                        timestamp=bar.timestamp.replace(tzinfo=None)
-                    )
-                    candles.append(candle)
+            candles: List[Candle] = []
+
+            # alpaca-py 호환 처리: bars가 dict/객체/DF 등 다양한 형태
+            series: List = []
+            try:
+                # dict 스타일
+                if isinstance(bars, dict):
+                    series = bars.get(ticker, []) or []
+                # data 속성(dict)
+                elif hasattr(bars, "data"):
+                    data = getattr(bars, "data")
+                    if isinstance(data, dict):
+                        series = data.get(ticker, []) or []
+                    else:
+                        series = list(data) if data is not None else []
+                # DataFrame 제공 시
+                elif hasattr(bars, "df"):
+                    df = getattr(bars, "df")
+                    if df is not None and len(df) > 0:
+                        try:
+                            import pandas as pd  # noqa: F401
+                            df_t = df[df.get("symbol", "").str.upper() == ticker.upper()]
+                            for _, row in df_t.tail(n).iterrows():
+                                candles.append(Candle(
+                                    o=float(row["open"]),
+                                    h=float(row["high"]),
+                                    l=float(row["low"]),
+                                    c=float(row["close"]),
+                                    v=int(row.get("volume", 0) or 0),
+                                    ts=row.get("timestamp") if isinstance(row.get("timestamp"), datetime) else datetime.fromisoformat(str(row.get("timestamp")))
+                                ))
+                        except Exception:
+                            pass
+                else:
+                    # 마지막 폴백: iterable로 간주
+                    series = list(bars) if bars is not None else []
+            except Exception:
+                series = []
+
+            # Bar 객체 리스트 파싱
+            if series:
+                for bar in series[-n:]:
+                    try:
+                        ts = getattr(bar, "timestamp", None)
+                        if ts and hasattr(ts, "replace"):
+                            ts = ts.replace(tzinfo=None)
+                        candles.append(Candle(
+                            o=float(getattr(bar, "open", 0.0) or 0.0),
+                            h=float(getattr(bar, "high", 0.0) or 0.0),
+                            l=float(getattr(bar, "low", 0.0) or 0.0),
+                            c=float(getattr(bar, "close", 0.0) or 0.0),
+                            v=int(getattr(bar, "volume", 0) or 0),
+                            ts=ts or datetime.utcnow()
+                        ))
+                    except Exception:
+                        continue
             
             # 캐시 업데이트
             self.cache[ticker] = candles
