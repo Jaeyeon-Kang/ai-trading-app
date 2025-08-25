@@ -239,6 +239,18 @@ celery_app.conf.beat_schedule = {
         "task": "app.jobs.scheduler.scan_edgar",
         "schedule": 60.0,  # 1분
     },
+    # EOD 보고서(ET 16:05): 마감 직후 요약 생성
+    "eod-generate-report": {
+        "task": "app.jobs.eod_reporter.generate_eod_report",
+        "schedule": crontab(hour=16, minute=5, timezone='America/New_York'),
+        "options": {"queue": "celery", "expires": 300},
+    },
+    # KST 아침 08:05: 요약을 로그로 출력 (Slack 미사용)
+    "kst-morning-log": {
+        "task": "app.jobs.eod_reporter.log_morning_kst",
+        "schedule": crontab(hour=8, minute=5, timezone='Asia/Seoul'),
+        "options": {"queue": "celery", "expires": 300},
+    },
     # 5분마다 리스크 체크
     "check-risk": {
         "task": "app.jobs.scheduler.check_risk",
