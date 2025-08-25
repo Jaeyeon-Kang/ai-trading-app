@@ -51,6 +51,7 @@
 | **[GPT-5 전략](docs/FINAL_TRADING_STRATEGY.md)** | GPT-5 수학적 분석 결과 | 전략 이해 |
 | **[구현 로그](docs/IMPLEMENTATION_LOG.md)** | 개발 과정 상세 기록 | 개발 참고 |
 | **[월요일 준비](docs/MONDAY_PREP.md)** | 실전 테스트 가이드 | 운영 가이드 |
+| **[Aggressive Testing Playbook](docs/AGGRESSIVE_TESTING_PLAYBOOK.md)** | 스캘핑/공격 모드 .env/프롬프트 | 테스트 튜닝 |
 
 ## 🚀 빠른 시작
 
@@ -68,6 +69,7 @@ cd ai-trading-app
 cp .env.example .env
 # 완전 자동화: AUTO_MODE=1
 # 알파카 페이퍼: BROKER=alpaca_paper (첫 테스트)
+# 공격 모드 튜닝: docs/AGGRESSIVE_TESTING_PLAYBOOK.md 참고 (MIXER_THRESHOLD/SIGNAL_CUTOFF/RISK 상향)
 ```
 
 ### 3. GPT-5 리스크 시스템 가동
