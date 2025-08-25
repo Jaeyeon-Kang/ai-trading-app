@@ -203,7 +203,7 @@ celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
-    timezone="Asia/Seoul",  # KST
+    # timezone 설정 제거 - Celery 버전 호환성
     enable_utc=True,        # UTC 유지 + 타임존-aware 스케줄 OK
     task_track_started=True,
     task_time_limit=30 * 60,  # 30분
@@ -214,6 +214,7 @@ celery_app.conf.update(
         "app.jobs.scheduler",
         "app.jobs.paper_trading_manager",
         "app.jobs.daily_briefing",
+        "app.jobs.eod_reporter",
     ],
 )
 
@@ -242,13 +243,13 @@ celery_app.conf.beat_schedule = {
     # EOD 보고서(ET 16:05): 마감 직후 요약 생성
     "eod-generate-report": {
         "task": "app.jobs.eod_reporter.generate_eod_report",
-        "schedule": crontab(hour=16, minute=5, timezone='America/New_York'),
+        "schedule": crontab(hour=16, minute=5),
         "options": {"queue": "celery", "expires": 300},
     },
     # KST 아침 08:05: 요약을 로그로 출력 (Slack 미사용)
     "kst-morning-log": {
         "task": "app.jobs.eod_reporter.log_morning_kst",
-        "schedule": crontab(hour=8, minute=5, timezone='Asia/Seoul'),
+        "schedule": crontab(hour=8, minute=5),
         "options": {"queue": "celery", "expires": 300},
     },
     # 5분마다 리스크 체크
@@ -264,7 +265,7 @@ celery_app.conf.beat_schedule = {
     # 매일 06:10 KST에 일일 리포트
     "daily-report": {
         "task": "app.jobs.scheduler.daily_report", 
-        "schedule": crontab(hour=6, minute=10, timezone='Asia/Seoul'),
+        "schedule": crontab(hour=6, minute=10),
         "args": [False, True],  # force=False, post=True (슬랙으로 보내기)
     },
     # 5초마다 EDGAR 스트림 수집 → DB 적재 (dedupe는 DB UNIQUE와 ON CONFLICT로 보강)
@@ -280,7 +281,7 @@ celery_app.conf.beat_schedule = {
     # 매일 05:55 KST 적응형 컷오프 갱신 (리포트 직전)
     "adaptive-cutoff": {
         "task": "app.jobs.scheduler.adaptive_cutoff",
-        "schedule": crontab(hour=5, minute=55, timezone='Asia/Seoul'),
+        "schedule": crontab(hour=5, minute=55),
     },
     
     # =============================================================================
@@ -290,28 +291,28 @@ celery_app.conf.beat_schedule = {
     # 아침 브리핑 (09:00 KST)
     "morning-briefing": {
         "task": "app.jobs.daily_briefing.send_scheduled_briefing",
-        "schedule": crontab(hour=9, minute=0, timezone='Asia/Seoul'),
+        "schedule": crontab(hour=9, minute=0),
         "args": ["morning"],
     },
     
     # 점심 브리핑 (12:30 KST)  
     "midday-briefing": {
         "task": "app.jobs.daily_briefing.send_scheduled_briefing",
-        "schedule": crontab(hour=12, minute=30, timezone='Asia/Seoul'),
+        "schedule": crontab(hour=12, minute=30),
         "args": ["midday"],
     },
     
     # 저녁 브리핑 (18:00 KST)
     "evening-briefing": {
         "task": "app.jobs.daily_briefing.send_scheduled_briefing",
-        "schedule": crontab(hour=18, minute=0, timezone='Asia/Seoul'),
+        "schedule": crontab(hour=18, minute=0),
         "args": ["evening"],
     },
     
     # 조용한 시장 체크 (1시간마다, 9-18시 KST만)
     "quiet-market-check": {
         "task": "app.jobs.daily_briefing.check_and_send_quiet_message",
-        "schedule": crontab(minute=0, hour="9-18", timezone='Asia/Seoul'),  # 9-18시 KST만
+        "schedule": crontab(minute=0, hour="9-18"),  # 9-18시 KST만
     },
     
     # =============================================================================
@@ -332,7 +333,7 @@ celery_app.conf.beat_schedule = {
     # 마감 전 사전 예약 청산 (미 동부시간 15:48)
     "queue-preclose-liquidation": {
         "task": "app.jobs.scheduler.queue_preclose_liquidation",
-        "schedule": crontab(hour=15, minute=48, timezone='America/New_York'),
+        "schedule": crontab(hour=15, minute=48),
         "options": {"queue": "celery", "expires": 50},
     },
     # 타임 스톱 가드레일 (1분마다)
