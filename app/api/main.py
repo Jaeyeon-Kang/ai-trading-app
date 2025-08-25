@@ -882,19 +882,21 @@ async def send_daily_report_to_slack(report_data: Dict):
 async def get_positions():
     """현재 포지션 조회"""
     try:
-        # 실제로는 포지션 데이터에서 조회
-        positions = [
+        from app.api.portfolio import get_trading_adapter
+        trading_adapter = get_trading_adapter()
+        positions = trading_adapter.get_positions()
+        
+        return [
             {
-                "ticker": "AAPL",
-                "quantity": 10,
-                "avg_price": 150.25,
-                "current_price": 152.30,
-                "unrealized_pnl": 20.50,
+                "ticker": pos.ticker,
+                "quantity": pos.quantity,
+                "avg_price": pos.avg_price,
+                "current_price": pos.current_price,
+                "unrealized_pnl": pos.unrealized_pnl,
                 "timestamp": datetime.now().isoformat()
             }
+            for pos in positions
         ]
-        
-        return positions
         
     except Exception as e:
         logger.error(f"포지션 조회 실패: {e}")
