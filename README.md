@@ -88,6 +88,25 @@ curl http://localhost:8000/portfolio/summary | jq .data.risk_metrics
 docker logs -f trading_bot_scheduler | grep "신호\|거래\|위험"
 ```
 
+### 5. 야간 무인 운영(EOD/KST 로그 리포트)
+```bash
+# 시스템 상태
+curl -s http://localhost:8000/status | jq
+
+# 최근 24시간 신호(KST 타임스탬프 포함, 억제 신호 포함)
+curl -s "http://localhost:8000/signals/recent?hours=24&include_suppressed=1" | jq '.[0:50]'
+
+# EOD 요약 (자동)
+# - 미국 정규장 마감 직후(ET 16:05): EOD 보고서 생성 (Redis+파일)
+# - 한국시간 아침 08:05: 워커 로그에 마지막 EOD 요약을 출력
+
+# 컨테이너 로그로 확인
+docker logs --since 12h trading_bot_worker | grep -E "EOD 보고서 생성 완료|KST 아침 요약"
+
+# 파일 저장 위치 (컨테이너 내부)
+# /app/logs/eod/YYYYMMDD.json
+```
+
 ## ⚙️ 설정
 
 ### 브로커 설정
@@ -187,11 +206,8 @@ POST /emergency-stop
 - 리스크 지표
 - 시스템 상태
 
-### Slack 알림
-- 거래 시그널 (승인 버튼 포함)
-- 리스크 경고
-- 일일 리포트
-- 시스템 상태
+### Slack 알림 (선택)
+- 기본은 비활성화(`DISABLE_SLACK_ALERTS=true`). 운영 안정화 후에만 활성화 권장.
 
 ## 🛡️ 리스크 관리
 
@@ -220,17 +236,26 @@ POST /emergency-stop
 
 ## 🔍 시그널 전략
 
-### 1. 추세 돌파 (Trend Breakout)
+### 1. 추세 돌파 (Trend Breakout) — 데이트레이딩/스캘핑 기본 축
 - 30초봉 전고 상향 돌파
 - VWAP 상단 + ADX 상승
 - 가중치: 기술 75% / 감성 25%
 
-### 2. 변동성 급등 (Vol-Spike)
+### 2. 변동성 급등 (Vol-Spike) — 뉴스/거래량 급등 단타
 - 거래량 급증 + 가격 변동성
 - 뉴스/공시 기반
 - 가중치: 기술 30% / 감성 70%
 
-### 3. 평균회귀 (Mean-Revert)
+### 3. 평균회귀 (Mean-Revert) — VWAP/밴드 복귀 스캘프
+
+### ETF 정책 (레버리지/인버스)
+- 지원 유지: `INVERSE_ETFS`, `LEVERAGED_ETFS` 환경변수 기반. UVXY 등 표기 오류 자동 보정.
+- 가드레일: 레버리지 ETF는 포지션 사이징 30% 축소(리스크 엔진), EOD 강제 청산 유지.
+- 바스켓/충돌 방지: 역방향 중복·충돌 포지션은 스케줄러 가드레일로 제어.
+
+### LLM 역할
+- 신호 “보조”에 한정(뉴스/공시 급등·강신호 보정). `LLM_MIN_SIGNAL_SCORE=0.6`.
+- 요약·리포트/설명에 주로 사용(EOD/KST 로그, 브리핑). 매수/매도 의사결정의 주역이 아님.
 - RSI 극단값에서 반전
 - 볼린저 밴드 복귀
 - 가중치: 기술 60% / 감성 40%
