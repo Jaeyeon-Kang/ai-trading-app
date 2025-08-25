@@ -21,6 +21,7 @@ import time
 import numpy as np
 from openai import OpenAI
 import redis
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,7 @@ class LLMInsightEngine:
             bool: LLM 호출 여부
         """
         # 조건 1: 강신호 무조건 LLM 분석 (Phase 1.5 핵심 개선!)
-        if abs(signal_strength) >= 0.70:
+        if abs(signal_strength) >= settings.LLM_MIN_SIGNAL_SCORE:
             logger.info(f"🎯 강신호 LLM 호출: signal_strength={signal_strength:.3f}")
             return True
         

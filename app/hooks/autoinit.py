@@ -30,18 +30,25 @@ def _build_components():
     comps["stream_consumer"] = StreamConsumer(rs)
 
     # Quotes ingestor (warmup 제거 - 첫 태스크에서 처리)
+    quotes_provider = os.getenv("QUOTES_PROVIDER", "delayed")
+    if quotes_provider == "alpaca":
+        log.warning("[autoinit] QUOTES_PROVIDER=alpaca 설정됨, 하지만 Alpaca 실시간 시세 모듈 미구현. delayed로 fallback")
+        quotes_provider = "delayed"
+    
     qi = DelayedQuotesIngestor()
-    log.info("[autoinit] quotes ingestor created (warmup deferred)")
+    log.info(f"[autoinit] quotes ingestor created (provider: {quotes_provider}, warmup deferred)")
     comps["quotes_ingestor"] = qi
 
     # Engines
     # GPT 제안: MIXER_THRESHOLD 사용, 매도는 음수로
     mixer_thr = float(os.getenv("MIXER_THRESHOLD", "0.15"))
+    buy_threshold = float(os.getenv("BUY_THRESHOLD", str(mixer_thr)))
+    sell_threshold = float(os.getenv("SELL_THRESHOLD", str(-mixer_thr)))
     comps["regime_detector"] = RegimeDetector()
     comps["tech_score_engine"] = TechScoreEngine()
-    comps["signal_mixer"] = SignalMixer(buy_threshold=mixer_thr, sell_threshold=-mixer_thr)
+    comps["signal_mixer"] = SignalMixer(buy_threshold=buy_threshold, sell_threshold=sell_threshold)
     # GPT 제안: 명시적 로그로 정합성 확인
-    log.info(f"[MixerInit] MIXER={mixer_thr}, buy={mixer_thr}, sell={-mixer_thr}, callsite=autoinit")
+    log.info(f"[MixerInit] MIXER={mixer_thr}, BUY={buy_threshold}, SELL={sell_threshold}, callsite=autoinit")
     init_cap = float(os.getenv("INITIAL_CAPITAL", "1000000") or 1000000)
     comps["risk_engine"] = RiskEngine(initial_capital=init_cap)
     comps["paper_ledger"] = PaperLedger(initial_cash=init_cap)

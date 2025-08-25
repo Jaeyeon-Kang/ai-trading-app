@@ -75,8 +75,25 @@ class Settings:
         self.REGULATORY_BLOCK_WORDS = os.getenv("REGULATORY_BLOCK_WORDS", "regulatory,litigation,FTC,DoJ,antitrust").split(",")
         
         # --- Inverse ETF Support ---
-        self.INVERSE_ETFS = os.getenv("INVERSE_ETFS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS,DRV,SARK").split(",")
-        self.LEVERAGED_ETFS = os.getenv("LEVERAGED_ETFS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS,DRV").split(",")
+        # 환경에서 목록을 읽은 뒤, 심볼 표기 오류 수정 및 중복 제거
+        inverse_raw = os.getenv("INVERSE_ETFS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS,DRV,SARK").split(",")
+        leveraged_raw = os.getenv("LEVERAGED_ETFS", "SOXS,SQQQ,SPXS,TZA,SDOW,TECS,DRV").split(",")
+
+        def _normalize_symbols(symbols):
+            fixed = []
+            seen = set()
+            for s in symbols:
+                sym = (s or "").strip().upper()
+                # 흔한 오타 보정: UVX -> UVXY
+                if sym == "UVX":
+                    sym = "UVXY"
+                if sym and sym not in seen:
+                    seen.add(sym)
+                    fixed.append(sym)
+            return fixed
+
+        self.INVERSE_ETFS = _normalize_symbols(inverse_raw)
+        self.LEVERAGED_ETFS = _normalize_symbols(leveraged_raw)
         
         # --- 가격 상한/분할매수 설정 ---
         self.FRACTIONAL_ENABLED = os.getenv("FRACTIONAL_ENABLED", "true").lower() in ("true", "1", "yes", "on")
