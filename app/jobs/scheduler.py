@@ -2358,7 +2358,7 @@ def save_signal_to_db(signal_data: Dict, action: str, decision_reason: str) -> O
         return None
 
 @celery_app.task(bind=True, name="app.jobs.scheduler.pipeline_e2e",
-                 soft_time_limit=12, time_limit=14)  # 15초 주기에 맞춤
+                 soft_time_limit=20, time_limit=22)  # 15초 주기 대비 안전 여유(네트워크 변동)
 def pipeline_e2e(self):
     """포지션 관리 기반 E2E 파이프라인: 신호 소비 → 포지션 상태 기반 거래 실행"""
     # Redis lock to prevent overlap
@@ -3816,7 +3816,7 @@ def generate_signals(self):
         }
 
 @celery_app.task(bind=True, name="app.jobs.scheduler.update_quotes", 
-                 soft_time_limit=90, time_limit=120)
+                 soft_time_limit=120, time_limit=150)
 def update_quotes(self):
     """시세 업데이트 작업"""
     # Redis 락으로 중복 실행 방지
