@@ -129,6 +129,37 @@ class AlpacaQuotesIngestor:
             except Exception as e:
                 logger.error(f"Alpaca {ticker} 업데이트 실패: {e}")
     
+    def _compute_indicators_from_candles(self, candles: List[Candle]) -> Dict:
+        """지표 계산 (delayed 인제스터와 호환)"""
+        if not candles:
+            return {"dollar_vol_5m": 0.0, "spread_bp": 0.0}
+        # 1분봉 가정: 최근 5개 사용
+        window = candles[-5:] if len(candles) >= 5 else candles
+        last_close = window[-1].c if window else 0.0
+        dollar_vol = sum((c.c or last_close) * float(c.v or 0) for c in window)
+        last = window[-1]
+        if last.c > 0:
+            spread_bp = ((last.h - last.l) / max(last.c, 1e-9)) * 10000.0
+        else:
+            spread_bp = 0.0
+        return {"dollar_vol_5m": float(dollar_vol), "spread_bp": float(spread_bp)}
+
+    def get_technical_indicators(self, ticker: str) -> Dict:
+        """기술지표 반환 (delayed 인제스터와 동일 키)"""
+        candles = self.cache.get(ticker)
+        if not candles:
+            try:
+                candles = self.get_latest_candles(ticker, 50)
+            except Exception:
+                candles = []
+        current_price = candles[-1].c if candles else 0.0
+        indicators = self._compute_indicators_from_candles(candles)
+        return {
+            "current_price": current_price,
+            "dollar_vol_5m": indicators.get("dollar_vol_5m", 0.0),
+            "spread_bp": indicators.get("spread_bp", 0.0)
+        }
+    
     def update(self):
         """기존 티커 업데이트 (호환성 메소드)"""
         self.update_all_tickers()
