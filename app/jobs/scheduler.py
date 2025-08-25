@@ -3487,7 +3487,7 @@ def generate_signals(self):
                     try:
                         if rurl:
                             r_conn = redis.from_url(rurl)
-                            rth_daily_cap = int(os.getenv("RTH_DAILY_CAP", "5"))
+                            rth_daily_cap = int(os.getenv("RTH_DAILY_CAP", "100"))
                             # ET 기준 날짜 키 (UTC-5, DST 간이 적용)
                             et_tz = timezone(timedelta(hours=-5))
                             now_et = datetime.now(et_tz)
