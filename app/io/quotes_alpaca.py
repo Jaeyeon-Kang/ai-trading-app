@@ -191,10 +191,19 @@ class AlpacaQuotesIngestor:
         return self.cache.get(ticker, [])
     
     def get_market_data_summary(self) -> Dict:
-        """시장 데이터 요약 (호환성 메소드)"""
-        return {
-            "total_tickers": len(self.tickers),
-            "cached_tickers": len(self.cache),
-            "provider": "alpaca",
-            "status": "active"
-        }
+        """티커별 시세/지표 맵 (scheduler.update_quotes 호환)"""
+        result: Dict[str, Dict] = {}
+        for ticker, candles in self.cache.items():
+            try:
+                candles = candles or []
+                last_close = float(candles[-1].c) if candles else 0.0
+                indicators = self._compute_indicators_from_candles(candles)
+                last_ts = candles[-1].ts if candles else datetime.utcnow()
+                result[ticker] = {
+                    "current_price": last_close,
+                    "indicators": indicators,
+                    "last_update": last_ts,
+                }
+            except Exception:  # noqa: BLE001
+                continue
+        return result

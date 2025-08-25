@@ -3927,8 +3927,16 @@ def update_quotes(self):
         if not quotes_ingestor or not redis_streams:
             return {"status": "skipped", "reason": "components_not_ready"}
         
-        # 모든 종목 시세 업데이트
-        quotes_ingestor.update_all_tickers()
+        # 모든 종목 시세 업데이트 (현재 유니버스 기준)
+        try:
+            universe = list({
+                *[t.strip().upper() for t in settings.TIER_A_TICKERS],
+                *[t.strip().upper() for t in settings.TIER_B_TICKERS],
+                *[t.strip().upper() for t in settings.BENCH_TICKERS],
+            })
+        except Exception:
+            universe = []
+        quotes_ingestor.update_all_tickers(universe)
         
         # Redis 스트림에 발행
         market_data = quotes_ingestor.get_market_data_summary()
